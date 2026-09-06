@@ -165,6 +165,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
  * because the device is allocated at runtime.
  *
  * Returns 0 on success, -1 if the table is full. */
+/* Mirror one field of the device struct onto another, for the counter pair a
+ * swap throttle waits on: the title bumps "frames submitted" itself and waits
+ * for "frames completed", which only the GPU moves on hardware. Unlike
+ * xbox_Nv2aFrameCounter this cannot run ahead of the title, so the unsigned
+ * submitted - completed it gets compared against cannot underflow. */
+int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
+                           uint32_t src_off, uint32_t dst_off);
+
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
