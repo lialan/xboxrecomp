@@ -464,6 +464,19 @@ void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch)
     s_fb_pitch = pitch;
 }
 
+/* Where the title last said its framebuffer is, for anything that wants to read
+ * guest pixels directly. There was only a setter, so every such reader carried
+ * its own hardcoded address instead -- and a title that moves its framebuffer
+ * (which is most of them, once it owns one) left that constant pointing at
+ * uninitialised memory. A dump taken there is not empty, it is noise, which
+ * reads as "the title drew garbage" rather than "you read the wrong page". */
+uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch)
+{
+    if (pitch)
+        *pitch = s_fb_pitch;
+    return s_fb_va;
+}
+
 static void framebuffer_probe_tick(void)
 {
     static DWORD last_ms;

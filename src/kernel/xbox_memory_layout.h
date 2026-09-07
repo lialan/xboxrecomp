@@ -177,6 +177,8 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
+/* Read it back: 0 until the title sets a mode. Pitch is optional. */
+uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 
 /* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
  * below 256 MB, or 0 when the arena is exhausted. */

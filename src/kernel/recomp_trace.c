@@ -92,6 +92,21 @@ static void prof_report(void)
     fflush(stderr);
 }
 
+/* RECOMP_TRACE_PROFILE=1 profiles; a larger number is also how often to
+ * report, in calls. The default suits a title burning a core in a spin loop;
+ * a title that no longer has one may never reach it, and then the only report
+ * is the one at exit -- which a killed run never gets. */
+static unsigned long long prof_interval(void)
+{
+    static unsigned long long every;
+    if (!every) {
+        const char *v = getenv("RECOMP_TRACE_PROFILE");
+        unsigned long long n = v ? strtoull(v, NULL, 0) : 0;
+        every = n > 1 ? n : 20000000ull;
+    }
+    return every;
+}
+
 static int prof_enabled(void)
 {
     static int on = -1;
@@ -111,7 +126,7 @@ static void prof_count(const char *name, uint32_t va)
     /* A title being profiled for a hang or a slowdown is a title that gets
      * killed rather than exited, and a kill does not reach atexit. Report as
      * it goes, so there is always a recent one. */
-    if (++g_prof_calls % 20000000ull == 0)
+    if (++g_prof_calls % prof_interval() == 0)
         prof_report();
 
     for (n = 0; n < PROF_SLOTS; n++) {
