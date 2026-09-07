@@ -40,7 +40,12 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 #define HcRhDescriptorB         0x4C
 #define HcRhStatus              0x50
 #define HcRhPortStatus1         0x54
-#define OHCI_REG_MAX            0x60
+/* Through port 4. The root hub here reports two downstream ports, and the
+ * driver reads four status registers regardless -- so the file has to cover
+ * them or the last one falls outside the array and is answered by the
+ * not-a-register path instead of by an empty port. Same value either way,
+ * reached honestly. */
+#define OHCI_REG_MAX            0x64
 
 /* HcCommandStatus */
 #define CS_HCR                  0x00000001u   /* host controller reset       */
