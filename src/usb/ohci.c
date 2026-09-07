@@ -9,6 +9,7 @@
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
+#include "usb_gamepad.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,8 @@ extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 #endif
 extern OHCI_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern OHCI_TLS uint32_t g_ebx, g_esi, g_edi;
+extern OHCI_TLS uint32_t g_fs_base;
+extern uint32_t xbox_AllocThreadTib(void);
 
 /* The vector XPP takes for USB0. HalGetInterruptVector(1) returns 1 here, and
  * the bus interrupt level is what the XDK passes. */
@@ -267,6 +270,206 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
     }
 }
 
+/* ---- the control list -------------------------------------------------- */
+/*
+ * A host controller is a bus master: the driver builds endpoint and transfer
+ * descriptors in RAM, points HcControlHeadED at them and sets ControlListFilled,
+ * and the controller walks that list itself. Nothing arrives through MMIO, so
+ * none of this is visible to the register trace -- which is why the driver
+ * looked idle after the port came up.
+ *
+ * OHCI 1.0a, section 4. An endpoint descriptor is four dwords:
+ *
+ *   +0  FA | EN<<7 | D<<11 | S<<13 | K<<14 | F<<15 | MPS<<16
+ *   +4  TailP        queue tail, 16-byte aligned
+ *   +8  HeadP        queue head, with Halted in bit 0 and toggleCarry in bit 1
+ *   +C  NextED
+ *
+ * and a general transfer descriptor is four more:
+ *
+ *   +0  ... DP<<19 | DI<<21 | T<<24 | EC<<26 | CC<<28
+ *   +4  CBP          current buffer pointer, 0 when the transfer moved nothing
+ *   +8  NextTD
+ *   +C  BE           last byte of the buffer, inclusive
+ *
+ * A transfer is done when HeadP reaches TailP. Completed descriptors go on the
+ * done queue, newest first, and the controller publishes it in the HCCA and
+ * raises WritebackDoneHead.
+ */
+#define ED_SKIP        (1u << 14)
+#define ED_HEAD_HALT   (1u << 0)
+#define ED_HEAD_TOGGLE (1u << 1)
+#define ED_PTR_MASK    0xFFFFFFF0u
+
+#define TD_DP_SETUP    0u
+#define TD_DP_OUT      1u
+#define TD_DP_IN       2u
+#define TD_CC_NOERROR  0u
+#define TD_CC_STALL    4u
+
+#define HCCA_DONE_HEAD 0x84
+
+static uint32_t g_setup_pending;      /* wLength of the last SETUP seen */
+static UsbSetup g_setup;
+
+/* Every address below came out of guest memory, so none of them are trusted.
+ *
+ * This is not theoretical. The driver writes HcControlHeadED twice during
+ * bring-up, and the second write is 0xCCCCCCCC -- MSVC's uninitialised-memory
+ * fill, left there by a local that was never assigned. Following it lands far
+ * outside the mapping and takes the runtime down with an access violation,
+ * which is a crash the title itself would never have had. A device model
+ * following a pointer a title left lying around has to check it first.
+ */
+static int guest_ok(uint32_t va, uint32_t bytes)
+{
+    size_t mapped = xbox_GetMappedSize();
+    return va != 0 && mapped != 0
+        && (uint64_t)va + bytes <= (uint64_t)mapped;
+}
+
+static uint32_t rd32(uint32_t va)
+{
+    if (!guest_ok(va, 4))
+        return 0;
+    return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
+}
+static void wr32(uint32_t va, uint32_t v)
+{
+    if (!guest_ok(va, 4))
+        return;
+    *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
+}
+static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
+{
+    return guest_ok(va, bytes)
+         ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
+}
+
+/* Move one transfer descriptor. Returns the condition code to report. */
+static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
+{
+    uint32_t info = rd32(td);
+    uint32_t cbp  = rd32(td + 4);
+    uint32_t be   = rd32(td + 12);
+    uint32_t dp   = (info >> 19) & 3u;
+    int      len  = (cbp && be >= cbp) ? (int)(be - cbp + 1) : 0;
+    uint32_t endpoint = (ed0 >> 7) & 0xFu;
+    int      moved = 0;
+
+    if (dp == TD_DP_SETUP) {
+        /* Eight bytes of setup, kept for the data stage that follows. */
+        if (len >= 8) {
+            const uint8_t *p = guest_ptr(cbp, 8);
+            if (!p) return TD_CC_NOERROR;
+            g_setup.bmRequestType = p[0];
+            g_setup.bRequest      = p[1];
+            g_setup.wValue        = (uint16_t)(p[2] | (p[3] << 8));
+            g_setup.wIndex        = (uint16_t)(p[4] | (p[5] << 8));
+            g_setup.wLength       = (uint16_t)(p[6] | (p[7] << 8));
+            g_setup_pending = 1;
+            if (s_trace) {
+                fprintf(stderr, "  [OHCI%d] SETUP %02X %02X value %04X "
+                                "index %04X len %u\n",
+                        hc->index, g_setup.bmRequestType, g_setup.bRequest,
+                        g_setup.wValue, g_setup.wIndex, g_setup.wLength);
+                fflush(stderr);
+            }
+            moved = 8;
+        }
+    } else if (dp == TD_DP_IN) {
+        if (endpoint == 0) {
+            /* Data stage of a control transfer, or its status stage when the
+             * driver asks for nothing. */
+            uint8_t buf[64];
+            int n;
+
+            if (!g_setup_pending)
+                return TD_CC_NOERROR;
+            n = usb_gamepad_control(&g_setup, buf, (int)sizeof buf);
+            if (n < 0) {
+                g_setup_pending = 0;
+                return TD_CC_STALL;
+            }
+            if (n > len) n = len;
+            if (n > 0 && guest_ptr(cbp, (uint32_t)n))
+                memcpy(guest_ptr(cbp, (uint32_t)n), buf, (size_t)n);
+            moved = n;
+            if (s_trace && n > 0) {
+                fprintf(stderr, "  [OHCI%d] IN ep0 %d bytes\n", hc->index, n);
+                fflush(stderr);
+            }
+        } else {
+            /* The pad's report, on its interrupt endpoint. */
+            uint8_t rep[32];
+            int n = usb_gamepad_report(rep, (int)sizeof rep);
+            if (n > len) n = len;
+            if (n > 0 && guest_ptr(cbp, (uint32_t)n))
+                memcpy(guest_ptr(cbp, (uint32_t)n), rep, (size_t)n);
+            moved = n;
+        }
+    } else {
+        /* OUT: the status stage of an IN control transfer, or rumble. Both
+         * are accepted and discarded. */
+        moved = len;
+        g_setup_pending = 0;
+    }
+
+    /* CBP is zero when everything asked for moved, and otherwise points past
+     * what did. A driver computes the transferred length from it. */
+    wr32(td + 4, (moved >= len) ? 0u : cbp + (uint32_t)moved);
+    return TD_CC_NOERROR;
+}
+
+/* Walk the control list once. Returns 1 if anything completed. */
+static int ohci_run_control_list(OhciController *hc)
+{
+    uint32_t ed = hc->reg[HcControlHeadED / 4] & ED_PTR_MASK;
+    uint32_t done_head = 0;
+    int completed = 0, guard = 0;
+
+    while (guest_ok(ed, 16) && ++guard < 64) {
+        uint32_t ed0  = rd32(ed);
+        uint32_t tail = rd32(ed + 4) & ED_PTR_MASK;
+        uint32_t head = rd32(ed + 8);
+        int tguard = 0;
+
+        if (ed0 & ED_SKIP) { ed = rd32(ed + 12) & ED_PTR_MASK; continue; }
+        if (head & ED_HEAD_HALT) { ed = rd32(ed + 12) & ED_PTR_MASK; continue; }
+
+        while ((head & ED_PTR_MASK) != tail
+            && guest_ok(head & ED_PTR_MASK, 16) && ++tguard < 64) {
+            uint32_t td = head & ED_PTR_MASK;
+            uint32_t next = rd32(td + 8) & ED_PTR_MASK;
+            uint32_t cc = ohci_do_td(hc, ed0, td);
+
+            /* Report the outcome where the driver reads it, then put the
+             * descriptor on the done queue, newest first. */
+            wr32(td, (rd32(td) & 0x0FFFFFFFu) | (cc << 28));
+            wr32(td + 8, done_head);
+            done_head = td;
+            completed++;
+
+            head = next | (head & ED_HEAD_TOGGLE);
+            if (cc != TD_CC_NOERROR) {
+                head |= ED_HEAD_HALT;       /* a stall halts the endpoint */
+                break;
+            }
+        }
+        wr32(ed + 8, head);
+        ed = rd32(ed + 12) & ED_PTR_MASK;
+    }
+
+    if (completed) {
+        uint32_t hcca = hc->reg[HcHCCA / 4];
+        if (hcca)
+            wr32(hcca + HCCA_DONE_HEAD, done_head);
+        hc->reg[HcDoneHead / 4] = done_head;
+        hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
+    }
+    return completed;
+}
+
 /* ---- raising an interrupt --------------------------------------------- */
 
 /* Call the title's ISR on this thread, with a guest stack under it.
@@ -413,11 +616,31 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
  */
 static DWORD WINAPI ohci_thread(LPVOID unused)
 {
+    /* This thread calls recompiled code, so it needs what any thread running
+     * recompiled code needs: its own TIB. The guest register set is already
+     * thread-local and the ISR gets a worker stack, but fs:[0] is the SEH
+     * chain head and fs:[4] reaches the CRT's per-thread data -- and a guest
+     * function with an SEH prologue on a thread whose g_fs_base is zero
+     * dereferences null before it executes a line of its own body. That is
+     * what killed the process here, two interrupts in, with no fault report
+     * because the fault was in the runtime rather than in the title. */
     unsigned waited = 0;
     int plugged = 0;
-    unsigned delivered = 0;
+    uint32_t last_status = 0;
+    unsigned repeats = 0;
 
     (void)unused;
+    {
+        uint32_t tib = xbox_AllocThreadTib();
+        if (!tib) {
+            fprintf(stderr, "  [OHCI0] no TIB for the controller thread; "
+                            "not delivering interrupts\n");
+            fflush(stderr);
+            return 0;
+        }
+        g_fs_base = tib;
+    }
+
     for (;;) {
         OhciController *hc = &s_hc[0];
         uint32_t control, enable, status;
@@ -450,6 +673,17 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             fflush(stderr);
         }
 
+        /* Be the bus master. ControlListEnable in HcControl says the driver
+         * wants the list walked; ControlListFilled says it has put something
+         * on it. Walking on the tick rather than only when CLF is written
+         * costs a read of a guest dword and means a descriptor queued without
+         * rewriting CLF is still moved -- which is legal, and drivers do it. */
+        if ((control & 0x10u)
+         && guest_ok(hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, 16)) {
+            if (ohci_run_control_list(hc))
+                hc->reg[HcCommandStatus / 4] &= ~0x02u;   /* CLF consumed */
+        }
+
         /* Level-triggered, which is what OHCI is: while an enabled source is
          * set, the line is asserted. The handler clears the status bit, so
          * this stops on its own -- and if it ever does not, the cap below says
@@ -458,12 +692,19 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         if (!status)
             continue;
 
-        if (++delivered > 200) {
-            fprintf(stderr, "  [OHCI0] 200 interrupts with status still %08X; "
-                            "the handler is not clearing it, stopping\n",
-                    status);
-            fflush(stderr);
-            break;
+        /* A stuck source is one the handler never clears, which shows up as
+         * the same status delivered over and over. Counting deliveries alone
+         * would trip on a device that is simply busy. */
+        if (status == last_status) {
+            if (++repeats > 200) {
+                fprintf(stderr, "  [OHCI0] status %08X delivered 200 times "
+                                "without being cleared; stopping\n", status);
+                fflush(stderr);
+                break;
+            }
+        } else {
+            last_status = status;
+            repeats = 0;
         }
         ohci_raise(hc, status);
     }

@@ -2039,6 +2039,20 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         return 0;
     }
     g_esp = XBOX_WORKER_STACK_TOP(slot);
+    {
+        /* Its own TIB, for the same reason bridge_thread_main gives one to
+         * every worker: a DPC routine with an SEH prologue reads fs:[0],
+         * and a thread whose g_fs_base is zero faults inside the runtime
+         * before the routine runs. */
+        uint32_t tib = xbox_AllocThreadTib();
+        if (!tib) {
+            fprintf(stderr, "  [KERNEL] timer thread has no TIB; "
+                            "timer DPCs will not run\n");
+            fflush(stderr);
+            return 0;
+        }
+        g_fs_base = tib;
+    }
 
     for (;;) {
         long long now;
