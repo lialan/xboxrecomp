@@ -1829,9 +1829,62 @@ static void bridge_KeRemoveQueueDpc(void)
     g_eax = 0;
 }
 
+/* The pending DPC queue.
+ *
+ * These used to run inline, on whichever thread queued them, before the caller
+ * returned. That is not what a DPC is: an interrupt service routine masks its
+ * source and queues, and the deferred routine runs afterwards at DISPATCH_LEVEL
+ * -- after the ISR has returned. Running it inline inverts that, so a routine
+ * that re-enables interrupts does it while the ISR that masked them is still on
+ * the stack, and a driver's state machine re-enters itself from inside its own
+ * interrupt.
+ *
+ * Queued properly now, and drained by the timer thread, which is the one thread
+ * here that already has a guest stack and a TIB and runs nothing else urgent.
+ *
+ * ponytail: one queue, no IRQL, no per-processor list, and a DPC queued from a
+ * DPC runs on the next drain rather than immediately. Nothing here depends on
+ * DPC ordering beyond "after the ISR".
+ */
+#define XBOX_MAX_PENDING_DPC 64
+typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
+static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
+static volatile LONG g_dpc_head, g_dpc_tail;
+
 static void bridge_KeInsertQueueDpc(void)
 {
-    g_eax = kernel_run_dpc(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2));
+    uint32_t dpc  = STACK_ARG(0);
+    uint32_t arg1 = STACK_ARG(1);
+    uint32_t arg2 = STACK_ARG(2);
+    LONG tail, next;
+
+    if (!dpc) { g_eax = 0; return; }
+
+    tail = g_dpc_tail;
+    next = (tail + 1) % XBOX_MAX_PENDING_DPC;
+    if (next == g_dpc_head) {
+        fprintf(stderr, "  [KERNEL] DPC queue full, dropping 0x%08X\n", dpc);
+        fflush(stderr);
+        g_eax = 0;
+        return;
+    }
+    g_dpc_queue[tail].dpc  = dpc;
+    g_dpc_queue[tail].arg1 = arg1;
+    g_dpc_queue[tail].arg2 = arg2;
+    g_dpc_tail = next;
+    g_eax = 1;
+}
+
+/* Run whatever is queued. Called from the timer thread, which has the guest
+ * stack and TIB that a deferred routine needs. */
+static void kernel_drain_dpcs(void)
+{
+    while (g_dpc_head != g_dpc_tail) {
+        LONG head = g_dpc_head;
+        PendingDpc d = g_dpc_queue[head];
+        g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
+        kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+    }
 }
 
 /* ── KeInitializeDpc (ordinal 107) ────────────────────────
@@ -2059,6 +2112,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i;
 
         Sleep(10);
+        kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
