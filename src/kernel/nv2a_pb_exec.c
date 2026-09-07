@@ -30,6 +30,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
+/* The swizzle decoder the D3D8 layer already uses -- one implementation of
+ * Morton order, not a second one that can disagree with it. */
+#include "../d3d/d3d8_swizzle.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -218,8 +221,14 @@ static void record_tex_reg(uint32_t method, uint32_t param)
 {
     s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
     s_tex_set[(method - NV_TEX_FIRST) / 4] = 1;
-    s_gpu.tex.valid = s_gpu.tex.offset && s_gpu.tex.pitch
-                   && s_gpu.tex.width  && s_gpu.tex.height;
+    /* A pitch is a linear texture's property. A swizzled one has no rows and
+     * so no pitch, and requiring one here refused every swizzled texture --
+     * which is nearly all of them, since swizzled is the Xbox default. That
+     * left the title's own textures unsampled and every textured quad drawn in
+     * flat vertex colour. */
+    s_gpu.tex.valid = s_gpu.tex.offset && s_gpu.tex.width && s_gpu.tex.height
+                   && (d3d8_format_is_swizzled(s_gpu.tex.color)
+                       || s_gpu.tex.pitch);
 }
 
 static void note_unhandled(uint32_t method)
@@ -557,18 +566,53 @@ static uint32_t expand(uint32_t v, uint32_t bits)
     return v * 255u / ((1u << bits) - 1u);
 }
 
+/* The linear format that decodes the same texels as a swizzled one.
+ *
+ * Swizzling changes where a texel lives, not what it says: A8R8G8B8 (0x06) and
+ * LIN_A8R8G8B8 (0x12) are the same four bytes in the same order. So the whole
+ * difference is the address calculation, and one of those lets every format
+ * below serve both. Pairs read off the table in d3d8_xbox.h rather than
+ * recalled -- the comment above this one is about getting exactly that wrong. */
+static uint32_t linear_twin(uint32_t fmt)
+{
+    switch (fmt) {
+    case 0x00: return 0x13;                /* L8        -> LIN_L8        */
+    case 0x02: return 0x10;                /* A1R5G5B5  -> LIN_A1R5G5B5  */
+    case 0x03: return 0x1C;                /* X1R5G5B5  -> LIN_X1R5G5B5  */
+    case 0x04: return 0x1D;                /* A4R4G4B4  -> LIN_A4R4G4B4  */
+    case 0x05: return 0x11;                /* R5G6B5    -> LIN_R5G6B5    */
+    case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
+    case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
+    case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
+    default:   return fmt;                 /* already linear, or unhandled */
+    }
+}
+
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint8_t *p;
+    uint32_t fmt;
 
     if (!s_gpu.tex.valid)
         return 0;
     u = wrap_coord(u, s_gpu.tex.width,  s_gpu.tex.addr_u);
     v = wrap_coord(v, s_gpu.tex.height, s_gpu.tex.addr_v);
-    p = mem + s_gpu.tex.offset + (size_t)v * s_gpu.tex.pitch;
 
-    switch (s_gpu.tex.color) {
+    fmt = s_gpu.tex.color;
+    if (d3d8_format_is_swizzled(fmt)) {
+        /* Morton order: a texel's index is interleaved from x and y instead of
+         * v*pitch + u, so index from the base of the image. The switch below
+         * casts to each format's own width, which makes that index a texel
+         * index for every one of them. */
+        fmt = linear_twin(fmt);
+        p = mem + s_gpu.tex.offset;
+        u = swizzle_offset(u, v, s_gpu.tex.width, s_gpu.tex.height);
+    } else {
+        p = mem + s_gpu.tex.offset + (size_t)v * s_gpu.tex.pitch;
+    }
+
+    switch (fmt) {
 
     /* 32-bit, alpha-red-green-blue in the dword. */
     case 0x12:                                      /* LIN_A8R8G8B8 */
@@ -763,19 +807,48 @@ static const VertexAttr *color_attr(void)
 }
 
 /* Attribute 9 is texture coordinate 0 in the NV2A vertex layout, the same way
- * 0 is position and 3 is diffuse. Nothing clever to fall back to: a batch that
- * does not set it is not textured. */
+ * 0 is position and 3 is diffuse -- for a title that follows the convention.
+ *
+ * Half-Life 2 does not, in either place. Its menu and HUD vertex is position,
+ * colour, texcoord at stride 24, with the colour in slot 5 and the texcoords
+ * in slot 7, so reading slot 9 found nothing and every batch drew untextured.
+ * That is invisible rather than wrong-looking: the menu paints a full-screen
+ * quad and then draws its text over it, and with no sampling both come out
+ * white, so the screen is blank white and nothing suggests the text was ever
+ * drawn.
+ *
+ * Falling back to the format works because the three attributes of such a
+ * vertex are distinguishable: position is float3, colour is D3DCOLOR, and a
+ * float2 is a texture coordinate and nothing else.
+ *
+ * ponytail: takes the first float2 it finds, so a title with two texcoord sets
+ * gets stage 0's -- which is what this single-texture rasteriser samples
+ * anyway. Multi-texture wants the D3D11 translator, not another heuristic. */
 static const VertexAttr *texcoord_attr(void)
 {
+    uint32_t a;
+
+    if (s_gpu.attr[9].offset && s_gpu.attr[9].stride)
+        return &s_gpu.attr[9];
+    for (a = 0; a < NV_VERTEX_ATTRS; a++)
+        if (s_gpu.attr[a].type == 2 && s_gpu.attr[a].size == 2
+                && s_gpu.attr[a].offset && s_gpu.attr[a].stride)
+            return &s_gpu.attr[a];
     return &s_gpu.attr[9];
 }
 
-/* Texel coordinates, not normalised ones.
+/* Texel coordinates, whichever convention the title used.
  *
- * The two conventions are not interchangeable and the format decides which is
- * in force: a swizzled texture is addressed in [0,1], a linear one in texels.
- * sample_texture only reads linear formats, so this only ever sees the second.
- */
+ * The two are not interchangeable and the format decides which is in force: a
+ * swizzled texture is addressed in [0,1], a linear one in texels. Both are
+ * scaled to texels here so that everything downstream -- the barycentric
+ * interpolation and the sampler -- works in one unit.
+ *
+ * This mattered the moment swizzled formats became samplable. Normalised
+ * coordinates truncated to a texel index land on texel 0 for any coordinate
+ * below 1.0, so a whole quad sampled a single texel and came out flat: the
+ * background painted one near-black colour, which looks like a texture that
+ * decoded wrong rather than one that was never indexed. */
 static int fetch_texcoord(uint32_t index, float out[2])
 {
     float t[4];
@@ -784,6 +857,10 @@ static int fetch_texcoord(uint32_t index, float out[2])
         return 0;
     out[0] = t[0];
     out[1] = t[1];
+    if (d3d8_format_is_swizzled(s_gpu.tex.color)) {
+        out[0] *= (float)s_gpu.tex.width;
+        out[1] *= (float)s_gpu.tex.height;
+    }
     return 1;
 }
 
@@ -984,11 +1061,27 @@ static void draw_primitive(void)
                             " off 0x%08X type %u size %u stride %u\n",
                     s_gpu.prim, s_gpu.idx_count, s_gpu.attr[0].offset,
                     s_gpu.attr[0].type, s_gpu.attr[0].size, s_gpu.attr[0].stride);
+            /* The texture stage, for either kind of batch. This used to print
+             * only for inline batches, which meant a title drawing through
+             * vertex arrays -- Half-Life 2's menu, for one -- showed no
+             * texture state at all, and the reason a quad sampled flat was
+             * invisible. */
+            fprintf(stderr, "  [GPU]   tex: off 0x%08X %ux%u pitch %u"
+                            " colour 0x%02X swizzled %d valid %d\n",
+                    s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
+                    s_gpu.tex.pitch, s_gpu.tex.color,
+                    d3d8_format_is_swizzled(s_gpu.tex.color), s_gpu.tex.valid);
+            {
+                uint32_t k;
+                for (k = 0; k < s_gpu.idx_count && k < 3; k++) {
+                    float t[2];
+                    if (fetch_texcoord(s_gpu.idx[k], t))
+                        fprintf(stderr, "  [GPU]   uv[%u] = %.3f %.3f\n",
+                                k, t[0], t[1]);
+                }
+            }
             /* An inline batch has no guest buffer to go and look at -- the
-             * vertices are the payload -- so print the payload and what the
-             * texture stage will be sampled with. Which of the two texture
-             * coordinate conventions is in force is not a guess anyone should
-             * be making from the format code alone. */
+             * vertices are the payload -- so print the payload too. */
             if (s_gpu.inline_active) {
                 uint32_t k;
                 fprintf(stderr, "  [GPU]   inline %u dwords:", s_gpu.inline_count);
@@ -1205,6 +1298,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_TEXTURE_FORMAT:
         s_gpu.tex.color = (param >> 8) & 0xFF;
+        /* A swizzled texture carries its own dimensions here, as log2 in
+         * BASE_SIZE_U/V (nv2a_regs.h: 0x00F00000 / 0x0F000000). It has to:
+         * SET_TEXTURE_IMAGE_RECT describes a linear image, and a title that
+         * only uses swizzled textures never sends one -- this title sends it
+         * once and sets a format 3,176 times. Without this the width and
+         * height stayed zero and nothing was ever sampled. */
+        if (d3d8_format_is_swizzled((param >> 8) & 0xFF)) {
+            s_gpu.tex.width  = 1u << ((param >> 20) & 0xF);
+            s_gpu.tex.height = 1u << ((param >> 24) & 0xF);
+        }
         record_tex_reg(method, param);
         break;
 
