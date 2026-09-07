@@ -15,4 +15,12 @@ if(WIN32)
     if(MSVC)
         target_compile_options(d3d8_smoke PRIVATE /W3)
     endif()
+
+    # Exercise bound state objects on D3D11's software device (no window/GPU).
+    add_executable(d3d8_states_smoke
+        test_states.c
+        ../../src/d3d/d3d8_states.c
+    )
+    target_include_directories(d3d8_states_smoke PRIVATE ../../src/d3d)
+    target_link_libraries(d3d8_states_smoke PRIVATE platform d3d11)
 endif()
