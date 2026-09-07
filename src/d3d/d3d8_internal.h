@@ -281,8 +281,8 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
 HRESULT d3d8_shaders_init(void);
 void    d3d8_shaders_shutdown(void);
 
-/* Bind shaders + input layout for the given FVF, upload transform CBs */
-void    d3d8_shaders_prepare_draw(DWORD fvf);
+/* Select programmable/FVF vertex state and refresh fixed-function pixel state. */
+void    d3d8_shaders_prepare_draw(DWORD handle);
 
 /* ================================================================
  * NV2A Register Combiner pixel shaders (d3d8_combiners.c)

@@ -8,6 +8,8 @@
 
 static ID3D11Device *device;
 static ID3D11DeviceContext *context;
+static ID3D11VertexShader *vs;
+static ID3D11Buffer *programmable_constants;
 static IDirect3DBaseTexture8 *textures[4];
 static DWORD states[512], stages[4][64];
 static const D3DMATRIX identity = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -28,6 +30,17 @@ BOOL d3d8_GetLightEnable(DWORD index) { (void)index; return FALSE; }
 const D3DMATERIAL8 *d3d8_GetMaterial(void) { return NULL; }
 UINT d3d8_GetNumLights(void) { return 0; }
 
+/* Model successful programmable-VS preparation without Xbox microcode.
+ * Bind real D3D11 vertex state so pixel preparation must preserve it. */
+BOOL d3d8_vsh_prepare_draw(DWORD handle)
+{
+    if (handle != 0x10000) return FALSE;
+    ID3D11DeviceContext_VSSetShader(context, vs, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(context, NULL);
+    ID3D11DeviceContext_VSSetConstantBuffers(context, 1, 1, &programmable_constants);
+    return TRUE;
+}
+
 #define REQUIRE(call) do { HRESULT hr = (call); if (FAILED(hr)) { \
     fprintf(stderr, "%s: HRESULT 0x%08lx\n", #call, (unsigned long)hr); exit(1); } } while (0)
 
@@ -44,13 +57,13 @@ int main(void)
     static const BYTE alphas[] = {0, 1, 127, 255};
     ID3D11Texture2D *target, *readback;
     ID3D11RenderTargetView *rtv;
-    ID3D11VertexShader *vs;
     ID3D11SamplerState *sampler;
     ID3D11RasterizerState *rasterizer;
     ID3DBlob *blob;
     D3D11_TEXTURE2D_DESC td = {0};
     D3D11_SAMPLER_DESC sd = {0};
     D3D11_RASTERIZER_DESC rd = {0};
+    D3D11_BUFFER_DESC cbd = {0};
     D3D11_VIEWPORT viewport = {0, 0, 1, 1, 0, 1};
     unsigned f, a, stage, path, c, kind;
     int failures = 0;
@@ -64,6 +77,9 @@ int main(void)
     REQUIRE(ID3D11Device_CreateVertexShader(device, ID3D10Blob_GetBufferPointer(blob),
         ID3D10Blob_GetBufferSize(blob), NULL, &vs));
     ID3D10Blob_Release(blob);
+    cbd.ByteWidth = 16;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    REQUIRE(ID3D11Device_CreateBuffer(device, &cbd, NULL, &programmable_constants));
     td.Width = td.Height = td.MipLevels = td.ArraySize = td.SampleDesc.Count = 1;
     td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     td.BindFlags = D3D11_BIND_RENDER_TARGET;
@@ -141,12 +157,36 @@ int main(void)
                     else if (kind == 2) REQUIRE(volume->lpVtbl->UnlockBox(volume, 1));
                     else REQUIRE(flat->lpVtbl->UnlockRect(flat, 1));
                 }
-                for (path = 0; path < 2; path++) {
+                for (path = 0; path < (kind == 0 ? 3u : 2u); path++) {
                     D3D11_MAPPED_SUBRESOURCE mapped;
-                    d3d8_shaders_prepare_draw(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
-                    if (path && !d3d8_combiners_prepare_draw()) return 1;
-                    ID3D11DeviceContext_VSSetShader(context, vs, NULL, 0);
-                    ID3D11DeviceContext_IASetInputLayout(context, NULL);
+                    if (path == 2) {
+                        D3D8Texture previous = *(D3D8Texture *)tex;
+                        ID3D11VertexShader *bound_vs;
+                        ID3D11Buffer *bound_cb;
+                        ID3D11InputLayout *bound_layout;
+                        /* Seed an FFP draw with the opposite format, then
+                         * switch texture and vertex shader before the draw. */
+                        previous.d3d8_format = f == 2 ? D3DFMT_A8 : D3DFMT_LIN_A8R8G8B8;
+                        textures[stage] = (IDirect3DBaseTexture8 *)&previous;
+                        d3d8_shaders_prepare_draw(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+                        textures[stage] = tex;
+                        d3d8_shaders_prepare_draw(0x10000);
+                        ID3D11DeviceContext_VSGetShader(context, &bound_vs, NULL, NULL);
+                        ID3D11DeviceContext_VSGetConstantBuffers(context, 1, 1, &bound_cb);
+                        ID3D11DeviceContext_IAGetInputLayout(context, &bound_layout);
+                        if (bound_vs != vs || bound_cb != programmable_constants || bound_layout) {
+                            fprintf(stderr, "FAIL programmable vertex state overwritten\n");
+                            failures++;
+                        }
+                        if (bound_vs) ID3D11VertexShader_Release(bound_vs);
+                        if (bound_cb) ID3D11Buffer_Release(bound_cb);
+                        if (bound_layout) ID3D11InputLayout_Release(bound_layout);
+                    } else {
+                        d3d8_shaders_prepare_draw(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+                        if (path && !d3d8_combiners_prepare_draw()) return 1;
+                        ID3D11DeviceContext_VSSetShader(context, vs, NULL, 0);
+                        ID3D11DeviceContext_IASetInputLayout(context, NULL);
+                    }
                     ID3D11DeviceContext_IASetPrimitiveTopology(context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                     ID3D11DeviceContext_Draw(context, 3, 0);
                     ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)readback, (ID3D11Resource *)target);
@@ -154,7 +194,7 @@ int main(void)
                     if (memcmp(mapped.pData, expected, 4)) {
                         BYTE *got = mapped.pData;
                         fprintf(stderr, "FAIL kind=%u stage=%u format=0x%x alpha=%u path=%s: RGBA=%u,%u,%u,%u\n",
-                            kind, stage, formats[f], alphas[a], path ? "combiner" : "fixed",
+                            kind, stage, formats[f], alphas[a], path == 2 ? "programmable-VS" : path ? "combiner" : "fixed",
                             got[0], got[1], got[2], got[3]);
                         failures++;
                     }
@@ -173,11 +213,12 @@ int main(void)
     ID3D11RasterizerState_Release(rasterizer);
     ID3D11SamplerState_Release(sampler);
     ID3D11VertexShader_Release(vs);
+    ID3D11Buffer_Release(programmable_constants);
     ID3D11RenderTargetView_Release(rtv);
     ID3D11Texture2D_Release(target);
     ID3D11Texture2D_Release(readback);
     ID3D11DeviceContext_Release(context);
     ID3D11Device_Release(device);
-    printf("d3d8_a8: %d failures (288 draws)\n", failures);
+    printf("d3d8_a8: %d failures (336 draws)\n", failures);
     return failures != 0;
 }

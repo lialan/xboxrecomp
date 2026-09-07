@@ -894,11 +894,10 @@ void d3d8_shaders_shutdown(void)
  * Pre-draw binding
  * ================================================================ */
 
-void d3d8_shaders_prepare_draw(DWORD fvf)
+static void ff_vs_prepare_draw(DWORD fvf)
 {
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     ID3D11InputLayout *layout;
-    ID3D11PixelShader *ps;
     D3D11_MAPPED_SUBRESOURCE mapped;
     const D3DMATRIX *world, *view, *proj;
     const DWORD *rs;
@@ -910,14 +909,7 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
     rs = d3d8_GetRenderStates();
     tex_count = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
 
-    /* Bind the fixed-function pixel shader matching the texture types
-     * currently bound to each stage (2D/cube/volume). */
-    ps = ff_ps_get_shader(ff_ps_compute_signature());
-    if (!ps) return;
-
-    /* Bind shaders */
     ID3D11DeviceContext_VSSetShader(ctx, g_vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
 
     /* Bind input layout */
     layout = get_or_create_layout(fvf);
@@ -1090,6 +1082,31 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vs_light_cb, 0);
     }
 
+    {
+        ID3D11Buffer *vs_cbs[2] = { g_vs_cb, g_vs_light_cb };
+        ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 2, vs_cbs);
+    }
+}
+
+void d3d8_shaders_prepare_draw(DWORD handle)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    ID3D11PixelShader *ps;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    const DWORD *rs;
+    HRESULT hr;
+
+    if (!ctx) return;
+    if (!d3d8_vsh_prepare_draw(handle))
+        ff_vs_prepare_draw(handle);
+
+    /* Pixel state is independent of whether the vertex shader is programmable. */
+    if (!g_ps_cb) return;
+    ps = ff_ps_get_shader(ff_ps_compute_signature());
+    if (!ps) return;
+    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+    rs = d3d8_GetRenderStates();
+
     /* ---- PS Constant Buffer ---- */
     hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_ps_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (SUCCEEDED(hr)) {
@@ -1168,10 +1185,5 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_ps_cb, 0);
     }
 
-    /* Bind constant buffers */
-    {
-        ID3D11Buffer *vs_cbs[2] = { g_vs_cb, g_vs_light_cb };
-        ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 2, vs_cbs);
-    }
     ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_ps_cb);
 }
