@@ -469,7 +469,12 @@ void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch)
  * its own hardcoded address instead -- and a title that moves its framebuffer
  * (which is most of them, once it owns one) left that constant pointing at
  * uninitialised memory. A dump taken there is not empty, it is noise, which
- * reads as "the title drew garbage" rather than "you read the wrong page". */
+ * reads as "the title drew garbage" rather than "you read the wrong page".
+ *
+ * This is the resolved address, not the physical one AvSetDisplayMode states:
+ * the caller resolves before storing, because a physical framebuffer address
+ * read directly lands in the loaded image. Getting that wrong is the same bug
+ * twice over -- once in the probe below, once in a caller of this. */
 uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch)
 {
     if (pitch)

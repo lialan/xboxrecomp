@@ -244,6 +244,46 @@ static void record_tex_reg(uint32_t method, uint32_t param)
                        || s_gpu.tex.pitch);
 }
 
+/* Every distinct texture a batch was drawn with, and how many batches used it.
+ *
+ * The per-draw verbose print shows the first few draws of the first frame,
+ * which is enough to see that texturing works at all and not enough to answer
+ * "is a font page ever bound". This is the same shape as the unhandled-method
+ * table below it: a small set, ranked, printed with the rest of the report. */
+#define PB_EXEC_MAX_TEXTURES 64
+typedef struct {
+    uint32_t offset, color, width, height, batches;
+} PbTexUse;
+static PbTexUse s_tex_use[PB_EXEC_MAX_TEXTURES];
+static int s_tex_use_count;
+
+/* Defined below, next to the sampler it goes through. */
+static void dump_texture_bmp(uint32_t seq);
+
+static void note_texture_use(void)
+{
+    int i;
+
+    if (!s_gpu.tex.valid)
+        return;
+    for (i = 0; i < s_tex_use_count; i++) {
+        if (s_tex_use[i].offset == s_gpu.tex.offset
+         && s_tex_use[i].color  == s_gpu.tex.color) {
+            s_tex_use[i].batches++;
+            return;
+        }
+    }
+    if (s_tex_use_count < PB_EXEC_MAX_TEXTURES) {
+        s_tex_use[s_tex_use_count].offset  = s_gpu.tex.offset;
+        s_tex_use[s_tex_use_count].color   = s_gpu.tex.color;
+        s_tex_use[s_tex_use_count].width   = s_gpu.tex.width;
+        s_tex_use[s_tex_use_count].height  = s_gpu.tex.height;
+        s_tex_use[s_tex_use_count].batches = 1;
+        s_tex_use_count++;
+        dump_texture_bmp((uint32_t)s_tex_use_count - 1);
+    }
+}
+
 static void note_unhandled(uint32_t method)
 {
     int i;
@@ -706,6 +746,72 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
     }
 }
 
+/* Write a bound texture out as a BMP, through the sampler rather than around it.
+ *
+ * "Which texture is this" is not answerable from an address and a format, and
+ * it is the question behind most of the ones that matter -- is that a font
+ * page or an icon atlas, did the swizzle decode, is the alpha inverted. Going
+ * through sample_texture means the file shows exactly what the rasteriser
+ * sees, so a decode bug appears here rather than only as a wrong-looking
+ * triangle.
+ *
+ * ponytail: RGB only, alpha dropped. A glyph page is alpha and would come out
+ * black, so alpha is composited onto mid-grey to stay legible; that is a
+ * viewing choice, not a decode. One file per distinct texture, first use only.
+ */
+static void dump_texture_bmp(uint32_t seq)
+{
+    const char *prefix = getenv("RECOMP_TEX_DUMP");
+    uint32_t w = s_gpu.tex.width, h = s_gpu.tex.height, x, y;
+    uint32_t row_bytes, pad, filesz;
+    uint8_t hdr[54];
+    char path[512];
+    FILE *f;
+
+    if (!prefix || !w || !h || w > 4096 || h > 4096)
+        return;
+    row_bytes = w * 3;
+    pad = (4 - (row_bytes & 3)) & 3;
+    filesz = 54 + (row_bytes + pad) * h;
+
+    snprintf(path, sizeof path, "%s%02u_%08X_fmt%02X.bmp",
+             prefix, seq, s_gpu.tex.offset, s_gpu.tex.color);
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 'B'; hdr[1] = 'M';
+    memcpy(hdr + 2, &filesz, 4);
+    hdr[10] = 54; hdr[14] = 40;
+    memcpy(hdr + 18, &w, 4);
+    memcpy(hdr + 22, &h, 4);
+    hdr[26] = 1; hdr[28] = 24;
+    fwrite(hdr, 1, sizeof hdr, f);
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            uint32_t argb = 0, a;
+            uint8_t px[3];
+            if (!sample_texture(x, h - 1 - y, &argb))
+                argb = 0;
+            a = (argb >> 24) & 0xFFu;
+            /* over mid-grey, so an alpha-only page is visible either way */
+            px[0] = (uint8_t)(((argb & 0xFFu) * a + 128u * (255u - a)) / 255u);
+            px[1] = (uint8_t)((((argb >> 8) & 0xFFu) * a + 128u * (255u - a)) / 255u);
+            px[2] = (uint8_t)((((argb >> 16) & 0xFFu) * a + 128u * (255u - a)) / 255u);
+            fwrite(px, 1, 3, f);
+        }
+        if (pad) {
+            static const uint8_t zero[3] = {0, 0, 0};
+            fwrite(zero, 1, pad, f);
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "  [TEXDUMP] %s (%ux%u fmt 0x%02X)\n",
+            path, w, h, s_gpu.tex.color);
+    fflush(stderr);
+}
+
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
     uint8_t *row;
@@ -1002,8 +1108,10 @@ static void raster_batch(void)
             s_gpu.batches_no_uv++;
         else if (!s_gpu.tex.valid)
             s_gpu.batches_no_tex++;
-        else
+        else {
             s_gpu.batches_textured++;
+            note_texture_use();
+        }
     }
 
     switch (s_gpu.prim) {
@@ -1580,6 +1688,13 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
                     " %u with texcoords but no usable stage\n",
             s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
+    for (i = 0; i < s_tex_use_count; i++)
+        fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
+                s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,
+                s_tex_use[i].color,
+                d3d8_format_dxt_block_bytes(s_tex_use[i].color) ? " dxt"
+                    : d3d8_format_is_swizzled(s_tex_use[i].color) ? " swz" : " lin",
+                s_tex_use[i].batches);
 
     if (getenv("RECOMP_TEX_STATE")) {
         uint32_t k;
