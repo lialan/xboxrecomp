@@ -198,6 +198,10 @@ static struct {
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
+    /* Why a batch came out flat. "Untextured" has two causes that look
+     * identical on screen and want opposite fixes: the batch carried no
+     * texture coordinates, or it did and the stage was not usable. */
+    uint32_t batches_textured, batches_no_uv, batches_no_tex;
     Texture  tex;
 } s_gpu;
 
@@ -217,6 +221,15 @@ static int s_unhandled_count;
 static uint32_t s_tex_reg[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
 static uint8_t  s_tex_set[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
 
+/* Formats whose dimensions come from the format word and whose coordinates
+ * arrive normalised, rather than from a pitch and SET_TEXTURE_IMAGE_RECT with
+ * coordinates in texels. Swizzled and block-compressed are both in this group,
+ * and every place that used to test only for swizzled needs the pair. */
+static int tex_size_from_format(uint32_t fmt)
+{
+    return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
+}
+
 static void record_tex_reg(uint32_t method, uint32_t param)
 {
     s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
@@ -227,7 +240,7 @@ static void record_tex_reg(uint32_t method, uint32_t param)
      * left the title's own textures unsampled and every textured quad drawn in
      * flat vertex colour. */
     s_gpu.tex.valid = s_gpu.tex.offset && s_gpu.tex.width && s_gpu.tex.height
-                   && (d3d8_format_is_swizzled(s_gpu.tex.color)
+                   && (tex_size_from_format(s_gpu.tex.color)
                        || s_gpu.tex.pitch);
 }
 
@@ -561,9 +574,7 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
 
 static uint32_t expand(uint32_t v, uint32_t bits)
 {
-    /* 5 bits of white have to come back as 0xFF, not 0xF8, so scale rather
-     * than shift. */
-    return v * 255u / ((1u << bits) - 1u);
+    return d3d8_expand_channel(v, bits);
 }
 
 /* The linear format that decodes the same texels as a swizzled one.
@@ -600,6 +611,9 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
     v = wrap_coord(v, s_gpu.tex.height, s_gpu.tex.addr_v);
 
     fmt = s_gpu.tex.color;
+    if (d3d8_format_dxt_block_bytes(fmt))
+        return d3d8_dxt_decode_texel(mem + s_gpu.tex.offset, fmt, u, v,
+                                     s_gpu.tex.width, argb);
     if (d3d8_format_is_swizzled(fmt)) {
         /* Morton order: a texel's index is interleaved from x and y instead of
          * v*pitch + u, so index from the base of the image. The switch below
@@ -857,7 +871,7 @@ static int fetch_texcoord(uint32_t index, float out[2])
         return 0;
     out[0] = t[0];
     out[1] = t[1];
-    if (d3d8_format_is_swizzled(s_gpu.tex.color)) {
+    if (tex_size_from_format(s_gpu.tex.color)) {
         out[0] *= (float)s_gpu.tex.width;
         out[1] *= (float)s_gpu.tex.height;
     }
@@ -978,6 +992,18 @@ static void raster_batch(void)
     if (!batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         return;
+    }
+
+    /* Count why, once per batch: the texture stage cannot change inside one. */
+    {
+        const VertexAttr *tc = texcoord_attr();
+
+        if (!(tc->offset && tc->stride))
+            s_gpu.batches_no_uv++;
+        else if (!s_gpu.tex.valid)
+            s_gpu.batches_no_tex++;
+        else
+            s_gpu.batches_textured++;
     }
 
     switch (s_gpu.prim) {
@@ -1304,7 +1330,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * only uses swizzled textures never sends one -- this title sends it
          * once and sets a format 3,176 times. Without this the width and
          * height stayed zero and nothing was ever sampled. */
-        if (d3d8_format_is_swizzled((param >> 8) & 0xFF)) {
+        if (tex_size_from_format((param >> 8) & 0xFF)) {
             s_gpu.tex.width  = 1u << ((param >> 20) & 0xF);
             s_gpu.tex.height = 1u << ((param >> 24) & 0xF);
         }
@@ -1546,6 +1572,14 @@ void nv2a_pb_exec_report(void)
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
+
+    /* And of the batches that did rasterise, how many sampled anything. A menu
+     * that draws its background from one texture and its text from another
+     * shows both as flat colour if either half is missing, so the split is
+     * what says which half. */
+    fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
+                    " %u with texcoords but no usable stage\n",
+            s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
 
     if (getenv("RECOMP_TEX_STATE")) {
         uint32_t k;
