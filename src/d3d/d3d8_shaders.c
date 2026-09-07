@@ -272,6 +272,7 @@ static const char g_ps_body[] =
     "    uint4  StageColor[4];\n"
     "    // Per-stage: x=alphaarg1, y=alphaarg2, z=0, w=0\n"
     "    uint4  StageAlpha[4];\n"
+    "    uint4  AlphaOnly;\n"
     "};\n"
     "\n"
     "struct PS_IN {\n"
@@ -453,6 +454,9 @@ static void build_ps_source(UINT sig, char *buf, int bufsize)
         off += snprintf(buf + off, bufsize - off,
                         "    texels[%d] = tex%d.Sample(samp%d, input.tex%d.%s);\n",
                         i, i, i, i, dim ? "xyz" : "xy");
+        /* Xbox A8 samples white RGB; DXGI A8 supplies zero RGB. */
+        off += snprintf(buf + off, bufsize - off,
+                        "    if (AlphaOnly[%d]) texels[%d].rgb = 1.0;\n", i, i);
     }
     off += snprintf(buf + off, bufsize - off, "%s", g_ps_tail);
 }
@@ -601,6 +605,7 @@ typedef struct {
     UINT  _pad0;
     UINT  stage_color[4][4];     /* [stage][x=colorop, y=arg1, z=arg2, w=alphaop] */
     UINT  stage_alpha[4][4];     /* [stage][x=alphaarg1, y=alphaarg2, z=0, w=0] */
+    UINT  alpha_only[4];
 } PSConstants;
 
 /* ================================================================
@@ -1139,7 +1144,9 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
 
         /* Per-stage texture state */
         for (stage = 0; stage < 4; stage++) {
+            D3DFORMAT format = d3d8_base_format(d3d8_GetStageTexture(stage));
             const DWORD *tss = d3d8_GetTSS(stage);
+            pc->alpha_only[stage] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
             if (!tss) {
                 pc->stage_color[stage][0] = D3DTOP_DISABLE;
                 continue;

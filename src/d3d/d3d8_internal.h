@@ -246,8 +246,7 @@ HRESULT d3d8_CreateImageSurfaceImpl(UINT Width, UINT Height, D3DFORMAT Format,
  * as D3D8Texture. */
 ID3D11ShaderResourceView *d3d8_base_srv(IDirect3DBaseTexture8 *texture);
 
-/* Read the D3DFORMAT / palette stage of any base texture via the shared
- * D3D8Texture layout overlay. */
+/* Read the D3DFORMAT of any base texture. */
 D3DFORMAT d3d8_base_format(IDirect3DBaseTexture8 *texture);
 void      d3d8_base_set_palette(IDirect3DBaseTexture8 *texture, UINT palette);
 
