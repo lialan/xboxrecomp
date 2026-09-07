@@ -8,6 +8,7 @@
  */
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
+#include "../kernel/xbox_memory_layout.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,34 @@
 
 /* The runtime maps guest memory at a fixed host offset. */
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+
+/* Calling the title's interrupt service routine.
+ *
+ * A recompiled function reads its arguments off the guest stack and keeps its
+ * registers in thread-local storage, so it can only be called from a thread
+ * that has both. xbox_worker_stack_alloc hands out a guest stack slice for
+ * exactly this -- a host thread calling recompiled code -- and recomp_lookup
+ * turns a guest address into something callable.
+ */
+typedef void (*recomp_func_t)(void);
+extern recomp_func_t recomp_lookup(uint32_t xbox_va);
+extern int  xbox_worker_stack_alloc(void);
+extern void xbox_worker_stack_free(int slot);
+extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+
+/* Declared in the generated runtime; thread-local, so the values below are
+ * this thread's and not the guest thread's. */
+#if defined(_MSC_VER)
+#  define OHCI_TLS __declspec(thread)
+#else
+#  define OHCI_TLS __thread
+#endif
+extern OHCI_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern OHCI_TLS uint32_t g_ebx, g_esi, g_edi;
+
+/* The vector XPP takes for USB0. HalGetInterruptVector(1) returns 1 here, and
+ * the bus interrupt level is what the XDK passes. */
+#define OHCI_VECTOR  1
 
 /* ---- OHCI 1.0a operational registers, by byte offset ------------------- */
 #define HcRevision              0x00
@@ -205,9 +234,16 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
         if (v & PORT_W_PPS_SET_POWER)    *ps |= PORT_PPS;
         if (v & PORT_W_CLEAR_POWER)      *ps &= ~PORT_PPS;
         if (v & PORT_W_PRS_SET_RESET) {
-            /* Reset completes immediately: there is no wire to settle. A
-             * device that is present comes back enabled, which is what the
-             * driver is about to check. */
+            /* Reset completes immediately -- there is no wire to settle -- so
+             * PRS is never observed set. What matters is what the driver
+             * checks afterwards: a present device comes back enabled, and the
+             * reset-change bit says the reset finished.
+             *
+             * Only the status bit is set here. Delivering the interrupt is the
+             * controller thread's job, because this runs on the guest's own
+             * thread inside a fault handler, and pointing g_esp at a worker
+             * stack from here would overwrite the stack pointer of the thread
+             * being interrupted. */
             if (*ps & PORT_CCS)
                 *ps |= PORT_PES;
             *ps |= PORT_PRSC;
@@ -231,6 +267,96 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
     }
 }
 
+/* ---- raising an interrupt --------------------------------------------- */
+
+/* Call the title's ISR on this thread, with a guest stack under it.
+ *
+ * BOOLEAN ServiceRoutine(PKINTERRUPT Interrupt, PVOID ServiceContext), stdcall,
+ * so the two arguments go on the stack right to left with a return address on
+ * top. The sentinel is what the routine pops on the way out; nothing jumps to
+ * it, and a recognisable value beats a real address if it ever shows up in a
+ * report.
+ *
+ * Returns what the routine returned: an ISR that does not claim the interrupt
+ * returns FALSE, and that is worth seeing rather than assuming.
+ */
+static int ohci_call_isr(OhciController *hc)
+{
+    uint32_t kinterrupt = xbox_GetConnectedInterrupt(OHCI_VECTOR);
+    uint32_t routine, context;
+    recomp_func_t fn;
+    uint8_t *mem;
+    int slot;
+
+    if (!kinterrupt)
+        return -1;                      /* nothing connected yet            */
+
+    mem     = (uint8_t *)xbox_GetMemoryOffset();
+    routine = *(uint32_t *)(mem + kinterrupt + 0);
+    context = *(uint32_t *)(mem + kinterrupt + 4);
+    if (!routine)
+        return -1;
+
+    fn = recomp_lookup(routine);
+    if (!fn) {
+        fprintf(stderr, "  [OHCI%d] ISR 0x%08X has no translation\n",
+                hc->index, routine);
+        fflush(stderr);
+        return -1;
+    }
+
+    /* One slice for the life of the raise. Sixteen exist and this takes one
+     * only while the routine runs, so a title using them for its own workers
+     * is not starved by a controller that interrupts. */
+    slot = xbox_worker_stack_alloc();
+    if (slot < 0) {
+        fprintf(stderr, "  [OHCI%d] no worker stack for the ISR\n", hc->index);
+        fflush(stderr);
+        return -1;
+    }
+
+    g_esp = XBOX_WORKER_STACK_TOP(slot);
+    g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
+
+    g_esp -= 4; *(uint32_t *)(mem + g_esp) = context;      /* arg 2 */
+    g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
+    g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
+
+    fn();
+
+    xbox_worker_stack_free(slot);
+    return (int)(g_eax & 1u);
+}
+
+/* Set the status bits and, if the driver has unmasked them, call the ISR.
+ *
+ * MIE is the master enable and HcInterruptEnable is the per-source mask; a
+ * controller that interrupts through either of those while they are clear is
+ * a controller the driver has every right to be confused by.
+ */
+static void ohci_raise(OhciController *hc, uint32_t source)
+{
+    uint32_t enable = hc->reg[HcInterruptEnable / 4];
+    int claimed;
+
+    hc->reg[HcInterruptStatus / 4] |= source;
+
+    if (!(enable & INTR_MIE) || !(enable & source))
+        return;
+
+    claimed = ohci_call_isr(hc);
+    if (s_trace || claimed >= 0) {
+        static unsigned n;
+        if (n++ < 20) {
+            fprintf(stderr, "  [OHCI%d] raised %08X -> ISR %s\n",
+                    hc->index, source,
+                    claimed < 0 ? "not callable" :
+                    claimed ? "claimed it" : "declined it");
+            fflush(stderr);
+        }
+    }
+}
+
 /* ---- bring-up ---------------------------------------------------------- */
 
 static void ohci_reset(OhciController *hc, uint32_t base, int index)
@@ -251,15 +377,97 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
     hc->reg[HcRhDescriptorB / 4]  = 0x00000000u;
     hc->reg[HcRhStatus / 4]       = 0x00000000u;
 
-    /* Controller 0 port 1 has the gamepad on it. Powered and connected, with
-     * the connect-status-change bit set so the first root hub poll sees a new
-     * device rather than one that was always there. */
-    hc->reg[HcRhPortStatus1 / 4]     = PORT_PPS;
+    /* Ports powered and empty. The gamepad is not here yet, deliberately.
+     *
+     * Presenting it as already connected does not work, and the reason is
+     * worth keeping: the driver scans the root hub itself during bring-up,
+     * sees the connect-status-change bit, clears it, and by the time it
+     * unmasks the root hub interrupt there is no change left to report. The
+     * pending status bit does not survive either, because the driver resets
+     * the controller first and a reset clears interrupt status -- both of
+     * those are correct behaviour, and between them a device that was always
+     * there is a device that never arrives.
+     *
+     * A console detects the port change after the controller is running, so
+     * that is what the controller thread does: it waits for operational with
+     * the interrupt unmasked, and only then plugs the device in. */
+    hc->reg[HcRhPortStatus1 / 4]       = PORT_PPS;
     hc->reg[(HcRhPortStatus1 + 4) / 4] = PORT_PPS;
-    if (index == 0) {
-        hc->reg[HcRhPortStatus1 / 4] |= PORT_CCS | PORT_CSC;
-        hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+}
+
+/* The controller, running on its own thread.
+ *
+ * It has to be its own thread for a reason that is easy to get wrong: the
+ * guest register file is thread-local, so setting g_esp to a worker stack on
+ * the guest's thread would overwrite the guest's own stack pointer mid-call.
+ * A separate thread has its own copy, and it also happens to be what the
+ * hardware does -- an interrupt arrives when the controller decides, not when
+ * the driver next reads a register.
+ *
+ * ponytail: one delivery, of the root hub status change that is already
+ * pending from bring-up. There is nothing behind it yet -- no descriptor list
+ * walking, so an enumeration attempt has nothing to answer it -- and the point
+ * of this delivery is to find out what the driver does when it finally gets
+ * the interrupt it has been waiting for. Repeat delivery and the transfer
+ * lists come after that answer, not before it.
+ */
+static DWORD WINAPI ohci_thread(LPVOID unused)
+{
+    unsigned waited = 0;
+    int plugged = 0;
+    unsigned delivered = 0;
+
+    (void)unused;
+    for (;;) {
+        OhciController *hc = &s_hc[0];
+        uint32_t control, enable, status;
+
+        Sleep(20);
+        control = hc->reg[HcControl / 4];
+        enable  = hc->reg[HcInterruptEnable / 4];
+
+        /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
+         * the driver has not started yet is not a test of anything. */
+        if ((control & 0xC0u) != 0x80u) {
+            if (++waited > 1500)              /* 30 s and it never started */
+                break;
+            continue;
+        }
+        if (!(enable & INTR_MIE))
+            continue;
+
+        /* Plug the device in once, after the driver is running and listening.
+         * Presenting it earlier does not work: the driver clears the connect
+         * change during its own bring-up scan, and a reset clears interrupt
+         * status, so a device that was always there is one that never
+         * arrives. */
+        if (!plugged && (enable & INTR_RHSC)) {
+            hc->reg[HcRhPortStatus1 / 4] |= PORT_CCS | PORT_CSC;
+            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+            plugged = 1;
+            fprintf(stderr, "  [OHCI0] operational after %u ms; device "
+                            "arriving on port 1\n", waited * 20);
+            fflush(stderr);
+        }
+
+        /* Level-triggered, which is what OHCI is: while an enabled source is
+         * set, the line is asserted. The handler clears the status bit, so
+         * this stops on its own -- and if it ever does not, the cap below says
+         * so rather than spinning the ISR forever. */
+        status = hc->reg[HcInterruptStatus / 4] & enable & 0x7Fu;
+        if (!status)
+            continue;
+
+        if (++delivered > 200) {
+            fprintf(stderr, "  [OHCI0] 200 interrupts with status still %08X; "
+                            "the handler is not clearing it, stopping\n",
+                    status);
+            fflush(stderr);
+            break;
+        }
+        ohci_raise(hc, status);
     }
+    return 0;
 }
 
 void xbox_OhciInit(void)
@@ -316,6 +524,14 @@ void xbox_OhciInit(void)
                     "%d ports each, one device on HC0 port 1\n",
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
+
+#if defined(_WIN32)
+    {
+        HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
+        if (th)
+            CloseHandle(th);
+    }
+#endif
 }
 
 static OhciController *hc_for(uint32_t va)
