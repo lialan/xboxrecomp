@@ -61,42 +61,26 @@ static inline uint32_t swizzle_compact(uint32_t v)
 }
 
 /**
- * Compute the swizzled (Morton code) offset for coordinates (x, y)
- * within a texture of dimensions (width, height).
+ * Deposit the low bits of `v` into the set bits of `mask`, lowest to lowest.
  *
- * For non-square textures, the larger dimension's bits are spread
- * and the smaller dimension is masked. This handles the "folding"
- * behavior where the swizzle pattern wraps within power-of-2 tiles.
+ * This is the scalar form of BMI2's PDEP, and it is what interleaving a
+ * coordinate into a Morton code actually requires. The bit-spreading trick
+ * one function below only produces the even positions, so it can fill an X
+ * mask and never a Y mask -- see the note on swizzle_offset.
  */
-static inline uint32_t swizzle_offset(uint32_t x, uint32_t y,
-                                       uint32_t width, uint32_t height)
+static inline uint32_t swizzle_deposit(uint32_t v, uint32_t mask)
 {
-    /* Build masks for X and Y based on texture dimensions.
-     * For a 256x64 texture: x uses bits 0,2,4,6,8,10,12,14 (8 bits for 256)
-     *                        y uses bits 1,3,5,7,9,11 (6 bits for 64)
-     * But the Y bits only occupy positions where they "fit" within the
-     * square tiles. */
-
-    uint32_t x_mask = 0, y_mask = 0;
+    uint32_t result = 0;
     uint32_t bit = 1;
-    uint32_t w = width, h = height;
 
-    /* Interleave bit allocation: alternate between X and Y,
-     * but stop allocating bits for a dimension once it's exhausted. */
-    while (w > 1 || h > 1) {
-        if (w > 1) {
-            x_mask |= bit;
-            bit <<= 1;
-            w >>= 1;
-        }
-        if (h > 1) {
-            y_mask |= bit;
-            bit <<= 1;
-            h >>= 1;
-        }
+    while (mask) {
+        uint32_t low = mask & (~mask + 1u);   /* lowest set bit of mask */
+        if (v & bit)
+            result |= low;
+        mask &= mask - 1u;                    /* clear it */
+        bit <<= 1;
     }
-
-    return (swizzle_spread(x) & x_mask) | (swizzle_spread(y) & y_mask);
+    return result;
 }
 
 /**
@@ -117,6 +101,35 @@ static inline void xbox_swizzle_masks(uint32_t width, uint32_t height,
     *mask_x = x;
     *mask_y = y;
 }
+
+/**
+ * Compute the swizzled (Morton code) offset for coordinates (x, y)
+ * within a texture of dimensions (width, height).
+ *
+ * For non-square textures the larger dimension keeps taking bits after the
+ * smaller one is exhausted, so the masks are not a simple alternation and the
+ * deposit has to be general.
+ *
+ * This previously spread both coordinates and masked: `(spread(x) & mask_x) |
+ * (spread(y) & mask_y)`. Spreading puts a coordinate's bits on even positions
+ * only, while mask_y selects odd ones, so the Y term was almost always zero --
+ * for 512x512, offset(0,1) came back the same as offset(0,0) and 261,632 of
+ * the 262,144 coordinates collided. Nothing called this until a texture
+ * sampler did, and then it sampled a column of the image for every row and
+ * drew vertical stripes.
+ *
+ * The masks come from xbox_swizzle_masks, the same generator the row-walking
+ * unswizzle uses, so the two cannot disagree about where a texel lives.
+ */
+static inline uint32_t swizzle_offset(uint32_t x, uint32_t y,
+                                       uint32_t width, uint32_t height)
+{
+    uint32_t mask_x, mask_y;
+
+    xbox_swizzle_masks(width, height, &mask_x, &mask_y);
+    return swizzle_deposit(x, mask_x) | swizzle_deposit(y, mask_y);
+}
+
 
 /**
  * Unswizzle a texture from Xbox swizzled (Z-order/Morton) layout

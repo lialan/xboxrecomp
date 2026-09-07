@@ -5,6 +5,7 @@
  * software conversions without needing a D3D11 device:
  *   - d3d8_to_dxgi_format, d3d8_format_bpp, d3d8_format_is_*
  *   - d3d8_format_is_swizzled / unswizzle round-trip (d3d8_swizzle.h)
+ *   - swizzle_offset agreeing with xbox_swizzle_rect, texel for texel
  *   - d3d8_convert_linear_pixels (channel swaps, sign extension)
  *
  * The D3D8 resource file is compiled alongside this driver; the handful of
@@ -173,6 +174,53 @@ static void test_unswizzle_roundtrip(void)
     }
 }
 
+/* swizzle_offset must land on the same byte that xbox_swizzle_rect wrote.
+ *
+ * The two are separate implementations of Morton order: xbox_swizzle_rect
+ * walks rows and is what unswizzling (and therefore the D3D11 path) trusts,
+ * while swizzle_offset computes one texel's address and is what the software
+ * sampler calls per pixel. If they disagree, a texture decodes correctly in
+ * one path and wrongly in the other -- which is how this was found: the
+ * sampler read a column of the image for every row and drew vertical stripes.
+ *
+ * The old implementation spread both coordinates onto even bit positions and
+ * masked, so the Y term was almost always zero: at 512x512 offset(0,1) equalled
+ * offset(0,0) and 261,632 of 262,144 coordinates collided. Any size here with
+ * height > 1 catches that.
+ */
+static void test_swizzle_offset(void)
+{
+    struct { UINT w, h; } cases[] = {
+        { 4, 4 }, { 8, 8 }, { 64, 64 },
+        { 16, 4 }, { 4, 16 }, { 32, 8 }, { 256, 64 },   /* non-square: uneven bit runs */
+    };
+    int c;
+
+    printf("test_swizzle_offset\n");
+    for (c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); c++) {
+        UINT w = cases[c].w, h = cases[c].h, bpp = 4, n = w * h * bpp;
+        UINT32 *lin = (UINT32 *)malloc(n), *swz = (UINT32 *)malloc(n);
+        UINT bad = 0, x, y;
+
+        /* One distinct value per texel, so a wrong address cannot alias. */
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++)
+                lin[y * w + x] = 0xC0DE0000u | (y << 8) | x;
+        xbox_swizzle_rect((BYTE *)swz, (const BYTE *)lin, w, h, bpp);
+
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++)
+                if (swz[swizzle_offset(x, y, w, h)] != lin[y * w + x])
+                    bad++;
+        {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "swizzle_offset agrees %ux%u", w, h);
+            CHECK_INT(nm, (int)bad, 0);
+        }
+        free(lin); free(swz);
+    }
+}
+
 /* Forward the D3D8 conversion helper through a tiny local wrapper so we
  * test the real d3d8_resources.c implementation. */
 static void test_convert_linear(void)
@@ -264,6 +312,7 @@ int main(void)
     test_predicates();
     test_swizzle_classification();
     test_unswizzle_roundtrip();
+    test_swizzle_offset();
     test_convert_linear();
     test_fvf_position();
 
