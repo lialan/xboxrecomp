@@ -1875,6 +1875,99 @@ static void bridge_KeInsertQueueDpc(void)
     g_eax = 1;
 }
 
+/* Call a connected interrupt service routine.
+ *
+ * BOOLEAN ServiceRoutine(PKINTERRUPT, PVOID ServiceContext), __stdcall: its
+ * `ret 8` takes the dummy return address and both arguments, so g_esp needs no
+ * fixup. The caller must already have a guest stack and a TIB, which the timer
+ * thread has.
+ *
+ * Returns what the routine returned -- an ISR that does not recognise the
+ * interrupt returns FALSE, and that is worth seeing rather than assuming.
+ */
+static int kernel_raise_interrupt(uint32_t vector)
+{
+    uint32_t kint = xbox_GetConnectedInterrupt(vector);
+    uint32_t routine, context;
+    recomp_func_t fn;
+
+    if (!kint)
+        return -1;
+    routine = BRIDGE_MEM32(kint + 0);
+    context = BRIDGE_MEM32(kint + 4);
+    if (!routine)
+        return -1;
+    fn = recomp_lookup(routine);
+    if (!fn) fn = recomp_lookup_manual(routine);
+    if (!fn)
+        return -1;
+
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    fn();
+    return (int)(g_eax & 1u);
+}
+
+/* The GPU's vertical blank, delivered rather than merely enabled.
+ *
+ * The D3D8 library linked into a title installs an ISR for this and then waits
+ * on it. Nothing ever raised it, so a title whose frame loop waits for vblank
+ * rather than polling stops after its first clear -- which is exactly where
+ * Half-Life 2's loader stops, with its videos open, its 23 MB of UI textures
+ * loaded, and no second frame.
+ *
+ * The ISR reads the NV2A's own interrupt status to decide whether the
+ * interrupt is its business, so the registers have to say vblank before the
+ * routine is called: PCRTC_INTR_0 bit 0 for the vblank itself, and PMC_INTR_0
+ * bit 24 to say the PCRTC block is the source. Without those the handler looks,
+ * finds nothing, and correctly declines.
+ *
+ * ponytail: a fixed 60 Hz off the timer tick rather than anything tied to the
+ * display mode, and no field or interlace handling. A title that measures
+ * refresh rate from this will read 60; a title that needs the real one wants
+ * the mode AvSetDisplayMode was given, which is recorded a few files away.
+ */
+#define XBOX_NV2A_REG_BASE     0xFD000000u
+#define NV2A_PMC_INTR_0        0x00000100u
+#define NV2A_PMC_INTR_PCRTC    (1u << 24)
+#define NV2A_PCRTC_INTR_0      0x00600100u
+#define NV2A_PCRTC_INTR_VBLANK (1u << 0)
+#define NV2A_VECTOR            3u
+
+static void kernel_vblank_tick(void)
+{
+    static int enabled = -1;
+    static long long next_ms;
+    long long now;
+
+    if (enabled < 0)
+        enabled = getenv("RECOMP_VBLANK") != NULL;
+    if (!enabled)
+        return;
+
+    now = (long long)GetTickCount64();
+    if (now < next_ms)
+        return;
+    next_ms = now + 16;                       /* ~60 Hz */
+
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
+        return;
+
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+
+    {
+        static unsigned n;
+        int claimed = kernel_raise_interrupt(NV2A_VECTOR);
+        if (n++ < 3)
+            fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
+                    claimed < 0 ? "not callable" :
+                    claimed ? "claimed it" : "declined it");
+        fflush(stderr);
+    }
+}
+
 /* Run whatever is queued. Called from the timer thread, which has the guest
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
@@ -2112,6 +2205,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i;
 
         Sleep(10);
+        kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 
