@@ -12,6 +12,8 @@
 
 /* Enable memfd_create, MAP_FIXED_NOREPLACE, timegm. Must precede all #includes. */
 #define _GNU_SOURCE
+/* Darwin: exposes memset_s, its explicit_bzero equivalent. */
+#define __STDC_WANT_LIB_EXT1__ 1
 
 #include "win32_compat.h"
 
@@ -1109,7 +1111,7 @@ VOID DebugBreak(void) {
 VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
-    // TODO: Darwin explicit_bzero equivalent is memset_s.
+    memset_s(ptr, cnt, 0, cnt);
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -1371,8 +1373,14 @@ static size_t view_take(const void *addr)
 static int anon_map_fd(const char *name)
 {
 #if defined(__APPLE__)
-    // TODO: use shm_open on macOS 10.12+ or mkstemp + unlink for older versions
-    return 0;
+    static volatile LONG map_counter = 0;
+    char shm_name[32];
+    LONG seq = InterlockedIncrement(&map_counter);
+    const char *base = name ? name : "xbox_map";
+    snprintf(shm_name, sizeof(shm_name), "/%s_%ld", base, seq);
+    int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
+    if (fd >= 0) shm_unlink(shm_name);
+    return fd;
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif
@@ -1455,8 +1463,33 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
 {
 #if defined(__APPLE__)
-    /* TODO: Darwin has no sysinfo(2): physical memory comes from sysctl, the free
-     * page count from the Mach VM statistics, swap from vm.swapusage. */
+    /* Darwin has no sysinfo(2): physical memory comes from sysctl hw.memsize,
+     * swap from vm.swapusage, the free page count from the Mach VM statistics. */
+    uint64_t memsize = 0;
+    size_t   len     = sizeof(memsize);
+    int oid_memsize[] = { CTL_HW, HW_MEMSIZE };
+    if (sysctl(oid_memsize, 2, &memsize, &len, NULL, 0) != 0) return FALSE;
+
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) page = 4096;
+
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    ULONGLONG avail = 0;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vm, &count) == KERN_SUCCESS)
+        avail = ((ULONGLONG)vm.free_count + vm.inactive_count) * (ULONGLONG)page;
+
+    struct xsw_usage swap;
+    len = sizeof(swap);
+    int oid_swapusage[] = { CTL_VM, VM_SWAPUSAGE };
+    if (sysctl(oid_swapusage, 2, &swap, &len, NULL, 0) != 0)
+        memset(&swap, 0, sizeof(swap));
+
+    b->ullTotalPhys     = (ULONGLONG)memsize;
+    b->ullAvailPhys     = avail;
+    b->ullTotalPageFile = b->ullTotalPhys + (ULONGLONG)swap.xsu_total;
+    b->ullAvailPageFile = b->ullAvailPhys + (ULONGLONG)swap.xsu_avail;
 #else
     struct sysinfo si;
     if (!b) return FALSE;
