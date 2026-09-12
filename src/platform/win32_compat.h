@@ -88,6 +88,7 @@ LONG InterlockedDecrement(volatile LONG *Addend);
 LONG InterlockedExchange(volatile LONG *Target, LONG Value);
 LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
+LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
 
 /* ---- Critical sections ------------------------------------------------- */
@@ -181,6 +182,10 @@ BOOL   DeleteTimerQueueTimer(HANDLE timerQueue, HANDLE timer, HANDLE completionE
 BOOL   ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG period);
 BOOL   TrySubmitThreadpoolCallback(PTP_SIMPLE_CALLBACK callback,
                                    PVOID context, PVOID env);
+
+/* ---- Waitable timers --------------------------------------------------- */
+HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name);
+BOOL   CancelWaitableTimer(HANDLE h);
 
 /* ---- Heap ------------------------------------------------------------- */
 HANDLE GetProcessHeap(void);
