@@ -562,7 +562,9 @@ class FunctionDetector:
             # to fall in an as-yet unclaimed code gap. Keep the same prologue
             # exception as explicit seeds so an out-of-phase sweep can recover.
             if (self.engine.instruction_covering(target) is not None
-                    and not self.engine.probes_as_prologue(target)):
+                    and not (self.engine.probes_as_prologue(target)
+                             or self.engine.probes_as_constant_stub(target)
+                             or self.engine.probes_as_vcall_thunk(target))):
                 continue
             # A ret, not merely a terminator: an immediate is weak evidence,
             # so the probe has to reject data that happens to disassemble. The

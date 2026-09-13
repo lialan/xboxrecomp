@@ -30,3 +30,15 @@ def test_instruction_boundary_remains_a_candidate():
     det, sec, target = detector(bytes.fromhex('558becc3'), 10)
     det._pass_imm_ref_targets([sec])
     assert target in det._candidates
+
+def test_constant_return_stub_can_realign_an_overlapping_sweep():
+    det, sec, target = detector(bytes.fromhex('b9b878563412c3'), 11)
+    assert det.engine.instruction_covering(target) is not None
+    det._pass_imm_ref_targets([sec])
+    assert target in det._candidates
+
+def test_virtual_dispatch_thunk_can_realign_an_overlapping_sweep():
+    det, sec, target = detector(bytes.fromhex('b98b01ff6010c3'), 11)
+    assert det.engine.instruction_covering(target) is not None
+    det._pass_imm_ref_targets([sec])
+    assert target in det._candidates
