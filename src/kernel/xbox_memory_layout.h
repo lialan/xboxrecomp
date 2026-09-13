@@ -253,7 +253,7 @@ void xbox_WatchdogStart(void);
 #define KDATA_FILE_OBJ_TYPE     0x0C0  /* IoFileObjectType (4 bytes) */
 #define KDATA_TIME_INCREMENT    0x0D0  /* KeTimeIncrement (4 bytes) */
 #define KDATA_BOOT_SMC_VIDEO    0x0E0  /* HalBootSMCVideoMode (4 bytes) */
-#define KDATA_IDEX_CHANNEL      0x0F0  /* IdexChannelObject (opaque) */
+#define KDATA_IDEX_CHANNEL      0x500  /* IDE_CHANNEL_OBJECT (512-byte reserved region) */
 #define KDATA_HD_KEY            0x100  /* XboxHDKey (16 bytes) */
 #define KDATA_SIGNATURE_KEY     0x110  /* XboxSignatureKey (16 bytes) */
 #define KDATA_LAN_KEY           0x120  /* XboxLANKey (16 bytes) */
