@@ -862,7 +862,7 @@ class FunctionTranslator:
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg")
+                                 "lock cmpxchg", "inc", "dec")
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")

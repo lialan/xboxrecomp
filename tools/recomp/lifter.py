@@ -665,6 +665,7 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── dec/inc: result-based, CF unchanged ──
     if flag_setter in ("dec", "inc"):
+        lhs = "_fa"  # Result at the flag-setting instruction, before later MOVs.
         if jcc in ("jb", "jnae", "jc"):
             return "_cf", desc
         if jcc in ("jae", "jnb", "jnc"):
@@ -678,13 +679,17 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return "(_fas < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return "(_fas >= 0)", desc
         if jcc in ("jl", "jle", "jg", "jge"):
-            cast = "(int32_t)" + lhs
-            op = {"jl": "<", "jle": "<=", "jg": ">", "jge": ">="}[jcc]
-            return f"({cast} {op} 0)", desc
+            less = "((_fas < 0) != (_fb != 0))"
+            return {"jl": less, "jle": f"({less} || _fa == 0)",
+                    "jg": f"(!{less} && _fa != 0)", "jge": f"!{less}"}[jcc], desc
+        if jcc in ("jo", "jno"):
+            return ("(_fb != 0)" if jcc == "jo" else "(_fb == 0)"), desc
+        if jcc in ("jp", "jpe", "jnp", "jpo"):
+            return ("RECOMP_PARITY8(_fa)" if jcc in ("jp", "jpe") else "!RECOMP_PARITY8(_fa)"), desc
         return None
 
     # ── neg: flags from (0 - a_orig), result is -a ──
@@ -1593,9 +1598,15 @@ class Lifter:
         # For sub-registers (al, cl, etc.), use the SET macro instead of ++
         if ops[0].type == "reg" and ops[0].reg in (
                 "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"):
-            return [f"{val}{'++' if m == 'inc' else '--'};"]
+            out = [f"{val}{'++' if m == 'inc' else '--'};"]
         else:
-            return [_fmt_operand_write(ops[0], f"{val} {op_char} {delta}")]
+            out = [_fmt_operand_write(ops[0], f"{val} {op_char} {delta}")]
+        size = _operand_width(ops[0]) or 4
+        mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
+        overflow_result = (1 << (size * 8 - 1)) - (m == "dec")
+        out += [f"_fa = (uint32_t)({val}) & {mask};",
+                f"_fas = (int32_t){sx}(_fa); _fb = (_fa == 0x{overflow_result:X}u); /* {m} result/SF/OF; CF unchanged */"]
+        return out
 
     def _lift_neg(self, insn, ops, preserve_carry=False):
         if len(ops) < 1:
