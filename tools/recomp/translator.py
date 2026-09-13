@@ -568,7 +568,7 @@ class FunctionTranslator:
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
             if (cc in FunctionTranslator._CARRY_CC
-                    and last_setter in CF_TRACKED):
+                    and (last_setter in CF_TRACKED or last_setter in ("inc", "dec"))):
                 return True
             if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m

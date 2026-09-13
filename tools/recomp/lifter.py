@@ -665,6 +665,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── dec/inc: result-based, CF unchanged ──
     if flag_setter in ("dec", "inc"):
+        if jcc in ("jb", "jnae", "jc"):
+            return "_cf", desc
+        if jcc in ("jae", "jnb", "jnc"):
+            return "!_cf", desc
+        if jcc in ("ja", "jnbe"):
+            return f"(!_cf && {lhs} != 0)", desc
+        if jcc in ("jbe", "jna"):
+            return f"(_cf || {lhs} == 0)", desc
         if jcc in ("je", "jz"):
             return f"({lhs} == 0)", desc
         if jcc in ("jne", "jnz"):
