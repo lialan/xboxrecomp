@@ -8642,7 +8642,7 @@ static void kernel_watch_arm_once(void)
 }
 
 /* Current dispatching slot */
-static int g_kernel_dispatch_slot = -1;
+static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
 static void kernel_thunk_dispatch(void)
 {
