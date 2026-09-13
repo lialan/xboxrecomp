@@ -599,6 +599,7 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
 {
     DIR_CONTEXT* ctx;
@@ -607,6 +608,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+    IoStatusBlock->Information = 0;
+    if (FileInformationClass != XboxFileDirectoryInformation) {
+        IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
+        return STATUS_INVALID_INFO_CLASS;
+    }
 
     ctx = find_or_create_dir_context(FileHandle, TRUE);
     if (!ctx)
@@ -645,6 +651,18 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         }
         ctx->first_done = TRUE;
     } else {
+        if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
+            FindClose(ctx->find_handle);
+            ctx->find_handle = NULL;
+            ctx->file_handle = NULL;
+            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+            return STATUS_NO_MORE_FILES;
+        }
+    }
+
+    /* FATX enumeration never exposes the host's dot directories. */
+    while (!wcscmp(ctx->find_data.cFileName, L".") ||
+           !wcscmp(ctx->find_data.cFileName, L"..")) {
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
@@ -1096,11 +1114,17 @@ static BOOL s_dir_cs_init = FALSE;
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
 {
     (void)Event; (void)ApcRoutine; (void)ApcContext;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+    IoStatusBlock->Information = 0;
+    if (FileInformationClass != XboxFileDirectoryInformation) {
+        IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
+        return STATUS_INVALID_INFO_CLASS;
+    }
 
     if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
     EnterCriticalSection(&s_dir_cs);
@@ -1151,6 +1175,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
         if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
             break;
     }

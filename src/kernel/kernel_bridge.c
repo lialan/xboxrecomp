@@ -3103,15 +3103,16 @@ static void bridge_NtDeleteFile(void)
     g_eax = (uint32_t)xbox_NtDeleteFile(&oa);
 }
 
-/* ── NtQueryDirectoryFile (ordinal 207, 9 args = 36 bytes) ─ */
+/* ── NtQueryDirectoryFile (ordinal 207, 10 args = 40 bytes) ─ */
 static void bridge_NtQueryDirectoryFile(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t ios_va      = STACK_ARG(4);
     uint32_t info_va     = STACK_ARG(5);
     uint32_t length      = STACK_ARG(6);
-    uint32_t filename_va = STACK_ARG(7);  /* PXBOX_ANSI_STRING */
-    uint32_t restart     = STACK_ARG(8);  /* BOOLEAN */
+    uint32_t info_class  = STACK_ARG(7);
+    uint32_t filename_va = STACK_ARG(8);  /* PXBOX_ANSI_STRING */
+    uint32_t restart     = STACK_ARG(9);  /* BOOLEAN */
     XBOX_IO_STATUS_BLOCK ios;
     XBOX_ANSI_STRING     fn;
     PXBOX_ANSI_STRING    pfn = NULL;
@@ -3126,7 +3127,8 @@ static void bridge_NtQueryDirectoryFile(void)
         if (fn.Buffer) pfn = &fn;
     }
     g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(info_va), length, pfn, (BOOLEAN)restart);
+                XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
+                pfn, (BOOLEAN)restart);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
@@ -7758,7 +7760,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 204: return 16;  /* NtProtectVirtualMemory (4) */
     case 205: return  8;  /* NtPulseEvent (2) */
     case 206: return 20;  /* NtQueueApcThread (5) */
-    case 207: return 36;  /* NtQueryDirectoryFile (9) */
+    case 207: return 40;  /* NtQueryDirectoryFile (10) */
     case 210: return  8;  /* NtQueryFullAttributesFile (2) */
     case 211: return 20;  /* NtQueryInformationFile (5) */
     case 215: return 12;  /* NtQuerySymbolicLinkObject (3) */
