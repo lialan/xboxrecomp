@@ -23,7 +23,31 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
-                     detect_setjmp_helpers, _func_ident)
+                     detect_setjmp_helpers, _func_ident, _operand_width)
+
+
+def _merge_flag_states(states):
+    """Merge comparable snapshots without requiring identical source operands.
+
+    CMP/TEST save their operands into function-local _fa/_fb/_fas/_fbs at
+    runtime. A shared consumer can use whichever predecessor executed. Keep
+    operation and width equal because sign/parity handling depends on them;
+    arithmetic states still reconstruct operands and cannot use this merge.
+    """
+    if not states or any(not state or not state[0] for state in states):
+        return None
+    first = states[0]
+    if all(state == first for state in states[1:]):
+        return first
+    if first[0] not in ("cmp", "test") or len(first[1]) != 2:
+        return None
+    width = _operand_width(first[1][0]) or _operand_width(first[1][1])
+    for kind, ops in states[1:]:
+        if kind != first[0] or len(ops) != 2:
+            return None
+        if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
+            return None
+    return first
 
 
 def write_if_changed(path, text):
@@ -984,20 +1008,17 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Inherit the flag state only when every predecessor agrees on it.
+            # Inherit agreed state, including compatible CMP/TEST snapshots
+            # whose source operands differ between predecessor paths.
             # Blocks are walked in address order, so a back edge's predecessor
             # may not be computed yet -- treat that as unknown rather than
-            # guessing, which costs a fallback condition and never a wrong one.
+            # guessing at which operation produced the runtime flags.
             sources = preds[bb.start]
             if bb.start == start or not sources:
                 incoming = None
             elif all(p in out_state for p in sources):
                 states = [out_state[p] for p in sources]
-                incoming = states[0]
-                for other in states[1:]:
-                    if other != incoming:
-                        incoming = None
-                        break
+                incoming = _merge_flag_states(states)
             else:
                 incoming = None
 
