@@ -44,4 +44,3 @@ int main(void) {
     if(!failed) puts("PASS fastcall IRQL: CL arguments, old levels, nesting and stack canary");
     return failed;
 }
-
