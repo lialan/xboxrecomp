@@ -1710,14 +1710,41 @@ class Lifter:
         return out
 
     def _lift_sar(self, insn, ops):
+        """Arithmetic shift right, at the operand's own width.
+
+        Two things have to be right that a bare "(int32_t)dst >> cnt" gets
+        wrong.
+
+        The cast must match the operand. Every narrow read arrives
+        zero-extended - LO8/HI8/LO16 mask, and MEM8/MEM16 are unsigned - so
+        casting an 8- or 16-bit operand to int32_t produces a positive number
+        and the ">>" is a logical shift wearing an arithmetic cast. "sar al, 1"
+        with al = 0x80 gave 0x40 where x86 gives 0xC0: a negative value halved
+        into a positive one, which is how a fixed-point divide or a signed
+        average goes quietly wrong without ever faulting. int8_t/int16_t
+        promote to int before the shift, so a count at or above the operand
+        width still sign-fills and stays well defined.
+
+        The count must be masked to 5 bits, as x86 does for 8-, 16- and 32-bit
+        operands. Unmasked, "sar eax, 33" asks C for a shift of 33 on a 32-bit
+        type, which is undefined - the host may fold it to 33 & 31 and look
+        correct, which is exactly why it cannot be left to chance.
+
+        CF is unaffected by the width change: the bit it reads is bit
+        (count - 1), which is inside the operand, and the zero-extended read
+        holds the same bits there as the sign-extended one. It takes the count
+        mask for the same reason the value does.
+        """
         if len(ops) < 2:
             return ["/* sar: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
+        cnt = f"(({cnt}) & 31)"
+        sx = self._SNAP_SX.get(_operand_width(ops[0]) or 4, "(int32_t)")
         out = []
         if self.needs_cf:
             out.append(f"if ({cnt}) _cf = (int)((({dst}) >> (({cnt}) - 1)) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} >> {cnt})"))
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)({sx}{dst} >> {cnt})"))
         return out
 
     def _lift_rotate(self, insn, ops, m):
@@ -1730,7 +1757,8 @@ class Lifter:
 
     # ── Compare / Test (standalone) ──
 
-    # Widths for the flag snapshot below.
+    # Sign-extending cast and mask per operand width, shared by the flag
+    # snapshot below and by the arithmetic shift above.
     _SNAP_MASK = {1: "0xFFu", 2: "0xFFFFu", 4: "0xFFFFFFFFu"}
     _SNAP_SX = {1: "(int8_t)", 2: "(int16_t)", 4: "(int32_t)"}
 
