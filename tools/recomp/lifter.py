@@ -657,10 +657,20 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"((int32_t){lhs} <= 0)", desc
         if jcc == "jg":
             return f"((int32_t){lhs} > 0)", desc
-        if jcc in ("jb", "jnae", "jbe", "jna"):
+        if jcc in ("jb", "jnae"):
             return "0", desc  # CF=0 after and/or/xor
-        if jcc in ("jae", "jnb", "ja", "jnbe"):
+        if jcc in ("jae", "jnb"):
             return "1", desc
+        # jbe and ja are not carry-only: jbe is CF|ZF, ja is !CF && !ZF. CF is
+        # 0 here, but ZF is whatever the result was, so these reduce to ZF and
+        # !ZF -- not to constants. Folding them to 0 and 1 meant
+        # "and eax, eax; jbe" never branched and "; ja" always did. The
+        # CF_TRACKED path above already spells the same two conditions out in
+        # full, as does the CMP_BE/CMP_A that `test` goes through.
+        if jcc in ("jbe", "jna"):
+            return f"({lhs} == 0)", desc
+        if jcc in ("ja", "jnbe"):
+            return f"({lhs} != 0)", desc
         return None
 
     # ── dec/inc: result-based, CF unchanged ──
