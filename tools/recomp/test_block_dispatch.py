@@ -1,0 +1,45 @@
+from tools.recomp.block_dispatch import BlockRecord, build_manifest, dispatch_stats, _normalize_functions
+
+
+def test_normalize_functions_accepts_list_and_hex_strings():
+    raw = [
+        {"start": "0x1000", "end": "0x1010"},
+        {"start": 0x2000, "end": 0x2020},
+        {"start": "0x3000", "end": "0x3000"},
+    ]
+    assert _normalize_functions(raw) == [(0x1000, 0x1010), (0x2000, 0x2020)]
+
+
+def test_dispatch_stats_uses_byte_indexed_guest_va_slots():
+    records = [
+        BlockRecord(0x1000, 0x1005, 0x1000, (0x1005,), 2),
+        BlockRecord(0x1005, 0x1010, 0x1000, (), 3),
+    ]
+    stats = dispatch_stats(records)
+    assert stats["blocks"] == 2
+    assert stats["code_base"] == 0x1000
+    assert stats["code_end"] == 0x1010
+    assert stats["span_bytes"] == 0x10
+    assert stats["dense_slots"] == 0x10
+    assert stats["dense_table_bytes"] == 0x80
+    assert stats["instructions"] == 5
+    assert stats["avg_instructions_per_block"] == 2.5
+
+
+def test_manifest_records_dense_slots_and_json_safe_successors():
+    records = [
+        BlockRecord(0x4010, 0x4014, 0x4000, (0x4020, 0x4030), 1),
+        BlockRecord(0x4020, 0x4028, 0x4000, (), 2),
+    ]
+    manifest = build_manifest(records)
+    assert manifest["format"] == 1
+    assert manifest["blocks"][0]["dense_slot"] == 0
+    assert manifest["blocks"][0]["successors"] == [0x4020, 0x4030]
+    assert manifest["blocks"][1]["dense_slot"] == 0x10
+
+
+def test_empty_stats_are_well_defined():
+    stats = dispatch_stats([])
+    assert stats["blocks"] == 0
+    assert stats["dense_table_bytes"] == 0
+    assert stats["avg_instructions_per_block"] == 0.0
