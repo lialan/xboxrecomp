@@ -1,4 +1,6 @@
-from tools.recomp.block_dispatch import BlockRecord, build_manifest, dispatch_stats, _normalize_functions
+from tools.recomp.block_dispatch import (BlockRecord, _dedupe_records,
+                                         _normalize_functions, build_manifest,
+                                         dispatch_stats)
 
 
 def test_normalize_functions_accepts_list_and_hex_strings():
@@ -8,6 +10,21 @@ def test_normalize_functions_accepts_list_and_hex_strings():
         {"start": "0x3000", "end": "0x3000"},
     ]
     assert _normalize_functions(raw) == [(0x1000, 0x1010), (0x2000, 0x2020)]
+
+
+def test_normalize_functions_derives_end_from_address_and_size():
+    raw = [
+        {"address": "0x4000", "size": "0x20"},
+        {"_addr": 0x5000, "size": 0x10},
+    ]
+    assert _normalize_functions(raw) == [(0x4000, 0x4020), (0x5000, 0x5010)]
+
+
+def test_dedupe_prefers_later_more_specific_overlapping_owner():
+    outer = BlockRecord(0x1100, 0x1110, 0x1000, (), 2)
+    inner = BlockRecord(0x1100, 0x1108, 0x1080, (), 1)
+    records = _dedupe_records([outer, inner])
+    assert records == [inner]
 
 
 def test_dispatch_stats_uses_byte_indexed_guest_va_slots():
