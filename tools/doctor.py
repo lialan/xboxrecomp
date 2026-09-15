@@ -29,14 +29,20 @@ DEFAULTS = {
 }
 
 
-def _load_json(path):
+def _load_json_with_status(path):
+    """Return (value, status), distinguishing absent from malformed input."""
     if not path or not os.path.exists(path):
-        return None
+        return None, "missing"
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+            return json.load(fh), "ok"
     except (OSError, ValueError):
-        return None
+        return None, "invalid"
+
+
+def _load_json(path):
+    """Compatibility wrapper returning only the decoded JSON value."""
+    return _load_json_with_status(path)[0]
 
 
 def _count_entries(value):
@@ -83,7 +89,10 @@ def parse_icall_feedback(path):
                 if len(parts) < 2:
                     continue
                 try:
-                    va = int(parts[0], 0)
+                    # Runtime feedback uses %08X: hexadecimal without a 0x
+                    # prefix.  Base 16 also accepts the prefixed form used by
+                    # hand-authored/debug files.
+                    va = int(parts[0], 16)
                     flags = int(parts[1], 0)
                 except ValueError:
                     continue
@@ -103,8 +112,15 @@ def parse_icall_feedback(path):
 
 
 _LOG_PATTERNS = (
-    ("unresolved_icall", re.compile(r"(?:unresolved|failed).*?(?:icall|indirect call).*?(0x[0-9a-fA-F]+)", re.I)),
-    ("kernel_stub", re.compile(r"(?:kernel|xboxkrnl).*?(?:stub|unimplemented|unsupported).*?([A-Za-z_][A-Za-z0-9_]*|ordinal\s+\d+)", re.I)),
+    # The runtime's common spelling is "[ICALL] Failed to resolve VA ...", so
+    # ICALL can appear before the failure word.  Lookaheads deliberately make
+    # term order irrelevant.
+    ("unresolved_icall", re.compile(
+        r"^(?=.*(?:icall|indirect call))(?=.*(?:unresolved|failed|failed to resolve)).*?(0x[0-9a-fA-F]+)",
+        re.I)),
+    ("kernel_stub", re.compile(
+        r"(?:kernel|xboxkrnl).*?(?:stub|unimplemented|unsupported|unresolved|failed).*?(ordinal\s+\d+|[A-Za-z_][A-Za-z0-9_]*)",
+        re.I)),
     ("d3d_unsupported", re.compile(r"(?:D3D8|D3D|NV2A).*?(?:unsupported|unimplemented|unknown).*?([^\r\n]+)", re.I)),
     ("audio_unsupported", re.compile(r"(?:DSOUND|DirectSound|APU|audio|WMA).*?(?:unsupported|unimplemented|stub).*?([^\r\n]+)", re.I)),
     ("unhandled_instruction", re.compile(r"(?:unhandled|unimplemented).*?(?:instruction|mnemonic).*?\b([A-Za-z][A-Za-z0-9]+)\b", re.I)),
@@ -112,6 +128,12 @@ _LOG_PATTERNS = (
 
 
 def parse_runtime_log(path):
+    """Aggregate every matching warning payload from a runtime log.
+
+    Keep the complete counters here so priority totals cannot be changed by a
+    presentation limit.  Callers that display individual payloads can slice the
+    already-sorted dictionaries without losing the category total.
+    """
     counters = {name: Counter() for name, _ in _LOG_PATTERNS}
     if not path or not os.path.exists(path):
         return {name: {} for name, _ in _LOG_PATTERNS}
@@ -125,25 +147,30 @@ def parse_runtime_log(path):
                         counters[name][value] += 1
     except OSError:
         pass
-    return {name: dict(counter.most_common(25)) for name, counter in counters.items()}
+    return {name: dict(counter.most_common()) for name, counter in counters.items()}
 
 
 def build_report(functions=None, identified=None, abi=None, recomp=None,
                  icall_feedback=None, runtime_log=None):
-    fns = _load_json(functions)
-    ids = _load_json(identified)
-    abi_data = _load_json(abi)
-    recomp_data = _load_json(recomp)
+    artifacts = {
+        "functions": _load_json_with_status(functions),
+        "identified": _load_json_with_status(identified),
+        "abi": _load_json_with_status(abi),
+        "recomp": _load_json_with_status(recomp),
+    }
+    fns = artifacts["functions"][0]
+    ids = artifacts["identified"][0]
+    abi_data = artifacts["abi"][0]
+    recomp_data = artifacts["recomp"][0]
     report = {
         "pipeline": {
             "functions": _count_entries(fns),
             "identified_functions": _count_entries(ids),
             "abi_functions": _count_entries(abi_data),
-            "missing_artifacts": [
-                name for name, path in (("functions", functions), ("identified", identified),
-                                        ("abi", abi), ("recomp", recomp))
-                if not path or not os.path.exists(path)
-            ],
+            "missing_artifacts": [name for name, (_, status) in artifacts.items()
+                                  if status == "missing"],
+            "invalid_artifacts": [name for name, (_, status) in artifacts.items()
+                                  if status == "invalid"],
         },
         "recompiler": _flatten_recomp_stats(recomp_data),
         "icalls": parse_icall_feedback(icall_feedback),
@@ -169,12 +196,22 @@ def rank_priorities(report):
     if icalls["unresolved"]:
         priorities.append({"severity": "high", "area": "control-flow",
                            "reason": f"{icalls['unresolved']} observed indirect targets were unresolved"})
-    for key, area in (("kernel_stub", "kernel"), ("d3d_unsupported", "graphics"),
-                      ("audio_unsupported", "audio"), ("unhandled_instruction", "cpu")):
+    runtime_classes = (
+        ("unresolved_icall", "control-flow", "high"),
+        ("kernel_stub", "kernel", "medium"),
+        ("d3d_unsupported", "graphics", "medium"),
+        ("audio_unsupported", "audio", "medium"),
+        ("unhandled_instruction", "cpu", "medium"),
+    )
+    for key, area, severity in runtime_classes:
         count = sum(runtime.get(key, {}).values())
         if count:
-            priorities.append({"severity": "medium", "area": area,
+            priorities.append({"severity": severity, "area": area,
                                "reason": f"{count} runtime warning hit(s) matched {key}"})
+    invalid = report["pipeline"].get("invalid_artifacts", [])
+    if invalid:
+        priorities.append({"severity": "medium", "area": "pipeline",
+                           "reason": "invalid/unreadable artifacts: " + ", ".join(invalid)})
     if report["pipeline"]["missing_artifacts"]:
         priorities.append({"severity": "info", "area": "pipeline",
                            "reason": "missing artifacts: " + ", ".join(report["pipeline"]["missing_artifacts"])})
