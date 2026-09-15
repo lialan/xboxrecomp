@@ -84,6 +84,13 @@ static int wma_read_format(IMFSourceReader *reader, XboxWmaPcm *out)
     return 0;
 }
 
+static int wma_same_format(const XboxWmaPcm *a, const XboxWmaPcm *b)
+{
+    return a->sample_rate == b->sample_rate &&
+           a->channels == b->channels &&
+           a->bits_per_sample == b->bits_per_sample;
+}
+
 int xbox_wma_decode_file(const char *path, XboxWmaPcm *out)
 {
     HRESULT hr;
@@ -96,8 +103,11 @@ int xbox_wma_decode_file(const char *path, XboxWmaPcm *out)
     size_t capacity = 0;
     int result = -1;
 
-    if (!path || !out) return -1;
+    /* The public contract says every failure leaves a non-NULL output cleared,
+     * including argument validation failures. */
+    if (!out) return -1;
     memset(out, 0, sizeof(*out));
+    if (!path) return -1;
 
     co_hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (SUCCEEDED(co_hr)) {
@@ -159,10 +169,24 @@ int xbox_wma_decode_file(const char *path, XboxWmaPcm *out)
         }
 
         if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
-            if (wma_read_format(reader, out) != 0) {
+            XboxWmaPcm changed;
+            memset(&changed, 0, sizeof(changed));
+            if (wma_read_format(reader, &changed) != 0) {
                 if (sample) IMFSample_Release(sample);
                 goto done;
             }
+            /* One XboxWmaPcm describes one interleaved PCM format.  Appending
+             * samples in a new format and then overwriting the metadata would
+             * return a buffer whose first segment is mislabeled.  A format
+             * notification is harmless when the negotiated PCM properties are
+             * unchanged; otherwise fail once bytes have already been emitted. */
+            if (out->size != 0 && !wma_same_format(out, &changed)) {
+                if (sample) IMFSample_Release(sample);
+                goto done;
+            }
+            out->sample_rate = changed.sample_rate;
+            out->channels = changed.channels;
+            out->bits_per_sample = changed.bits_per_sample;
         }
 
         if (sample) {
