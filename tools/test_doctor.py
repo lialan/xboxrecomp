@@ -20,7 +20,9 @@ def test_flatten_recomp_stats_merges_categories():
 
 def test_parse_icall_feedback_tolerates_truncated_and_merges_flags(tmp_path):
     path = tmp_path / "icalls.txt"
-    path.write_text("# icall-feedback v1\n0x1000 1\n0x2000 2\n0x1000 2\ntruncated\n")
+    # Runtime output is zero-padded hexadecimal without a 0x prefix. Keep a
+    # prefixed row too because hand-edited/debug feedback files commonly use it.
+    path.write_text("# icall-feedback v1\n00001000 1\n00002000 2\n0x1000 2\ntruncated\n")
     out = parse_icall_feedback(path)
     assert out["targets"] == 2
     assert out["resolved"] == 1
@@ -29,19 +31,29 @@ def test_parse_icall_feedback_tolerates_truncated_and_merges_flags(tmp_path):
     assert out["unresolved_vas"] == [0x1000, 0x2000]
 
 
-def test_parse_runtime_log_counts_known_problem_classes(tmp_path):
+def test_parse_runtime_log_counts_real_problem_spellings(tmp_path):
     path = tmp_path / "run.log"
     path.write_text(
-        "[KERNEL] unimplemented ordinal 123\n"
+        "[KERNEL] unresolved ordinal 123\n"
         "[D3D8] unsupported render state 999\n"
         "audio unsupported stream packet\n"
-        "unresolved icall target 0x12345678\n"
+        "[ICALL] Failed to resolve VA 0x12345678\n"
     )
     out = parse_runtime_log(path)
     assert sum(out["kernel_stub"].values()) == 1
     assert sum(out["d3d_unsupported"].values()) == 1
     assert sum(out["audio_unsupported"].values()) == 1
     assert sum(out["unresolved_icall"].values()) == 1
+
+
+def test_runtime_log_totals_are_not_truncated_to_top_25(tmp_path):
+    path = tmp_path / "many.log"
+    path.write_text("".join(
+        f"[D3D8] unsupported render state {i}\n" for i in range(30)
+    ))
+    out = parse_runtime_log(path)
+    assert len(out["d3d_unsupported"]) == 30
+    assert sum(out["d3d_unsupported"].values()) == 30
 
 
 def test_build_report_ranks_translation_and_icall_failures(tmp_path):
@@ -55,7 +67,7 @@ def test_build_report_ranks_translation_and_icall_failures(tmp_path):
     abi.write_text(json.dumps({"0x1000": {}, "0x2000": {}}))
     recomp.write_text(json.dumps({"total": 2, "translated": 1, "failed": 1,
                                   "unimplemented": {"fxam": [0x1010]}}))
-    icalls.write_text("0x3000 2\n")
+    icalls.write_text("00003000 2\n")
     report = build_report(str(functions), str(identified), str(abi), str(recomp),
                           str(icalls), None)
     reasons = " ".join(item["reason"] for item in report["priorities"])
@@ -65,9 +77,39 @@ def test_build_report_ranks_translation_and_icall_failures(tmp_path):
     assert "indirect targets were unresolved" in reasons
 
 
+def test_build_report_marks_malformed_existing_artifact_invalid(tmp_path):
+    functions = tmp_path / "functions.json"
+    identified = tmp_path / "identified.json"
+    abi = tmp_path / "abi.json"
+    recomp = tmp_path / "recomp.json"
+    functions.write_text("{not-json")
+    identified.write_text("{}")
+    abi.write_text("{}")
+    recomp.write_text("{}")
+
+    report = build_report(str(functions), str(identified), str(abi), str(recomp))
+    assert report["pipeline"]["missing_artifacts"] == []
+    assert report["pipeline"]["invalid_artifacts"] == ["functions"]
+    assert any("invalid/unreadable artifacts" in item["reason"]
+               for item in report["priorities"])
+
+
+def test_rank_priorities_promotes_runtime_icall_without_feedback_file():
+    report = {
+        "pipeline": {"missing_artifacts": [], "invalid_artifacts": []},
+        "recompiler": {"failed": 0, "unimplemented": {}},
+        "icalls": {"unresolved": 0},
+        "runtime": {"unresolved_icall": {"0x12345678": 3}},
+    }
+    out = rank_priorities(report)
+    assert out[0]["severity"] == "high"
+    assert out[0]["area"] == "control-flow"
+    assert "3 runtime warning hit" in out[0]["reason"]
+
+
 def test_rank_priorities_has_clean_fallback():
     report = {
-        "pipeline": {"missing_artifacts": []},
+        "pipeline": {"missing_artifacts": [], "invalid_artifacts": []},
         "recompiler": {"failed": 0, "unimplemented": {}},
         "icalls": {"unresolved": 0},
         "runtime": {},
