@@ -50,10 +50,29 @@ def _normalize_functions(raw):
         if not isinstance(item, dict):
             continue
         start = _parse_addr(item.get("start", item.get("address", item.get("_addr", 0))))
-        end = _parse_addr(item.get("end", start))
+        if "end" in item:
+            end = _parse_addr(item["end"])
+        else:
+            # Some pipeline outputs describe a function as {address, size}
+            # rather than {start, end}.  Treat both shapes equivalently.
+            end = start + _parse_addr(item.get("size", 0))
         if start and end > start:
             out.append((start, end))
     return sorted(set(out))
+
+
+def _dedupe_records(records):
+    """Choose one canonical owner when recovered functions overlap.
+
+    Bring-up can temporarily recover an outer function and a later-starting
+    nested/overlapping function that both contain the same basic-block VA.
+    For a shared block start, the later owner start is the more specific
+    recovery because it is closer to that block.  Prefer it deterministically.
+    """
+    by_start = {}
+    for record in sorted(records, key=lambda r: (r.start, -r.owner, r.end)):
+        by_start.setdefault(record.start, record)
+    return [by_start[va] for va in sorted(by_start)]
 
 
 def collect_blocks(xbe_data: bytes, functions, disasm=None):
@@ -80,13 +99,7 @@ def collect_blocks(xbe_data: bytes, functions, disasm=None):
                 successors=tuple(sorted(set(block.successors))),
                 instructions=len(block.instructions),
             ))
-    # Recovered functions can overlap while bring-up is incomplete.  Keep one
-    # canonical record per block VA and prefer the smallest containing owner,
-    # which is the more specific recovery.
-    by_start = {}
-    for record in sorted(records, key=lambda r: (r.start, r.end - r.owner, r.owner)):
-        by_start.setdefault(record.start, record)
-    return [by_start[va] for va in sorted(by_start)]
+    return _dedupe_records(records)
 
 
 def dispatch_stats(records, pointer_size=8):
