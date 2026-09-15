@@ -54,6 +54,12 @@ _WIDTHS = {
 }
 
 _CONDS = ("z", "nz", "b", "ae", "be", "a", "s", "ns", "l", "ge", "le", "g")
+# The conformance snippet runner only enables explicit carry tracking when the
+# sequence contains ADC/SBB.  Do not manufacture SETcc carry consumers here or
+# a correct arithmetic lift can look wrong merely because the harness did not
+# request CF bookkeeping.  Carry itself is fuzzed by the dedicated ADC/SBB
+# families below.
+_NON_CARRY_CONDS = ("z", "nz", "s", "ns", "l", "ge", "le", "g")
 _FLAG_PRESERVING_NOISE = (
     "mov edx, edx",
     "mov esi, esi",
@@ -113,7 +119,7 @@ def _arith_case(rng: random.Random, index: int):
     width = rng.choice(tuple(_WIDTHS))
     lhs, rhs = _WIDTHS[width]
     op = rng.choice(("add", "sub", "and", "or", "xor"))
-    cond = rng.choice(_CONDS)
+    cond = rng.choice(_NON_CARRY_CONDS)
     body = [f"{op} {lhs}, {rhs}", f"set{cond} dl", "movzx eax, dl"]
     body = _with_noise(rng, body)
     return Case(
@@ -156,18 +162,19 @@ def _shift_case(rng: random.Random, index: int):
     width = rng.choice(tuple(_WIDTHS))
     lhs, _ = _WIDTHS[width]
     op = rng.choice(("shl", "shr", "sar", "rol", "ror"))
-    cond = rng.choice(("z", "nz", "s", "ns", "b", "ae"))
-    # CL supplies counts including 0, width, 31, 32, 33 and 255 through the
-    # generated input set.  This is where masking and narrow sign-extension
-    # mistakes tend to hide.
-    body = [f"{op} {lhs}, cl", f"set{cond} dl", "movzx eax, dl"]
-    body = _with_noise(rng, body)
+    # Compare the shifted/rotated value directly.  Counts that mask to zero
+    # preserve the incoming flags, while ROL/ROR preserve ZF/SF for every
+    # count.  Attaching an arbitrary SETcc would therefore compare harness
+    # setup flags rather than the instruction under test and create false
+    # positives.  Dedicated cases with explicit flag setup can fuzz those
+    # semantics separately.
+    body = [f"{op} {lhs}, cl"]
     inputs = _inputs(rng)
     counts = (0, 1, max(1, width - 1), width, 31, 32, 33, 255)
     inputs[: len(counts)] = [(_EDGES[i % len(_EDGES)], c) for i, c in enumerate(counts)]
     return Case(
-        f"fuzz_{index:04d}_{op}_set{cond}_i{width}",
-        f"fuzz: {op} i{width} count masking and flags",
+        f"fuzz_{index:04d}_{op}_i{width}",
+        f"fuzz: {op} i{width} count masking and result preservation",
         body,
         inputs,
     )
@@ -209,6 +216,11 @@ def _case_listing(cases: Iterable[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_seed(seed: int) -> str:
+    """Return a seed spelling argparse can parse again verbatim."""
+    return str(seed) if seed < 0 else f"0x{seed:X}"
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m tools.conformance.fuzz",
@@ -227,7 +239,8 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         ap.error(str(exc))
 
-    print(f"xboxrecomp lifter fuzz seed=0x{args.seed:X} count={len(cases)}")
+    seed_text = _format_seed(args.seed)
+    print(f"xboxrecomp lifter fuzz seed={seed_text} count={len(cases)}")
     if args.list:
         print(_case_listing(cases))
         return 0
@@ -249,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
     if rc:
         print(
             f"\nReproduce with: py -3 -m tools.conformance.fuzz --count {args.count} "
-            f"--seed 0x{args.seed:X} --keep -v",
+            f"--seed {seed_text} --keep -v",
             file=sys.stderr,
         )
     return rc
