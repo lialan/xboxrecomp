@@ -268,6 +268,15 @@ direction.
 - The same PR **took Burnout 3 out of the tooling** — hardcoded title strings
   in the parser, disassembler, func_id and translator replaced with a shared
   config, and the Linux default paths made generic.
+- **Noticed that `tools.abi_analysis` was missing from the getting-started
+  guide** — "an instruction that's omitted (I don't know if it's crucial or
+  not but I run it to make sure)". It is crucial: without
+  `abi_functions.json`, `tools.recomp` warns once and then falls back to
+  `cdecl` / 0 parameters / `int_or_void` for every function in the game. The
+  recompile succeeds and the signatures are all wrong, which is the quiet
+  failure shape this project keeps running into. Also the person answering
+  most of the newcomer questions in the Discord, which does not show up in a
+  commit log anywhere.
 
 ### dplewis — [@dplewis](https://github.com/dplewis)
 - **`ReleaseMutex` reported success for a release it did not perform (#18)** —
@@ -485,6 +494,27 @@ real thunk through synthetic guest memory, so they need no game files.
   the only tool package with no `__main__.py` while every other one had it.
   Kept testing through each fix and reported what broke next, which is how the
   `write_summary` crash at the very end of a full run got found.
+
+### jv36 — [@jv36](https://github.com/jv36)
+- **Found that a guest function named `isnan` could not be compiled**, while
+  bringing up *FIFA Street 2*. The C99 `<math.h>` classification names are
+  function-like *macros*, so the name does not collide — it expands. `void
+  isnan(void);` becomes `void (fpclassify(void) == FP_NAN);` and the compiler
+  reports a bad parameter declarator inside a system header, naming neither
+  the guest function nor the clash, which is why it cost a day rather than a
+  minute. Reported with the fix already worked out and the sibling names
+  enumerated: `isinf`, `isfinite`, `isnormal`, `signbit`, `fpclassify`. That
+  list is what turned it from one patch into the right one — chasing it back
+  showed the generation-time guard in `_func_ident` was the *weaker* of the
+  project's two reserved-name lists, so every name the Ghidra-only merge
+  filter would have caught was reaching the generated C by the IDA path.
+
+### LukeWarm
+- **Reported that the Linux build could not be found from the docs** — the
+  README documents Linux and macOS, and `docs/GETTING_STARTED.md`, which is
+  the guide people are actually pointed to, said "Windows 11" as a hard
+  requirement and never mentioned either. Now carries a platform matrix that
+  says what genuinely differs rather than implying one OS.
 
 ---
 
