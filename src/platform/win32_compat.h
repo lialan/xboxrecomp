@@ -184,7 +184,10 @@ BOOL   TrySubmitThreadpoolCallback(PTP_SIMPLE_CALLBACK callback,
                                    PVOID context, PVOID env);
 
 /* ---- Waitable timers --------------------------------------------------- */
+typedef VOID (*PTIMERAPCROUTINE)(PVOID arg, DWORD lowValue, DWORD highValue);
 HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name);
+BOOL   SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
+                        PTIMERAPCROUTINE completion, PVOID arg, BOOL resume);
 BOOL   CancelWaitableTimer(HANDLE h);
 
 /* ---- Heap ------------------------------------------------------------- */

@@ -77,8 +77,14 @@ def _cl(vcvars, workdir, args):
 _IMAGE = "xboxrecomp-conf-i386"
 
 def _docker_image_present():
-    return subprocess.run(["docker", "image", "inspect", _IMAGE],
-                          capture_output=True).returncode == 0
+    # Not just a non-zero exit: with no docker on PATH at all this raises
+    # FileNotFoundError, and the caller is the code whose whole job is to
+    # print a readable "no toolchain" message instead of a traceback.
+    try:
+        return subprocess.run(["docker", "image", "inspect", _IMAGE],
+                              capture_output=True).returncode == 0
+    except OSError:
+        return False
 
 
 class _Container:

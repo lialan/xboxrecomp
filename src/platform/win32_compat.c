@@ -23,6 +23,7 @@
 #include <strings.h>
 #include <stdio.h>
 #include <time.h>
+#include <signal.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sched.h>
@@ -297,6 +298,7 @@ typedef struct w32_object {
     int             waitable_manual_reset;
     struct timespec waitable_due_time;
     int             waitable_triggered;
+    int             waitable_armed;
 
     /* file mapping / fd-backed file handle */
     int             fd;
@@ -430,6 +432,24 @@ static int drain_apcs(void)
     return run;
 }
 
+static int timespec_before(const struct timespec *a, const struct timespec *b)
+{
+    return a->tv_sec != b->tv_sec ? a->tv_sec < b->tv_sec : a->tv_nsec < b->tv_nsec;
+}
+
+/* Signalled once the due time passes; latched, so a manual-reset timer stays
+ * signalled until it is set or cancelled again. Caller holds o->lock. */
+static int waitable_due(w32_object *o)
+{
+    struct timespec now;
+    if (o->waitable_triggered) return 1;
+    if (!o->waitable_armed) return 0;
+    clock_gettime(CLOCK_REALTIME, &now);
+    if (timespec_before(&now, &o->waitable_due_time)) return 0;
+    o->waitable_triggered = 1;
+    return 1;
+}
+
 /*
  * Wait on a single object. The object lock must NOT be held.
  * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT.
@@ -452,18 +472,34 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         case K_MUTEX:
             ready = (o->mtx_owner == 0 || o->mtx_owner == GetCurrentThreadId());
             break;
+        case K_WAITABLE_TIMER: ready = waitable_due(o); break;
         default:       ready = 1; break;
         }
         if (ready) break;
 
-        int rc = timed ? pthread_cond_timedwait(&o->cond, &o->lock, &ts)
-                       : pthread_cond_wait(&o->cond, &o->lock);
-        if (rc == ETIMEDOUT) { result = WAIT_TIMEOUT; break; }
+        /* An armed timer has its own deadline. Waiting on the caller's alone
+         * would sleep straight past the due time, so take whichever comes
+         * first and re-test. */
+        struct timespec until = ts;
+        int bounded = timed;
+        if (o->kind == K_WAITABLE_TIMER && o->waitable_armed &&
+            (!timed || timespec_before(&o->waitable_due_time, &ts))) {
+            until = o->waitable_due_time;
+            bounded = 1;
+        }
+        int rc = bounded ? pthread_cond_timedwait(&o->cond, &o->lock, &until)
+                         : pthread_cond_wait(&o->cond, &o->lock);
+        if (rc == ETIMEDOUT && timed && !timespec_before(&until, &ts)) {
+            result = WAIT_TIMEOUT; break;
+        }
     }
 
     if (result == WAIT_OBJECT_0) {
         switch (o->kind) {
         case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
+        case K_WAITABLE_TIMER:
+            if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
+            break;
         case K_SEM:   o->sem_count--; break;
         case K_MUTEX: o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion++; break;
         default: break;
@@ -940,12 +976,46 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR 
     return (HANDLE)o;
 }
 
+BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
+                      PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
+{
+    w32_object *o = (w32_object *)h;
+    (void)completion; (void)arg; (void)resume;
+    if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
+    pthread_mutex_lock(&o->lock);
+    /* Win32 100ns units: negative is relative to now, positive is an absolute
+     * FILETIME. ponytail: period is ignored -- one-shot only, revisit if a
+     * title actually arms a repeating timer. */
+    if (dueTime->QuadPart <= 0) {
+        clock_gettime(CLOCK_REALTIME, &o->waitable_due_time);
+        LONGLONG ns = -dueTime->QuadPart * 100LL;
+        o->waitable_due_time.tv_sec  += (time_t)(ns / 1000000000LL);
+        o->waitable_due_time.tv_nsec += (long)(ns % 1000000000LL);
+        if (o->waitable_due_time.tv_nsec >= 1000000000L) {
+            o->waitable_due_time.tv_sec++;
+            o->waitable_due_time.tv_nsec -= 1000000000L;
+        }
+    } else {
+        /* FILETIME epoch is 1601-01-01; Unix is 1970-01-01. */
+        LONGLONG unix100ns = dueTime->QuadPart - 116444736000000000LL;
+        o->waitable_due_time.tv_sec  = (time_t)(unix100ns / 10000000LL);
+        o->waitable_due_time.tv_nsec = (long)((unix100ns % 10000000LL) * 100LL);
+    }
+    (void)period;
+    o->waitable_armed = 1;
+    o->waitable_triggered = 0;
+    pthread_mutex_unlock(&o->lock);
+    pthread_cond_broadcast(&o->cond);
+    return TRUE;
+}
+
 BOOL CancelWaitableTimer(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->waitable_triggered = 0;
+    o->waitable_armed = 0;
     pthread_mutex_unlock(&o->lock);
     return TRUE;
 }
@@ -1134,7 +1204,6 @@ BOOL IsDebuggerPresent(void)
 #if defined(__APPLE__)
     /* Darwin: KERN_PROC_PID reports P_TRACED when a debugger is attached. */
     struct kinfo_proc info;
-    info.kp_proc.p_flag = 0;
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
     size_t size = sizeof(info);
     memset(&info, 0, size);
@@ -1158,7 +1227,10 @@ BOOL IsDebuggerPresent(void)
 }
 
 VOID DebugBreak(void) {
-    __debugbreak();
+    /* Not __debugbreak(): that is an MSVC intrinsic, and this file is the
+     * half that MSVC never compiles. SIGTRAP is the POSIX equivalent --
+     * continuable under a debugger, fatal without one, as on Windows. */
+    raise(SIGTRAP);
 }
 
 VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
@@ -1515,6 +1587,7 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
 
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
 {
+    if (!b) return FALSE;
 #if defined(__APPLE__)
     /* Darwin has no sysinfo(2): physical memory comes from sysctl hw.memsize,
      * swap from vm.swapusage, the free page count from the Mach VM statistics. */
@@ -1545,7 +1618,6 @@ BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
     b->ullAvailPageFile = b->ullAvailPhys + (ULONGLONG)swap.xsu_avail;
 #else
     struct sysinfo si;
-    if (!b) return FALSE;
     if (sysinfo(&si) != 0) return FALSE;
 
     ULONGLONG unit = si.mem_unit ? si.mem_unit : 1;
