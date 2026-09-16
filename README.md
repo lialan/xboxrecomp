@@ -420,12 +420,18 @@ bash tools/macos/run_tests.sh
 ```
 
 The unit tests are fast and need no game files. The conformance suite goes
-further: it assembles each snippet with MSVC, lifts the resulting bytes, then
-runs the lifted C *and the original instructions* over the same inputs and
-requires them to agree. Because we target x86 and run on x86, the host CPU is
-the oracle — no model to be wrong. See
-[Conformance Testing](docs/technical/conformance-testing.md). It needs a 32-bit
-MSVC, and is skipped rather than failed where there isn't one.
+further: it assembles each snippet, lifts the resulting bytes, then runs the
+lifted C *and the original instructions* over the same inputs and requires them
+to agree. The CPU executing those instructions is the oracle — no model to be
+wrong. See [Conformance Testing](docs/technical/conformance-testing.md).
+
+That oracle has to be 32-bit x86. On Windows a 32-bit MSVC supplies one. On Non-Windows a `linux/386` container stands in for the toolchain while the lifting stays on the host:
+
+```bash
+bash tools/macos/run_conformance_tests.sh
+```
+
+That builds the container image on first run, then runs the snippet phase. The corpus and XBE phases need MSVC (they link a PE DLL and lift it back out) and report as skipped, never as passed.
 
 If you fix a lift, add the case.
 
