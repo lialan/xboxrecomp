@@ -58,6 +58,12 @@ LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
     return cmp;
 }
 
+LONGLONG InterlockedCompareExchange64(volatile LONGLONG *p, LONGLONG xchg, LONGLONG cmp)
+{
+    __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return cmp;
+}
+
 PVOID InterlockedCompareExchangePointer(PVOID volatile *p, PVOID xchg, PVOID cmp)
 {
     __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
@@ -241,7 +247,7 @@ VOID WakeAllConditionVariable(PCONDITION_VARIABLE cv)
 /* ===================================================================== */
 
 typedef enum { K_EVENT, K_SEM, K_MUTEX, K_THREAD, K_TIMER, K_HEAP,
-               K_FILEMAP, K_FILE } w32_kind;
+               K_FILEMAP, K_FILE, K_WAITABLE_TIMER } w32_kind;
 
 #define W32_MAX_APC 16
 
@@ -284,6 +290,11 @@ typedef struct w32_object {
     DWORD           timer_period;
     WAITORTIMERCALLBACK timer_cb;
     PVOID           timer_param;
+
+    /* waitable timer */
+    int             waitable_manual_reset;
+    struct timespec waitable_due_time;
+    int             waitable_triggered;
 
     /* file mapping / fd-backed file handle */
     int             fd;
@@ -331,6 +342,8 @@ static void obj_release(w32_object *o)
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
         if (o->fd >= 0) close(o->fd);
+    } else if (o->kind == K_WAITABLE_TIMER) {
+        /* Waitable timers: no special cleanup needed */
     }
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
@@ -909,6 +922,29 @@ BOOL TrySubmitThreadpoolCallback(PTP_SIMPLE_CALLBACK callback,
     pthread_t th;
     if (pthread_create(&th, NULL, w32_tp_trampoline, a) != 0) { free(a); return FALSE; }
     pthread_detach(th);
+    return TRUE;
+}
+
+/* ===================================================================== */
+/* Waitable timers                                                       */
+/* ===================================================================== */
+
+HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name)
+{
+    (void)sa;
+    (void)name;
+    w32_object *o = obj_alloc(K_WAITABLE_TIMER);
+    o->waitable_manual_reset = manualReset;
+    return (HANDLE)o;
+}
+
+BOOL CancelWaitableTimer(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
+    pthread_mutex_lock(&o->lock);
+    o->waitable_triggered = 0;
+    pthread_mutex_unlock(&o->lock);
     return TRUE;
 }
 
