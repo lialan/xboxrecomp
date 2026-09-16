@@ -33,6 +33,7 @@
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #else
 #include <sys/sysinfo.h>
 #endif
@@ -1070,6 +1071,52 @@ static int prot_from_page(DWORD protect)
     }
 }
 
+#if defined(__APPLE__)
+/* Darwin has no MAP_FIXED_NOREPLACE, and the two mmap options are both wrong
+ * for VirtualAlloc: MAP_FIXED silently unmaps whatever already occupies the
+ * range, and a bare address hint can be relocated by the kernel for reasons
+ * other than the range being taken -- so "we got a different address" is only
+ * an approximation of "it was occupied", and a racy one.
+ *
+ * mach_vm_map with VM_FLAGS_FIXED is the exact primitive: it maps at the
+ * address given, and returns KERN_NO_SPACE rather than displacing an existing
+ * mapping. That is what Win32 promises, and this layer exists to keep the Xbox
+ * HLE above it honest -- a VirtualAlloc that quietly replaced a live mapping
+ * would corrupt whatever held it, far from the call that did it.
+ *
+ * Memory from mach_vm_map is released by munmap like any other, because the
+ * BSD and Mach halves of Darwin share one VM map, so VirtualFree is unchanged.
+ */
+static void *mach_map_fixed(void *address, size_t size, int prot)
+{
+    mach_vm_address_t addr = (mach_vm_address_t)(uintptr_t)address;
+    mach_vm_size_t len = (size + vm_page_size - 1) & ~((mach_vm_size_t)vm_page_size - 1);
+    vm_prot_t vmprot = VM_PROT_NONE;
+
+    if (prot & PROT_READ)  vmprot |= VM_PROT_READ;
+    if (prot & PROT_WRITE) vmprot |= VM_PROT_WRITE;
+    if (prot & PROT_EXEC)  vmprot |= VM_PROT_EXECUTE;
+
+    kern_return_t kr = mach_vm_map(
+        mach_task_self(),
+        &addr,
+        len,
+        0,
+        VM_FLAGS_FIXED,
+        MEMORY_OBJECT_NULL,
+        0,
+        FALSE,
+        vmprot,
+        VM_PROT_ALL,
+        VM_INHERIT_DEFAULT
+    );
+    if (kr != KERN_SUCCESS) {
+        return MAP_FAILED;
+    }
+    return (void *)(uintptr_t)addr;
+}
+#endif
+
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
@@ -1085,17 +1132,29 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 
 #if defined(MAP_FIXED_NOREPLACE)
     if (address) flags |= MAP_FIXED_NOREPLACE;
-#elif defined(__APPLE__)
-    /* TODO: mach_vm_map with VM_FLAGS_FIXED (which does fail rather than replace),
-     * or a mach_vm_region probe before an MAP_FIXED call. */
 #endif
-    void *p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
-                   flags, -1, 0);
-    if (p == MAP_FAILED) { SetLastError(8); return NULL; }
-#if !defined(MAP_FIXED_NOREPLACE)
-    /* TODO: Without MAP_FIXED_NOREPLACE (macOS or older kernels) plain
-     * MAP_FIXED would silently unmap whatever already lives there. Getting a
-     * different address means the range was taken: fail as Linux does. */
+
+    void *p;
+#if defined(__APPLE__)
+    if (address) {
+        p = mach_map_fixed(address, size, prot ? prot : PROT_READ | PROT_WRITE);
+    } else
+#endif
+    p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (p == MAP_FAILED) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+#if !defined(MAP_FIXED_NOREPLACE) && !defined(__APPLE__)
+    /* Older kernels without MAP_FIXED_NOREPLACE: plain MAP_FIXED would silently
+     * unmap whatever already lives there, so we pass the address as a hint and
+     * treat a different result as "taken". Apple goes through mach_map_fixed
+     * above, which reports that properly instead of inferring it. */
+    if (address && p != address) {
+        munmap(p, size);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
 #endif
     return p;
 }
