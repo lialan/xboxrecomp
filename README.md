@@ -22,7 +22,7 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 ### Recent Changes
 
-**Current version: v0.9.0 — _"Quietly Wrong"_ (September 2026).**
+**Current version: v0.10.0 — _"Negative Control"_ (September 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
@@ -414,6 +414,17 @@ py -3 -m pytest tools/       # unit tests
 py -3 -m tools.conformance   # differential: lifted C vs the real CPU
 ```
 
+Several unit tests compile the lifter's own output and sweep it against x86's
+definitions — they are the real proof for the shift, flag and x87 work, and
+each is paired with a negative control that feeds the harness the pre-fix
+expression and requires it to fail. They need a C compiler on `PATH`, and
+**skip rather than fail without one**, so check the skip count: a clean run is
+272 passed / 0 skipped. If clang is installed but not on `PATH`:
+
+```bash
+export PATH="/c/Program Files/LLVM/bin:$PATH"   # Git Bash
+```
+
 Run unit tests on MacOS
 ```bash
 bash tools/macos/run_tests.sh
@@ -425,13 +436,17 @@ lifted C *and the original instructions* over the same inputs and requires them
 to agree. The CPU executing those instructions is the oracle — no model to be
 wrong. See [Conformance Testing](docs/technical/conformance-testing.md).
 
-That oracle has to be 32-bit x86. On Windows a 32-bit MSVC supplies one. On Non-Windows a `linux/386` container stands in for the toolchain while the lifting stays on the host:
+That oracle has to be 32-bit x86. On Windows a 32-bit MSVC supplies one.
+Everywhere else a `linux/386` container stands in for the toolchain while the
+lifting stays on the host:
 
 ```bash
 bash tools/macos/run_conformance_tests.sh
 ```
 
-That builds the container image on first run, then runs the snippet phase. The corpus and XBE phases need MSVC (they link a PE DLL and lift it back out) and report as skipped, never as passed.
+That builds the container image on first run, then runs the snippet phase. The
+corpus and XBE phases need MSVC (they link a PE DLL and lift it back out) and
+report as skipped, never as passed.
 
 If you fix a lift, add the case.
 
@@ -503,6 +518,165 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.10.0 — *"Negative Control"* (September 2026)
+
+*Twenty contributed PRs, and the thread running through them is the gap between
+a thing being declared and a thing being true. A function declared with nine
+arguments that takes ten. An argument declared on the stack that arrives in a
+register. A shift declared arithmetic that was logical. A test suite declared
+passing that was skipping. Several of these arrived with a* negative control —
+*a second test that feeds the harness the pre-fix code and requires it to fail,
+on the grounds that a sweep passing against both spellings is testing nothing.
+That is the right instinct, and it names the release.*
+
+**Fourteen fixes from one contributor, found by driving a real title through
+the pipeline** and chasing each wrong answer back to its cause — the largest
+single batch the project has taken. Each arrived with a regression that fails
+without it — *[@GTTeancum](https://github.com/GTTeancum)* (#41–#45, #47–#51,
+#53–#56)
+
+**Four kernel calls had the wrong ABI.**
+
+- **`NtQueryDirectoryFile` was declared with nine arguments and has ten.** The
+  missing `FileInformationClass` meant every argument after it was read one slot
+  early — the search mask and restart flag came from the wrong places — and the
+  bridge popped 36 bytes where the guest pushed 40. A four-byte stack leak per
+  call, which is the kind that runs for a while and then does not. The
+  enumeration also returned the host's `.` and `..`, which FATX does not have —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#51)
+- **`KfRaiseIrql` and `KfLowerIrql` are `__fastcall`**, so their argument
+  arrives in `CL` and the bridge was reading it off the stack. The cleanup table
+  already said zero bytes, so the value read was whatever sat at that address —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#54)
+- **Counted object names were read as NUL-terminated.** The XDK passes a
+  directory name with a trailing wildcard and `Length` shortened to exclude it,
+  without writing a NUL at the new end, so the path picked up the wildcard and
+  whatever followed it in guest memory. The same fix made
+  `ObjectAttributes->RootDirectory` real rather than always `NULL`, which is what
+  lets a title open a save file relative to the directory handle it just
+  enumerated — *[@GTTeancum](https://github.com/GTTeancum)* (#53)
+- **`MmGetPhysicalAddress` returned the virtual address unchanged.** For the
+  contiguous arena — the virtual *window* onto physical RAM — that hands a DMA
+  consumer an address with the high bit still set —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#55)
+
+**Three pieces of kernel state that were the wrong shape.**
+
+- **The pending kernel-dispatch slot was a single process-wide global.** Two
+  threads resolving an import at the same time raced, and the loser invoked the
+  *other* thread's service, popping that one's argument count off its own stack.
+  Thread-local now: a one-word change, and worth finding —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#43)
+- **`IdexChannelObject` was exported as an opaque self-pointer.** It is a
+  structure, and guest file-close code walks `DeviceQueue.DeviceListHead` at
+  +0x28, where it found nulls. Host-backed synchronous I/O never enqueues guest
+  IRPs, so the honest answer is a correctly formed *empty* circular list —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#45)
+- **The EEPROM advertised mono audio with AC3.** `XC_AUDIO` was set to
+  `0x00010001`, and in that field 1 means *mono*. A title asked the console what
+  it was plugged into and was told one channel plus an encoded output path that
+  does not exist — *[@GTTeancum](https://github.com/GTTeancum)* (#56)
+
+**Six x86 semantics the lifter had subtly wrong.**
+
+- **`SAR` shifted at 32 bits regardless of operand width.** Every narrow read
+  arrives zero-extended, so `(int32_t)` on an 8- or 16-bit operand never saw a
+  sign bit and the shift was a logical one wearing an arithmetic cast. `sar al,
+  1` on `0x80` gave `0x40` where x86 gives `0xC0` — a negative number halved into
+  a positive one, which is how a fixed-point divide or a signed average goes
+  wrong without ever faulting. The count is masked to five bits as x86 does, and
+  CF comes from the sign-extended value so a count at or past the operand width
+  still reports the sign bit. Found independently by two people —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#50) and
+  *[@andeecollard](https://github.com/andeecollard)* (#57)
+- **`INC`/`DEC` destroyed the carry flag they are defined to preserve.** The
+  whole point of `inc` over `add reg, 1` is that CF survives it. Their own flags
+  were no better: `js`, `jl` and friends re-read the destination at the branch,
+  so a `mov` in between changed the answer, and OF and PF were not modelled at
+  all — *[@GTTeancum](https://github.com/GTTeancum)* (#44)
+- **`jbe` and `ja` after `and`/`or`/`xor` were folded to constants.** Those
+  instructions do clear CF, so `jb` and `jae` after one really are 0 and 1 — but
+  `jbe` is CF|ZF and `ja` is !CF && !ZF, and ZF is whatever the result was.
+  Collapsing all four meant `and eax, eax; jbe` never branched and `ja` always
+  did: wrong exactly when the result is zero and right the rest of the time, so
+  it survives ordinary traffic and then takes the wrong arm on the empty list,
+  the null handle, the zero count —
+  *[@andeecollard](https://github.com/andeecollard)* (#57)
+- **`FIST`/`FISTP` ignored the guest's rounding mode**, lifting to `llrint`,
+  which rounds by the *host's*. The era's CRT `_ftol` sets round-toward-zero and
+  then converts, so the truncation it asks for silently became round-to-nearest:
+  the 255.5 a colour-packing path expects to floor to 255 became 256, and every
+  channel of white wrapped to 0 — *[@GTTeancum](https://github.com/GTTeancum)*
+  (#47)
+- **`FXAM` was not implemented, and the status word was rebuilt from scratch at
+  every read.** `fnstsw` derived C0/C2/C3 from the comparison result alone, so a
+  classification instruction contributed nothing and a title asking "is this a
+  NaN, a zero, an infinity?" got the last *compare* back. The condition bits are
+  shared x87 state now, so they survive a call the way the hardware's do —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#49)
+- **A classic `push ebp; mov ebp, esp` prologue pushed an uninitialised C
+  local.** The generated `ebp` was only seeded from the caller's frame for
+  *frameless* functions, and a function with a real prologue reads it on its very
+  first statement, so the guest's saved-frame chain got an indeterminate word
+  that the epilogue pops back. Reached from both directions and merged together:
+  one seeds it from the caller's frame, the other initialises the declaration,
+  and the fix wants both — *[@GTTeancum](https://github.com/GTTeancum)* (#48) and
+  *[@andeecollard](https://github.com/andeecollard)* (#57)
+
+**Two recovery passes that were guessing.** Comparison snapshots were discarded
+at any control-flow join whose predecessors compared different registers — the
+operands differ but the runtime slots they save into do not, so a shared consumer
+can use whichever path actually ran (#41). And a bare immediate could split an
+instruction the sweep had already decoded: an integer constant landing in an
+unclaimed code gap is weak evidence, and treating it as a function entry carved
+the real instruction stream in half (#42) —
+*[@GTTeancum](https://github.com/GTTeancum)*
+
+**Display gamma ramps.** `SetGammaRamp` and `GetGammaRamp` were empty stubs that
+took their arguments and dropped them, so a title that dims the screen for a fade
+simply did not — invisible until you know the fade is missing rather than
+instant. Implemented as a presentation-time transform, which is the part worth
+having: the ramp is applied on the way to the swap chain and the guest's own
+pixels are snapshotted first and copied back after, so a title that reads its
+backbuffer back still sees what it drew, and a failed `Present` does not leave
+gamma baked into guest memory. Runs on a deferred context so the game's bound
+pipeline survives, and an identity ramp costs no GPU work at all —
+*[@NoRain211](https://github.com/NoRain211)* (#46)
+
+**The conformance suite no longer needs Windows to prove anything.** It proves
+the lifter correct by running each snippet as real x86 and comparing, which meant
+a 32-bit MSVC — everywhere else it skipped, and a skip proves nothing. A
+`linux/386` container now supplies the toolchain and the CPU while the lifting
+stays on the host. Two details make it trustworthy rather than merely green:
+what is substituted is the toolchain and never the comparison, and the corpus and
+XBE phases, which genuinely need PE linking, report as *skipped* rather than
+passed. The sharpest find is in the harness — the native side deliberately runs
+the x87 at 53-bit precision, and musl's i386 `libm` needs extended precision for
+its argument reduction, so leaving that in force made `cos(100.0)` come back as
+-1.27e16 — *[@dplewis](https://github.com/dplewis)* (#52)
+
+**The Darwin `TODO`s became implementations.** `IsDebuggerPresent` reads
+`P_TRACED` on macOS and `TracerPid` on Linux instead of answering "no"
+everywhere; `SecureZeroMemory` uses `memset_s`; `GlobalMemoryStatusEx` assembles
+its answer from `hw.memsize`, the Mach VM statistics and `vm.swapusage`. The best
+of them is `anon_map_fd`, which on macOS had been returning a literal `0` — a
+valid file descriptor, and specifically *stdin*, so every file mapping on that
+path was quietly backed by the wrong thing. Plus
+`InterlockedCompareExchange64` and waitable-timer handles —
+*[@dplewis](https://github.com/dplewis)* (#38, #39, #40)
+
+**Also.** Four defects were fixed on integration, all on paths the Windows build
+cannot reach — so none were wrong at review time, they were unbuilt. One PR
+called `__debugbreak()`, an MSVC intrinsic, from inside the half of
+`win32_compat.c` guarded by `!defined(_WIN32)`, where clang rejects it outright;
+`win32_compat.c` is now compile-checked under Linux rather than assumed. The
+waitable timers shipped `Create` and `Cancel` with no `SetWaitableTimer` and no
+`wait_single` case, so a wait on one returned immediately; both are wired up.
+And the test suite was itself half-skipping: nine of the compile-and-sweep tests
+need a C compiler on `PATH`, and without one they skip rather than fail — 272
+tests pass where 237 did, and the difference is entirely tests that had been
+sitting out.
 
 ### v0.9.0 — *"Quietly Wrong"* (September 2026)
 
