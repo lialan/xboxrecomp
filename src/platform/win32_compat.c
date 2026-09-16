@@ -1130,16 +1130,33 @@ VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
 BOOL IsDebuggerPresent(void)
 {
 #if defined(__APPLE__)
-    /* TODO: Darwin: KERN_PROC_PID reports P_TRACED when a debugger is attached. */
-    return FALSE;
+    /* Darwin: KERN_PROC_PID reports P_TRACED when a debugger is attached. */
+    struct kinfo_proc info;
+    info.kp_proc.p_flag = 0;
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+    size_t size = sizeof(info);
+    memset(&info, 0, size);
+    if (sysctl(mib, sizeof(mib), &info, &size, NULL, 0) != 0) return FALSE;
+    return (info.kp_proc.p_flag & P_TRACED) != 0;
 #else
-    /* TODO: On Linux a non-zero TracerPid in /proc/self/status means ptrace is attached. */
-    return FALSE;
+    /* Linux: a non-zero TracerPid in /proc/self/status means ptrace is attached. */
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return FALSE;
+    char line[256];
+    BOOL traced = FALSE;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "TracerPid:", 10) == 0) {
+            traced = strtol(line + 10, NULL, 10) != 0;
+            break;
+        }
+    }
+    fclose(f);
+    return traced;
 #endif
 }
 
 VOID DebugBreak(void) {
-    // TODO: Use __debugbreak()?
+    __debugbreak();
 }
 
 VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
