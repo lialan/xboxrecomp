@@ -1624,10 +1624,12 @@ static void bridge_NtYieldExecution(void)
 static void bridge_MmGetPhysicalAddress(void)
 {
     uint32_t addr = STACK_ARG(0);
-    /* Xbox uses identity mapping (physical == virtual) for the lower 64MB.
-     * Just return the Xbox VA as-is. Don't call xbox_MmGetPhysicalAddress
-     * which would return a native pointer. */
-    g_eax = addr;
+    /* The contiguous arena is the virtual window for physical RAM.
+     * DMA consumers need its physical offset, not the high virtual-address bit.
+     * Preserve existing identity behavior outside this mapped window. */
+    g_eax = (addr >= XBOX_CONTIG_BASE &&
+             (uint64_t)addr < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+          ? addr - XBOX_CONTIG_BASE : addr;
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */
