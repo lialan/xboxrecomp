@@ -233,9 +233,16 @@ static void kernel_data_init(void)
      * "no video mode reported", which titles treat as auto-detect. */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_BOOT_SMC_VIDEO) = 0;
 
-    /* IdexChannelObject (ordinal 357) - IDE channel object. Opaque; only ever
-     * passed back to Io* routines we stub, so a recognisable non-null is enough. */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL) = XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL;
+    /* IdexChannelObject is a structure, not an opaque pointer. Guest file-close
+     * code walks DeviceQueue.DeviceListHead at +0x28. Host-backed synchronous
+     * I/O does not enqueue guest IRPs, so this must be an empty circular list.
+     * Reserve separate storage: the old 16-byte slot overlapped the key exports. */
+    {
+        uint32_t channel=XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL;
+        memset(XBOX_TO_NATIVE(channel),0,0x200);
+        BRIDGE_MEM32(channel+0x28)=channel+0x28;
+        BRIDGE_MEM32(channel+0x2C)=channel+0x28;
+    }
 
     /* HalDiskCachePartitionCount (ordinal 40) - number of cache partitions.
      * Retail consoles report 3 (X, Y, Z). Titles size a partition array from
