@@ -180,6 +180,20 @@ helpers the lift emits — was not in the PRs and was added on integration.)*
   correctly placed one. Dividing the reconstructed clip position by RHW
   restores clip W = 1/RHW and leaves post-divide screen XYZ untouched.
 
+*Display gamma (#46)*
+- **`SetGammaRamp` and `GetGammaRamp` were empty stubs** — both took their
+  arguments and dropped them, so a title that dims the screen to black for a
+  fade, or ramps back up on a load, simply did not. Silent, and invisible until
+  you know the fade is missing rather than instant. Implemented as a
+  presentation-time transform, which is the part worth having: the ramp is
+  applied to the backbuffer on the way to the swap chain and the guest's own
+  pixels are snapshotted first and copied back after, so a title that reads its
+  backbuffer back still sees what it drew, and a failed `Present` does not leave
+  gamma baked into guest memory. Runs on a deferred context so the game's bound
+  pipeline survives, and an identity ramp costs no GPU work at all. Shipped with
+  a WARP regression that reads displayed pixels back across all three
+  presentation entry points, a real DXGI `Present`, and teardown.
+
 *Also raised: stored code pointers (#13).* The gap is real and was found
 independently while bringing up Half-Life 2 -- functions reachable only as an
 address in a table have no call site, no prologue and no padding boundary, so
@@ -286,9 +300,161 @@ direction.
   were defined inside the `_WIN32` half and referenced from the POSIX half, and
   hoisted them above the backend split rather than duplicating the 0x4000 that
   Half-Life 2's CRT init requires.
+- **Filled in the Darwin `TODO`s left behind by #20 (#39, #40)** — the honest
+  placeholders from #20 became implementations. `IsDebuggerPresent` now reads
+  `P_TRACED` from `KERN_PROC_PID` on macOS and `TracerPid` from
+  `/proc/self/status` on Linux instead of answering "no" everywhere;
+  `SecureZeroMemory` uses `memset_s`; and `GlobalMemoryStatusEx` assembles the
+  Darwin answer from `hw.memsize`, the Mach VM statistics and `vm.swapusage`.
+  The best of them is `anon_map_fd`, which on macOS had been returning a literal
+  `0` — a valid file descriptor, and specifically *stdin*, so every file mapping
+  on that path was quietly backed by the wrong thing. Now `shm_open` with an
+  `O_EXCL` unique name, unlinked immediately.
+- **`InterlockedCompareExchange64` and the waitable-timer handles (#38)** — the
+  64-bit compare-exchange the CRT's own atomics reach for, and the timer objects
+  a title uses to pace itself.
+- **A 32-bit x86 oracle that does not need Windows (#52)** — the conformance
+  suite proves the lifter correct by running each snippet as real x86 and
+  comparing, which had meant a 32-bit MSVC and therefore Windows; everywhere
+  else the suite skipped, and a skip proves nothing. A `linux/386` container now
+  supplies the toolchain and the CPU while the lifting stays on the host, with
+  the MASM snippets rewritten into the GAS Intel dialect and the bytes recovered
+  from `objdump` instead of `/FAc`. Two details make it trustworthy rather than
+  merely green: what is substituted is the toolchain and never the comparison,
+  and the corpus and XBE phases — which genuinely need PE linking — report as
+  *skipped*, never as passed. The sharpest find is in the harness: the native
+  side deliberately runs the x87 at 53-bit precision, and musl's i386 `libm`
+  needs extended precision for its argument reduction, so leaving that setting
+  in force made `cos(100.0)` come back as -1.27e16. The control word is restored
+  before the lifted side runs.
 - **Scoped the macOS port (#19)** — an accurate, specific list of what stands
   in the way (`MAP_FIXED_NOREPLACE`, `memfd_create`, `GlobalMemoryStatusEx`,
   SDL2/epoxy) rather than a request, which is the useful kind of issue.
+
+### GTTeancum — [@GTTeancum](https://github.com/GTTeancum)
+Fourteen fixes in two days, found by driving a real title through the pipeline
+and chasing each wrong answer back to its cause. Every one arrived with a
+regression that fails without the fix — several compile the lifter's own
+output and sweep it against x86's definitions, and the kernel ones dispatch the
+real thunk through synthetic guest memory, so they need no game files.
+
+*x87 (#47, #49)*
+- **`FIST`/`FISTP` ignored the guest's rounding mode** — they lifted to
+  `llrint`, which rounds by the *host's* mode, while the guest's control word
+  said something else. The era's CRT `_ftol` sets round-toward-zero and then
+  converts, so the truncation it is asking for silently became round-to-nearest:
+  the 255.5 that a colour-packing path expects to floor to 255 became 256, and
+  every channel of white wrapped to 0. Now honours all four RC modes, with
+  ties-to-even done properly, and stores the integer-indefinite value on a
+  masked invalid conversion instead of whatever the cast happened to produce.
+- **`FXAM` was not implemented at all, and the status word was rebuilt from
+  scratch at every read** — `fnstsw` derived C0/C2/C3 from the comparison
+  result alone, so a classification instruction contributed nothing and a title
+  asking "is this a NaN, a zero, an infinity?" got the last *compare* back
+  instead. The condition bits are shared x87 state now, written by `fxam`,
+  `ftst` and the `fcom` family alike, which also means they survive a call the
+  way the hardware's do. Denormals are classified as normals with the reasoning
+  written down: a binary64 subnormal *is* a normal extended-precision value, so
+  that is not an approximation.
+
+*Flags and control flow (#41, #44, #48, #50)*
+- **`INC`/`DEC` destroyed the carry flag they are defined to preserve** — the
+  whole point of `inc` over `add reg, 1` is that CF survives it, and the lifter
+  dropped it, so a `jb`/`jae` after one read a stale or absent carry. Their own
+  flags were no better: `js`, `jl` and friends re-read the destination at the
+  branch, so a `mov` in between changed the answer, and OF and PF were not
+  modelled at all. Now snapshotted at the instruction, with OF derived from the
+  one input value that can overflow at each width.
+- **`SAR` shifted at 32 bits regardless of operand width** — every narrow read
+  arrives zero-extended, so `(int32_t)` on an 8- or 16-bit operand never saw a
+  sign bit and the shift was a logical one wearing an arithmetic cast. `sar al,
+  1` on 0x80 gave 0x40 where x86 gives 0xC0 — a negative number halved into a
+  positive one, which is how a fixed-point divide or a signed average goes
+  wrong without ever faulting. The count is masked to five bits as x86 does,
+  and CF is taken from the sign-extended value so a count at or past the
+  operand width still reports the sign bit.
+- **A classic `push ebp; mov ebp, esp` prologue pushed an uninitialised C
+  local** — the generated `ebp` was only seeded from the caller's frame for
+  *frameless* functions, and a function with a real prologue reads it on its
+  very first statement. So the guest's saved-frame chain got an indeterminate
+  word, which the epilogue then pops back and a frame walker may follow.
+- **Comparison snapshots were discarded at any control-flow join whose
+  predecessors compared different registers** — the operands differ but the
+  runtime slots they save into do not, so a shared consumer can use whichever
+  path actually ran. The merge is deliberately narrow: same operation, same
+  width, and arithmetic states still excluded, because those reconstruct their
+  operands.
+
+*Disassembly (#42)*
+- **A bare immediate could split an instruction the sweep had already
+  decoded** — an integer constant that happens to land in an unclaimed code gap
+  is weak evidence, and treating it as a function entry carved the real
+  instruction stream in half. It defers to the existing decode now unless the
+  target independently probes as a prologue, a constant stub or a vcall thunk,
+  which keeps the out-of-phase-sweep recovery that made the pass worth having.
+
+*Kernel ABI (#51, #53, #54, #55)*
+- **`NtQueryDirectoryFile` was declared with nine arguments and has ten** — the
+  missing `FileInformationClass` meant every argument after it was read one slot
+  early, the search mask and restart flag came from the wrong places, and the
+  bridge popped 36 bytes where the guest had pushed 40. A four-byte stack leak
+  per call, which is the kind that runs for a while and then does not. The
+  enumeration also returned the host's `.` and `..`, which FATX does not have.
+- **`KfRaiseIrql` and `KfLowerIrql` are `__fastcall`** — their argument arrives
+  in `CL`, and the bridge was reading it off the stack. The cleanup table
+  already said zero bytes, so the value read was whatever sat at that address.
+- **Counted object names were read as NUL-terminated (#53)** — the XDK passes a
+  directory name with a trailing wildcard and `Length` shortened to exclude it,
+  without writing a NUL at the new end, so the path picked up the wildcard and
+  whatever followed it in guest memory. The same PR made
+  `ObjectAttributes->RootDirectory` real rather than always `NULL`, which is
+  what lets a title open a save file relative to the directory handle it just
+  enumerated.
+- **`MmGetPhysicalAddress` returned the virtual address unchanged (#55)** — for
+  the contiguous arena, which is the virtual *window* onto physical RAM, that
+  hands a DMA consumer an address with the high bit still set. Returns the
+  offset within the window now, and leaves identity mapping alone everywhere
+  else.
+
+*Kernel state (#43, #45, #56)*
+- **The pending kernel-dispatch slot was a single process-wide global (#43)** —
+  two threads resolving a kernel import at the same time raced, and the loser
+  invoked the *other* thread's service, popping that one's argument count off
+  its own stack. Thread-local now: a one-word change, and worth finding.
+- **`IdexChannelObject` was exported as an opaque self-pointer (#45)** — it is
+  a structure, and guest file-close code walks `DeviceQueue.DeviceListHead` at
+  +0x28, where it found nulls. Host-backed synchronous I/O never enqueues guest
+  IRPs, so the honest answer is a correctly formed *empty* circular list. Also
+  gave it storage of its own; the old 16-byte slot would have overlapped the key
+  exports as soon as anything was written into it.
+- **The EEPROM advertised mono audio with AC3 (#56)** — `XC_AUDIO` was set to
+  `0x00010001`, and in that field 1 means *mono*, not stereo. So a title asked
+  the console what it was plugged into and was told one channel plus an encoded
+  output path that does not exist. Reports plain stereo PCM now, which is what
+  the host actually plays.
+
+### andeecollard — [@andeecollard](https://github.com/andeecollard)
+- **`jbe` and `ja` after `and`/`or`/`xor` were folded to constants (#57)** —
+  those instructions do clear CF, so `jb` and `jae` after one really are 0 and
+  1, but `jbe` is CF|ZF and `ja` is !CF && !ZF, and ZF is whatever the result
+  was. Collapsing all four meant `and eax, eax; jbe` never branched and `and
+  eax, eax; ja` always did — wrong exactly when the result is zero and right
+  the rest of the time, so it survives ordinary traffic and then takes the wrong
+  arm on the empty list, the null handle, the zero count. The lifter already
+  spelled both conditions out correctly two branches away, on the CF-tracked
+  path.
+- **The generated `ebp` local was declared without an initialiser** — reached
+  the same conclusion as #48 from the other direction, and the two were merged
+  together: #48 seeds it from the caller's frame, this initialises the
+  declaration, and the fix wants both.
+- Also **found the `SAR` operand-width and shift-count bugs independently of
+  #50**, which landed first. #50's body is the one in the tree because it takes
+  CF from the sign-extended value as well; the docstring explaining why any of
+  it matters is this PR's.
+- The tests are the part to copy: each is paired with a *negative control* that
+  feeds the identical harness the pre-fix expression and requires it to fail, on
+  the grounds that a sweep which passes against both spellings is testing
+  nothing.
 
 ---
 
