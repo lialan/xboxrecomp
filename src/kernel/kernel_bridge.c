@@ -1219,13 +1219,13 @@ static void bridge_ExAllocatePoolWithTag(void)
 /* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161) ────── */
 static void bridge_KfRaiseIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
+    uint32_t new_irql = g_ecx; /* fastcall: KIRQL is passed in CL */
     g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)new_irql);
 }
 
 static void bridge_KfLowerIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
+    uint32_t new_irql = g_ecx; /* fastcall: KIRQL is passed in CL */
     xbox_KfLowerIrql((UCHAR)new_irql);
     g_eax = 0;
 }
