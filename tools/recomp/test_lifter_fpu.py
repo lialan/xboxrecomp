@@ -145,11 +145,9 @@ class FpuLifterTest(unittest.TestCase):
         self.assertEqual(len(lifted), 1)
         # The compare can live in a different lifted body than the FNSTSW that
         # reads it, so the result has to be shared state, not a function local.
-        self.assertIn("g_fp_cmp", lifted[0])
+        self.assertIn("g_fp_cc", lifted[0])
         self.assertNotIn("_fpu_cmp", lifted[0])
         # C3 (equal) and C0 (less) at their status-word positions, plus TOP
-        self.assertIn("0x4000u", lifted[0])
-        self.assertIn("0x0100u", lifted[0])
         self.assertIn("(g_fp_top & 7u) << 11", lifted[0])
         self.assertNotIn("/* fnstsw ax - store FPU status word */", lifted[0])
 

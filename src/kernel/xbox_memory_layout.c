@@ -825,6 +825,7 @@ RECOMP_TLS int g_fp_top = 0;
  * rounds to nearest, which is what the CRT expects before _control87. */
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
 RECOMP_TLS int g_fp_cmp = 0;
+RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 
 /* Defined below, with the other guest registers. */
 extern RECOMP_TLS uint32_t g_ebp;

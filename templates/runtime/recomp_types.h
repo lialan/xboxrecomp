@@ -247,6 +247,16 @@ extern RECOMP_TLS int g_df;
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
 extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
+extern RECOMP_TLS uint16_t g_fp_cc;
+#define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
+/* Values in the existing double-backed stack are all representable as normal
+ * x87 extended values, including binary64 subnormals. Empty stack tags and
+ * unsupported extended encodings are not represented by this stack model. */
+static inline uint16_t recomp_fxam(double value) {
+    return (uint16_t)((signbit(value) ? 0x0200u : 0u) |
+        (isnan(value) ? 0x0100u : isinf(value) ? 0x0500u :
+         value == 0.0 ? 0x4000u : 0x0400u));
+}
 
 /* Result of an x87 compare, in the shape the status word wants:
  *   -1 less, 0 equal, 1 greater, 2 unordered (either operand is NaN).
