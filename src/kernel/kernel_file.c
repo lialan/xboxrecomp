@@ -114,6 +114,17 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     const char* xbox_path = get_xbox_path(ObjectAttributes);
     if (!xbox_path)
         return FALSE;
+    if (ObjectAttributes->RootDirectory && xbox_path[0] != '\\' &&
+        !(xbox_path[0] && xbox_path[1] == ':')) {
+        /* XDeleteSaveGame opens each child relative to its save directory. */
+        DWORD used = GetFinalPathNameByHandleW(ObjectAttributes->RootDirectory,
+            win_path, buf_size, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (!used || used >= buf_size || used + 1 >= buf_size) return FALSE;
+        if (win_path[used - 1] != L'\\') win_path[used++] = L'\\';
+        int count = MultiByteToWideChar(CP_ACP, 0, xbox_path, -1,
+            win_path + used, (int)(buf_size - used));
+        return count != 0;
+    }
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 

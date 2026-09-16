@@ -2439,7 +2439,14 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     if (!ansi_str_va) return NULL;
     buf_va = BRIDGE_MEM32(ansi_str_va + 4);
     if (!buf_va) return NULL;
-    return (const char*)XBOX_TO_NATIVE(buf_va);
+    /* XDK directory searches pass a counted prefix of "directory\\*".
+     * The byte after Length need not be NUL or part of the object name. */
+    static RECOMP_TLS char path[65536];
+    uint16_t length=BRIDGE_MEM16(ansi_str_va);
+    if(length>BRIDGE_MEM16(ansi_str_va+2)) return NULL;
+    memcpy(path,XBOX_TO_NATIVE(buf_va),length);
+    path[length]='\0';
+    return path;
 }
 
 /* Write NTSTATUS + Information into Xbox IO_STATUS_BLOCK */
@@ -2543,7 +2550,9 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
     name->Buffer        = (PCHAR)path;
     name->Length        = path ? (USHORT)strlen(path) : 0;
     name->MaximumLength = (USHORT)(name->Length + 1);
-    oa->RootDirectory = NULL;
+    uint32_t root = obj_attrs_va ? BRIDGE_MEM32(obj_attrs_va) : 0;
+    /* -3 is the XDK DOS-device namespace, not a file handle. */
+    oa->RootDirectory = root && root != 0xFFFFFFFDu ? bridge_resolve_handle(root) : NULL;
     oa->ObjectName    = name;
     oa->Attributes    = 0;
 }
