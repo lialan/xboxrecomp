@@ -865,7 +865,12 @@ class FunctionTranslator:
         # would still hold. Deliberately not the same as making ebp global:
         # that also changes save/restore, and a callee that fails to restore
         # then corrupts its caller (tried; esp underflowed inside XapiStartup).
-        if "ebp" in used_regs and not self._func_has_prologue(instructions):
+        if "ebp" in used_regs and self._func_has_prologue(instructions):
+            # The prologue's first PUSH saves the incoming register before
+            # MOV establishes this function's frame. It must not push an
+            # uninitialized C local into the guest's saved-frame chain.
+            lines.append("    ebp = g_ebp;  /* prologue saves caller's frame */")
+        elif "ebp" in used_regs:
             lines.append("    ebp = g_ebp;  /* frameless: caller's frame */")
 
         # Add _flags variable if function has conditional instructions
