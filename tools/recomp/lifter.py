@@ -48,6 +48,13 @@ if os.path.exists(_WIN32_EXPORTS_FILE):
 # APIs they wrap, so the same clash happens there for the linker. Mangle with
 # the address, the same suffixed-<addr> scheme func_id already uses for
 # duplicate names.
+#
+# This is the last guard before a name becomes a C token, and the only one
+# every name source passes through -- Ghidra, IDA, a hand-written symbols
+# file. tools/ghidra_naming/merge_names.py filters a similar set earlier, but
+# it only sees the Ghidra path, so this list must not be the smaller of the
+# two. Over-mangling costs an address suffix on a name; under-mangling costs
+# a build.
 _FUNC_RESERVED_IDENT = frozenset({
     # C and C++ keywords
     "asm", "auto", "break", "case", "char", "const", "continue",
@@ -60,17 +67,34 @@ _FUNC_RESERVED_IDENT = frozenset({
     "memchr", "memcmp", "memcpy", "memmove", "memset", "strcat",
     "strchr", "strcmp", "strcoll", "strcpy", "strcspn", "strerror",
     "strlen", "strncat", "strncmp", "strncpy", "strpbrk", "strrchr",
-    "strspn", "strstr", "strtok", "strxfrm",
-    # <math.h>
+    "strspn", "strstr", "strtok", "strxfrm", "strdup", "strnlen",
+    # <math.h> C89
     "acos", "asin", "atan", "atan2", "ceil", "cos", "cosh", "exp",
     "fabs", "floor", "fmod", "frexp", "ldexp", "log", "log10", "modf",
     "pow", "sin", "sinh", "sqrt", "tan", "tanh",
+    # <math.h> C99 classification and comparison. These are function-like
+    # *macros*, which makes them the worst members of this set: a function
+    # named `isnan` does not collide, it expands. `void isnan(void);` becomes
+    # `void (fpclassify(void) == FP_NAN);` and the compiler reports a bad
+    # parameter declarator inside corecrt_math.h, naming neither the guest
+    # function nor the clash. Reported from a FIFA Street 2 port.
+    "fpclassify", "isfinite", "isgreater", "isgreaterequal", "isinf",
+    "isless", "islessequal", "islessgreater", "isnan", "isnormal",
+    "isunordered", "signbit",
+    # <math.h> C99 functions
+    "acosh", "asinh", "atanh", "cbrt", "copysign", "erf", "erfc", "exp2",
+    "expm1", "fdim", "fma", "fmax", "fmin", "hypot", "ilogb", "lgamma",
+    "llrint", "llround", "log1p", "log2", "logb", "lrint", "lround",
+    "nan", "nearbyint", "nextafter", "nexttoward", "remainder", "remquo",
+    "rint", "round", "scalbln", "scalbn", "tgamma", "trunc",
     # <stdlib.h>
     "abort", "abs", "atexit", "atof", "atoi", "atol", "bsearch",
     "calloc", "div", "exit", "free", "getenv", "labs", "ldiv", "malloc",
     "mblen", "mbstowcs", "mbtowc", "onexit", "qsort", "rand", "realloc",
     "srand", "strtod", "strtol", "strtoul", "system", "wctomb",
     "wcstombs",
+    # <stdlib.h> C99
+    "atoll", "llabs", "lldiv", "strtof", "strtold", "strtoll", "strtoull",
     # <setjmp.h>
     "longjmp", "setjmp",
     # Host Win32 API export names (data/win32_api_names.txt) so a guest

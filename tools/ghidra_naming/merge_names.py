@@ -127,6 +127,8 @@ setjmp longjmp signal raise assert
 main
 nextafter nextafterf nexttoward copysign round roundf trunc truncf rint cbrt
 log2 log1p expm1 asinh acosh atanh erf erfc lgamma tgamma fmin fmax fma
+fpclassify isfinite isinf isnan isnormal signbit isgreater isgreaterequal
+isless islessequal islessgreater isunordered
 """.split()) | set("""
 wcscpy wcsncpy wcscat wcsncat wcscmp wcsncmp wcscoll wcsxfrm wcschr wcsrchr
 wcsspn wcscspn wcspbrk wcsstr wcstok wcslen wcsnlen wcsdup wcserror
