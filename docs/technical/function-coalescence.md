@@ -26,18 +26,20 @@ strictly inside the owner, sorted without duplicates. The flag is repeatable;
 files and entries apply in order to the updated function database. Keep actual
 title-specific bounds beside that title's private analysis, outside this repo.
 
-Recovery runs after static callback discovery and before automatic CFG ownership
-and translation. It removes the named fragments and emits the complete owner.
-Without the option, translation is unchanged.
+Recovery runs after static callback discovery and before runtime helper detection,
+automatic CFG ownership and translation. It removes the named fragments and emits
+the complete owner. Without the option, translation is unchanged.
 
 The operation rejects conflicting extents, independent entry evidence (prologue,
-callers or `external_entry`), calls to an interior entry from the owner, and code
-that does not cover the requested extent. Only proven alignment no-ops may close
-a decode gap. A local jump table can be read beyond the owned end, bounded by the
-next detected function and the code section. This validates supplied bounds; it
-does not infer them or prove that unknown indirect callers cannot exist. Review
-those callers before supplying a recovery file. Invalid input aborts the batch
-before generated output is written; rerun with corrected inputs.
+callers, `external_entry`, or detector-recorded tail jumps and code pointers),
+calls to an interior entry from the owner, and code that does not cover the
+requested extent. Only proven alignment no-ops may close a decode gap. A local
+jump table using a sole base or index register can be read beyond the owned end,
+bounded by the next detected function, if any, and the backed code section. This
+validates supplied bounds; it does not infer them or prove that unknown indirect
+callers cannot exist. Review those callers before supplying a recovery file.
+Invalid input aborts the batch before generated output is written; rerun with
+corrected inputs.
 
 Regression checks need no game files:
 

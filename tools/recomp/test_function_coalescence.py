@@ -80,6 +80,10 @@ def test_requires_exact_sorted_interior_census(starts):
     {"has_prologue": True}, {"called_by": [hex(BASE + 0x100)]},
     {"external_entry": True},
     {"has_prologue": True, "seed_derived": True},
+    {"detection_method": "tail_jump_target"},
+    {"detection_method": "tail_jump_alias"},
+    {"detection_method": "imm_ref_target"},
+    {"detection_method": "data_ptr_target"},
 ])
 def test_independent_entry_evidence_is_never_discarded(evidence):
     subject = translator()
@@ -113,19 +117,29 @@ def test_unreached_live_instructions_are_not_alignment_padding():
         subject.coalesce_function(BASE, BASE + 5, [BASE + 4])
 
 
-def test_jump_table_can_follow_owned_code():
-    end = BASE + 13
-    body = (bytes.fromhex("31c0ff2485") + end.to_bytes(4, "little")
+@pytest.mark.parametrize("jump", ["ff2485", "ffa0"])
+@pytest.mark.parametrize("has_next_function", [True, False])
+def test_jump_table_can_follow_owned_code(jump, has_next_function):
+    # jmp [eax*4 + table] or jmp [eax + table] (pre-scaled index).
+    prefix = bytes.fromhex("31c0" + jump)
+    first_case = BASE + len(prefix) + 4
+    end = first_case + 4
+    body = (prefix + end.to_bytes(4, "little")
             + bytes.fromhex("40c34bc3")
-            + (BASE + 9).to_bytes(4, "little")
-            + (BASE + 11).to_bytes(4, "little"))
-    subject = translator(body, [BASE + 9])
-    subject.func_db[BASE + 9]["end"] = end
-    subject.func_db[BASE + 0x100] = function(BASE + 0x100, BASE + 0x101)
-    subject.coalesce_function(BASE, end, [BASE + 9])
+            + first_case.to_bytes(4, "little")
+            + (first_case + 2).to_bytes(4, "little"))
+    subject = translator(body, [first_case])
+    subject.func_db[first_case]["end"] = end
+    if has_next_function:
+        subject.func_db[BASE + 0x100] = function(BASE + 0x100, BASE + 0x101)
+    subject.coalesce_function(BASE, end, [first_case])
     recovered = subject._recovered_cfg[BASE]
     assert recovered["end"] == end
-    assert recovered["jump_tables"][end] == [BASE + 9, BASE + 11]
+    assert recovered["jump_tables"][end] == [first_case, first_case + 2]
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert "switch: 2 entries, 2 targets" in code
+    assert f"loc_{first_case:08X}:" in code
+    assert f"loc_{first_case + 2:08X}:" in code
 
 
 @pytest.mark.parametrize("mutation, message", [
@@ -168,8 +182,7 @@ def test_invalid_recovery_json_fails_closed(tmp_path, entry):
         load_coalescences(path)
 
 
-def test_batch_wires_repair_before_ownership_and_emission(tmp_path):
-    subject = translator()
+def batch_translator(tmp_path, subject, end, splits, **kwargs):
     entries = list(copy.deepcopy(subject.func_db).values())
     for entry in entries:
         entry["end"] = hex(entry["end"])
@@ -179,11 +192,53 @@ def test_batch_wires_repair_before_ownership_and_emission(tmp_path):
     image.write_bytes(subject.xbe_data)
     functions.write_text(json.dumps(entries), encoding="utf-8")
     bounds.write_text(json.dumps([{
-        "start": hex(BASE), "end": hex(END),
-        "coalesce_starts": [hex(start) for start in SPLITS],
+        "start": hex(BASE), "end": hex(end),
+        "coalesce_starts": [hex(start) for start in splits],
     }]), encoding="utf-8")
-    batch = BatchTranslator(image, functions, coalesce_json_paths=[bounds],
-                            seh_prolog=0, seh_epilog=0)
+    return BatchTranslator(image, functions, coalesce_json_paths=[bounds],
+                           **kwargs)
+
+
+def test_batch_wires_repair_before_ownership_and_emission(tmp_path):
+    batch = batch_translator(tmp_path, translator(), END, SPLITS,
+                             seh_prolog=0, seh_epilog=0)
     assert list(batch.func_db) == [BASE]
     assert "CMP_GE(" in batch.translate_single(BASE)
     assert batch.translate_single(SPLITS[0]) is None
+
+
+@pytest.mark.parametrize("helper, body, split, call_code", [
+    # Marker instructions straddle the split for SEH; the non-local jump
+    # marker is entirely in the deleted fragment for setjmp/longjmp.
+    ("SEH_PROLOG", "64a1000000008d6c2410c3", 6,
+     "read back frame from SEH helper"),
+    ("SEH_EPILOG", "64890d00000000c951c3", 7,
+     "read back frame from SEH helper"),
+    ("SETJMP_FN", "90c7422030324356c3", 1, "setjmp(*recomp_setjmp_slot"),
+    ("LONGJMP_FN", "903d30324356c3", 1, "recomp_guest_longjmp("),
+])
+def test_batch_detects_helpers_from_repaired_owner(
+        tmp_path, helper, body, split, call_code):
+    body = bytes.fromhex(body)
+    subject = translator(body, [BASE + split])
+    caller = BASE + 0x100
+    call = (b"\xe8" + (BASE - caller - 5).to_bytes(4, "little", signed=True)
+            + b"\xc3")
+    subject.xbe_data = (subject.xbe_data[:0x100] + call
+                        + subject.xbe_data[0x100 + len(call):])
+    subject.func_db[caller] = function(caller, caller + len(call))
+    batch = batch_translator(tmp_path, subject, BASE + len(body), [BASE + split])
+    assert getattr(batch.translator.lifter, helper) == BASE
+    assert call_code in batch.translate_single(caller)
+    if helper.startswith("SEH_"):
+        assert getattr(batch, helper.lower()) == BASE
+
+
+@pytest.mark.parametrize("override", [0, BASE + 0x200])
+@pytest.mark.parametrize("helper", ["seh_prolog", "seh_epilog"])
+def test_batch_preserves_seh_overrides_after_repair(tmp_path, helper, override):
+    body = bytes.fromhex("64a1000000008d6c2410c3")
+    batch = batch_translator(tmp_path, translator(body, [BASE + 6]),
+                             BASE + len(body), [BASE + 6], **{helper: override})
+    assert getattr(batch, helper) == override
+    assert getattr(batch.translator.lifter, helper.upper()) == override

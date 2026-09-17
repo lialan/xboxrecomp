@@ -445,7 +445,10 @@ class FunctionTranslator:
             reject(f"current interior starts are [{formatted}]")
         strong = [start for start in actual
                   if self._is_strong_entry(self.func_db[start])
-                  or self.func_db[start].get("external_entry")]
+                  or self.func_db[start].get("external_entry")
+                  or self.func_db[start].get("detection_method") in (
+                      "tail_jump_target", "tail_jump_alias",
+                      "imm_ref_target", "data_ptr_target")]
         if strong:
             reject(
                 f"interior start 0x{strong[0]:08X} has independent evidence")
@@ -462,11 +465,10 @@ class FunctionTranslator:
         # checks below still fail closed if decoded code reaches past ``end``.
         current_starts = sorted(self.func_db)
         next_index = bisect.bisect_left(current_starts, end)
-        analysis_end = (
-            current_starts[next_index]
-            if next_index < len(current_starts) else end)
-        analysis_end = min(analysis_end, sections[0].va + sections[0].raw_size,
+        analysis_end = min(sections[0].va + sections[0].raw_size,
                            sections[0].va + sections[0].va_size)
+        if next_index < len(current_starts):
+            analysis_end = min(analysis_end, current_starts[next_index])
         recovered = self._recover_cfg(
             target, analysis_end, set(), set())
         if recovered is None:
@@ -748,7 +750,9 @@ class FunctionTranslator:
                 if not insn.operands or insn.operands[0].type != "mem":
                     continue
                 operand = insn.operands[0]
-                if not operand.mem_index or operand.mem_base:
+                if not (operand.mem_index or operand.mem_base):
+                    continue
+                if operand.mem_index and operand.mem_base:
                     continue
                 table_va = operand.mem_disp
                 if not (start <= table_va < upper):
@@ -1531,8 +1535,20 @@ class BatchTranslator:
                 addr = int(entry["address"], 16)
                 self.abi_db[addr] = entry
 
-        # Detect the SEH helpers once here rather than per-Lifter, so the
-        # result can be reported and overridden from the command line.
+        # Recover boundaries before identifying helpers from complete bodies.
+        self.translator = FunctionTranslator(
+            self.xbe_data, self.func_db, self.label_db,
+            self.classification_db, self.abi_db,
+            seh_prolog=0, seh_epilog=0,
+            trace_functions=trace_functions)
+        self.translator.discover_static_indirect_targets()
+        for path in coalesce_json_paths or ():
+            for entry in load_coalescences(path):
+                self.translator.coalesce_function(
+                    entry["start"], entry["end"], entry["coalesce_starts"])
+
+        # Detect once here so the result can be reported and overridden from
+        # the command line without retaining an address of a removed fragment.
         if seh_prolog is None or seh_epilog is None:
             found_prologs, found_epilog = detect_seh_helpers(
                 self.func_db, self.xbe_data, verbose=True)
@@ -1544,18 +1560,10 @@ class BatchTranslator:
         setjmp_fn, longjmp_fn = detect_setjmp_helpers(
             self.func_db, self.xbe_data, verbose=True)
 
-        # Create translator
-        self.translator = FunctionTranslator(
-            self.xbe_data, self.func_db, self.label_db,
-            self.classification_db, self.abi_db,
-            seh_prolog=seh_prolog, seh_epilog=seh_epilog,
-            setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
-            trace_functions=trace_functions)
-        self.translator.discover_static_indirect_targets()
-        for path in coalesce_json_paths or ():
-            for entry in load_coalescences(path):
-                self.translator.coalesce_function(
-                    entry["start"], entry["end"], entry["coalesce_starts"])
+        self.translator.lifter.SEH_PROLOG = seh_prolog
+        self.translator.lifter.SEH_EPILOG = seh_epilog
+        self.translator.lifter.SETJMP_FN = setjmp_fn
+        self.translator.lifter.LONGJMP_FN = longjmp_fn
         self.translator.discover_cfg_ownership()
 
     def get_functions_by_category(self, categories=None, exclude_categories=None):
