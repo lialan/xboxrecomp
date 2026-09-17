@@ -163,7 +163,7 @@ int xbox_wma_decode_file(const char *path, XboxWmaPcm *out)
             &sample);
         (void)stream_index;
         (void)timestamp;
-        if (FAILED(hr)) {
+        if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR)) {
             if (sample) IMFSample_Release(sample);
             goto done;
         }
