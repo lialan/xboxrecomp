@@ -353,6 +353,59 @@ def test_multi_operand_imul_preserves_unrelated_continuation_register():
     assert f"goto loc_{continuation:08X};" in code
 
 
+def test_default_translation_preserves_register_target_across_direct_join():
+    continuation = BASE + 9
+    body = (b"\xb8" + continuation.to_bytes(4, "little")
+            + bytes.fromhex("eb00ffe040c3"))
+    subject = translator(body, [])
+    instructions = subject.disasm.disassemble_function(
+        body, BASE, BASE + len(body))
+    assert continuation in subject._indirect_code_refs(
+        instructions, BASE, BASE + len(body))
+    assert continuation not in subject._indirect_code_refs(
+        instructions, BASE, BASE + len(body), proof_mode=True)
+
+
+def test_xlatb_clobbers_eax_continuation_proof():
+    continuation = BASE + 8
+    body = (b"\xb8" + continuation.to_bytes(4, "little")
+            + bytes.fromhex("d7ffe040c3"))
+    subject = translator(body, [continuation])
+    with pytest.raises(ValueError, match="not the requested end"):
+        subject.coalesce_function(BASE, BASE + len(body), [continuation])
+
+
+def test_sse_movsd_does_not_clobber_string_index_registers():
+    continuation = BASE + 11
+    body = (b"\xbe" + continuation.to_bytes(4, "little")
+            + bytes.fromhex("f20f10c1ffe640c3"))
+    subject = translator(body, [continuation])
+    subject.coalesce_function(BASE, BASE + len(body), [continuation])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert f"goto loc_{continuation:08X};" in code
+
+
+@pytest.mark.parametrize("string_op", ["a5", "a7"])
+def test_string_dword_ops_clobber_esi_continuation_proof(string_op):
+    continuation = BASE + 8
+    body = (b"\xbe" + continuation.to_bytes(4, "little")
+            + bytes.fromhex(string_op + "ffe640c3"))
+    subject = translator(body, [continuation])
+    with pytest.raises(ValueError, match="not the requested end"):
+        subject.coalesce_function(BASE, BASE + len(body), [continuation])
+
+
+def test_jecxz_reads_but_does_not_clobber_ecx_continuation():
+    continuation = BASE + 11
+    body = (b"\xb9" + continuation.to_bytes(4, "little")
+            + bytes.fromhex("e302ffe1c340c3"))
+    subject = translator(body, [])
+    instructions = subject.disasm.disassemble_function(
+        body, BASE, BASE + len(body))
+    assert continuation in subject._indirect_code_refs(
+        instructions, BASE, BASE + len(body), proof_mode=True)
+
+
 @pytest.mark.parametrize("mutation, message", [
     (lambda s: s.func_db[BASE].update(end=END + 1), "shrinks"),
     (lambda s: s.func_db[SPLITS[0]].update(end=END + 1), "crosses end"),

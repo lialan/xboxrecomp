@@ -812,7 +812,8 @@ class FunctionTranslator:
                 stop_mnemonics=("int3", "ud2", "hlt") if coalescing else ())
             changed = False
             if coalescing:
-                refs = self._indirect_code_refs(instructions, start, upper)
+                refs = self._indirect_code_refs(
+                    instructions, start, upper, proof_mode=coalescing)
                 if refs - entry_points:
                     entry_points.update(refs)
                     changed = True
@@ -1013,8 +1014,15 @@ class FunctionTranslator:
                    for insn in instructions)
 
     @staticmethod
-    def _indirect_code_refs(instructions, start, end):
-        """Immediate continuations used by the lifter's register-jump dispatch."""
+    def _indirect_code_refs(instructions, start, end, proof_mode=False):
+        """Immediate continuations used by register-jump dispatch.
+
+        Normal translation keeps the historical address-ordered heuristic so
+        existing generated code does not lose labels. ``proof_mode`` is only
+        for destructive coalescence: there, a target must survive conservative
+        control-flow and clobber checks before it can justify deleting an
+        interior function entry.
+        """
         refs = set()
         constants = {}
         direct_targets = {
@@ -1041,20 +1049,19 @@ class FunctionTranslator:
             "lodsb": {"eax", "esi"}, "lodsw": {"eax", "esi"},
             "lodsd": {"eax", "esi"},
             "movsb": {"esi", "edi"}, "movsw": {"esi", "edi"},
-            "movsd": {"esi", "edi"},
             "stosb": {"edi"}, "stosw": {"edi"}, "stosd": {"edi"},
             "scasb": {"edi"}, "scasw": {"edi"}, "scasd": {"edi"},
             "cmpsb": {"esi", "edi"}, "cmpsw": {"esi", "edi"},
-            "cmpsd": {"esi", "edi"},
             "loop": {"ecx"}, "loope": {"ecx"}, "loopne": {"ecx"},
-            "jecxz": {"ecx"}, "leave": {"esp", "ebp"},
-            "popad": set(full_registers),
+            "leave": {"esp", "ebp"}, "popad": set(full_registers),
+            "xlat": {"eax"}, "xlatb": {"eax"},
         }
         for insn in instructions:
             # This list is address ordered, not a single execution path. A
             # direct target may have predecessors that never executed the load
             # immediately above it, so never carry constants into a join.
-            if insn.address in direct_targets and insn.address != start:
+            if (proof_mode and insn.address in direct_targets
+                    and insn.address != start):
                 constants.clear()
             operands = insn.operands
             if (insn.mnemonic == "mov" and len(operands) >= 2
@@ -1089,7 +1096,13 @@ class FunctionTranslator:
                 constants.pop("eax", None)
                 constants.pop("edx", None)
 
-            for register in implicit_clobbers.get(insn.mnemonic, ()):
+            clobbers = implicit_clobbers.get(insn.mnemonic, ())
+            if insn.mnemonic in ("movsd", "cmpsd"):
+                mem_bases = {operand.mem_base for operand in operands
+                             if operand.type == "mem"}
+                if {"esi", "edi"}.issubset(mem_bases):
+                    clobbers = {"esi", "edi"}
+            for register in clobbers:
                 constants.pop(register, None)
 
             if (insn.mnemonic == "jmp" and not insn.jump_target and operands
@@ -1102,7 +1115,7 @@ class FunctionTranslator:
             # Address ordering after a branch/return is not reachability.
             # Clearing here is conservative for fallthrough, which is the
             # correct bias when this evidence can authorize destructive repair.
-            if insn.is_jump or insn.is_ret:
+            if proof_mode and (insn.is_jump or insn.is_ret):
                 constants.clear()
         return refs
 
