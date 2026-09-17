@@ -40,8 +40,6 @@
 typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(unsigned int va) { (void)va; return 0; }
 recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
-const char *xbox_LastFileError(void) { return ""; }
-const char *xbox_LastHostPath(void) { return ""; }
 
 static int failures = 0;
 
