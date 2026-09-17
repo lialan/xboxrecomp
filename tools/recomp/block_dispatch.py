@@ -42,13 +42,13 @@ def _parse_addr(value):
 
 
 def _normalize_functions(raw):
-    """Normalize the repository's list/dict function JSON shapes."""
-    out = []
-    items = raw.values() if isinstance(raw, dict) else raw
-    for item in items:
+    """Normalize addresses while retaining evidence used for CFG ownership."""
+    out = {}
+    items = raw.items() if isinstance(raw, dict) else ((0, item) for item in raw)
+    for key, item in items:
         if not isinstance(item, dict):
             continue
-        start = _parse_addr(item.get("start", item.get("address", item.get("_addr", 0))))
+        start = _parse_addr(item.get("start", item.get("address", item.get("_addr", key))))
         if "end" in item:
             end = _parse_addr(item["end"])
         else:
@@ -56,8 +56,8 @@ def _normalize_functions(raw):
             # rather than {start, end}.  Treat both shapes equivalently.
             end = start + _parse_addr(item.get("size", 0))
         if start and end > start:
-            out.append((start, end))
-    return sorted(set(out))
+            out[start] = {**item, "start": start, "end": end}
+    return dict(sorted(out.items()))
 
 
 def _dedupe_records(records):
@@ -75,13 +75,21 @@ def _dedupe_records(records):
 
 
 def collect_blocks(xbe_data: bytes, functions, disasm=None):
-    """Return BlockRecords for every decodable recovered function."""
-    translator = FunctionTranslator(xbe_data, {})
+    """Inventory a normalized function database with production recovery.
+
+    An injected disassembler must implement the production Disassembler API,
+    including disassemble_cfg(), resync, and extra_leaders.
+    """
+    translator = FunctionTranslator(xbe_data, dict(functions))
     if disasm is not None:
         translator.disasm = disasm
+    translator.discover_static_indirect_targets()
+    translator.discover_cfg_ownership()
     records = []
-    for start, end in functions:
-        _, blocks = translator.decode_function(start, end)
+    for start, info in sorted(translator.func_db.items()):
+        if start in translator.owned_function_starts:
+            continue
+        _, blocks = translator.decode_function(start, info["end"])
         for block in blocks:
             records.append(BlockRecord(
                 start=block.start,

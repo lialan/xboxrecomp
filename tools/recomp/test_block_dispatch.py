@@ -13,7 +13,9 @@ def test_normalize_functions_accepts_list_and_hex_strings():
         {"start": 0x2000, "end": 0x2020},
         {"start": "0x3000", "end": "0x3000"},
     ]
-    assert _normalize_functions(raw) == [(0x1000, 0x1010), (0x2000, 0x2020)]
+    functions = _normalize_functions(raw)
+    assert [(start, info["end"]) for start, info in functions.items()] == [
+        (0x1000, 0x1010), (0x2000, 0x2020)]
 
 
 def test_normalize_functions_derives_end_from_address_and_size():
@@ -21,7 +23,48 @@ def test_normalize_functions_derives_end_from_address_and_size():
         {"address": "0x4000", "size": "0x20"},
         {"_addr": 0x5000, "size": 0x10},
     ]
-    assert _normalize_functions(raw) == [(0x4000, 0x4020), (0x5000, 0x5010)]
+    functions = _normalize_functions(raw)
+    assert [(start, info["end"]) for start, info in functions.items()] == [
+        (0x4000, 0x4020), (0x5000, 0x5010)]
+
+
+def test_normalize_functions_preserves_keyed_addresses_and_entry_evidence():
+    raw = {
+        "0x1000": {"end": "0x1010", "section": ".text", "has_prologue": True},
+        "0x2000": {"size": "0x20", "called_by": ["0x1000"]},
+        "named": {"address": "0x3000", "size": 0x10},
+    }
+    functions = _normalize_functions(raw)
+    assert functions[0x1000]["end"] == 0x1010
+    assert functions[0x1000]["has_prologue"]
+    assert functions[0x1000]["section"] == ".text"
+    assert functions[0x2000]["end"] == 0x2020
+    assert functions[0x2000]["called_by"] == ["0x1000"]
+    assert functions[0x3000]["end"] == 0x3010
+
+
+def test_inventory_recovers_split_switch_ownership(monkeypatch):
+    raw = bytearray(b"\xcc" * 0x31)
+    raw[:12] = bytes.fromhex("83f8017723ff248510100000")
+    raw[0x10:0x18] = bytes.fromhex("2010000028100000")
+    raw[0x20:0x26] = bytes.fromhex("b801000000c3")
+    raw[0x28:0x2e] = bytes.fromhex("b802000000c3")
+    raw[0x30] = 0xc3
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", 0x1000, len(raw), 0, len(raw), True),
+    ])
+    functions = _normalize_functions([
+        {"start": 0x1000, "end": 0x100c, "has_prologue": True},
+        {"start": 0x1020, "end": 0x1026},
+        {"start": 0x1028, "end": 0x102e},
+        {"start": 0x1030, "end": 0x1031, "called_by": ["0x1000"]},
+    ])
+    records = collect_blocks(bytes(raw), functions)
+    owners = {record.start: record.owner for record in records}
+    assert owners[0x1020] == owners[0x1028] == 0x1000
+    assert owners[0x1030] == 0x1030
+    assert {record.owner for record in records} == {0x1000, 0x1030}
+    assert not any(0x100c <= record.start < 0x1020 for record in records)
 
 
 def test_dedupe_prefers_later_more_specific_overlapping_owner():
@@ -77,7 +120,7 @@ def test_inventory_includes_production_indirect_targets(monkeypatch, raw, target
     monkeypatch.setattr(config, "_SECTIONS", [
         config.Section(".text", 0x1000, len(raw), 0, len(raw), True),
     ])
-    records = collect_blocks(raw, [(0x1000, 0x1010)])
+    records = collect_blocks(raw, {0x1000: {"end": 0x1010}})
     assert targets <= {record.start for record in records}
     stats = dispatch_stats(records)
     assert stats["code_end"] == 0x1010

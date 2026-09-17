@@ -613,6 +613,8 @@ class FunctionTranslator:
     def decode_function(self, start, end):
         """Recover instructions and blocks, including indirect-entry leaders."""
         recovered = self._recovered_cfg.get(start)
+        if recovered:
+            end = recovered["end"]
         if end <= start:
             return [], []
 
