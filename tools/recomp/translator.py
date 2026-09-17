@@ -1024,11 +1024,6 @@ class FunctionTranslator:
         interior function entry.
         """
         refs = set()
-        constants = {}
-        direct_targets = {
-            insn.jump_target for insn in instructions
-            if insn.jump_target is not None
-        }
         aliases = {
             "eax": "eax", "ax": "eax", "al": "eax", "ah": "eax",
             "ebx": "ebx", "bx": "ebx", "bl": "ebx", "bh": "ebx",
@@ -1056,13 +1051,9 @@ class FunctionTranslator:
             "leave": {"esp", "ebp"}, "popad": set(full_registers),
             "xlat": {"eax"}, "xlatb": {"eax"},
         }
-        for insn in instructions:
-            # This list is address ordered, not a single execution path. A
-            # direct target may have predecessors that never executed the load
-            # immediately above it, so never carry constants into a join.
-            if (proof_mode and insn.address in direct_targets
-                    and insn.address != start):
-                constants.clear()
+
+        def transfer(insn, incoming):
+            constants = dict(incoming)
             operands = insn.operands
             if (insn.mnemonic == "mov" and len(operands) >= 2
                     and operands[0].type == "reg"):
@@ -1104,19 +1095,83 @@ class FunctionTranslator:
                     clobbers = {"esi", "edi"}
             for register in clobbers:
                 constants.pop(register, None)
+            return constants
 
+        def target_from(insn, constants):
+            operands = insn.operands
             if (insn.mnemonic == "jmp" and not insn.jump_target and operands
                     and operands[0].type == "reg"):
                 target = constants.get(aliases.get(
                     operands[0].reg, operands[0].reg))
                 if target is not None and start <= target < end:
-                    refs.add(target)
+                    return target
+            return None
 
-            # Address ordering after a branch/return is not reachability.
-            # Clearing here is conservative for fallthrough, which is the
-            # correct bias when this evidence can authorize destructive repair.
-            if proof_mode and (insn.is_jump or insn.is_ret):
-                constants.clear()
+        if not proof_mode:
+            constants = {}
+            for insn in instructions:
+                constants = transfer(insn, constants)
+                target = target_from(insn, constants)
+                if target is not None:
+                    refs.add(target)
+            return refs
+
+        # Coalescence uses these references as reachability evidence before
+        # deleting interior function entries. Track constants along actual CFG
+        # edges and keep one only when every incoming path agrees on its value.
+        ordered = sorted(instructions, key=lambda insn: insn.address)
+        if not ordered or ordered[0].address != start:
+            return refs
+        by_address = {insn.address: insn for insn in ordered}
+        fallthrough = {}
+        for current, following in zip(ordered, ordered[1:]):
+            if current.end_address == following.address:
+                fallthrough[current.address] = following.address
+        debug_slides = FunctionTranslator._debug_slide_int3s(ordered)
+
+        def successors(insn):
+            if (insn.is_ret or insn.mnemonic in ("ud2", "hlt")
+                    or (insn.mnemonic == "int3"
+                        and insn.address not in debug_slides)):
+                return ()
+            if insn.is_jump:
+                if insn.jump_target in by_address:
+                    return (insn.jump_target,)
+                return ()
+
+            out = []
+            if insn.is_cond_jump and insn.jump_target in by_address:
+                out.append(insn.jump_target)
+            next_address = fallthrough.get(insn.address)
+            if next_address is not None:
+                out.append(next_address)
+            return tuple(dict.fromkeys(out))
+
+        entry_states = {start: {}}
+        worklist = [start]
+        while worklist:
+            address = worklist.pop()
+            insn = by_address[address]
+            outgoing = transfer(insn, entry_states[address])
+            for successor in successors(insn):
+                previous = entry_states.get(successor)
+                if previous is None:
+                    merged = dict(outgoing)
+                else:
+                    merged = {
+                        register: value
+                        for register, value in previous.items()
+                        if outgoing.get(register) == value
+                    }
+                if previous != merged:
+                    entry_states[successor] = merged
+                    worklist.append(successor)
+
+        for address, incoming in entry_states.items():
+            insn = by_address[address]
+            target = target_from(insn, transfer(insn, incoming))
+            if target is not None:
+                refs.add(target)
         return refs
 
     @staticmethod

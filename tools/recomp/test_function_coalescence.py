@@ -353,17 +353,20 @@ def test_multi_operand_imul_preserves_unrelated_continuation_register():
     assert f"goto loc_{continuation:08X};" in code
 
 
-def test_default_translation_preserves_register_target_across_direct_join():
+def test_direct_cfg_edge_preserves_register_target_in_both_modes():
     continuation = BASE + 9
     body = (b"\xb8" + continuation.to_bytes(4, "little")
             + bytes.fromhex("eb00ffe040c3"))
-    subject = translator(body, [])
+    subject = translator(body, [continuation])
     instructions = subject.disasm.disassemble_function(
         body, BASE, BASE + len(body))
     assert continuation in subject._indirect_code_refs(
         instructions, BASE, BASE + len(body))
-    assert continuation not in subject._indirect_code_refs(
+    assert continuation in subject._indirect_code_refs(
         instructions, BASE, BASE + len(body), proof_mode=True)
+    subject.coalesce_function(BASE, BASE + len(body), [continuation])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert f"goto loc_{continuation:08X};" in code
 
 
 def test_xlatb_clobbers_eax_continuation_proof():
