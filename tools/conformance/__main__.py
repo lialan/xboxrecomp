@@ -194,7 +194,9 @@ def main_with_args(argv):
     for c in cases:
         code = _bytes_from_listing(cod, c["name"])
         lines, mnemonics = _lift(code)
-        dropped = [l for l in lines if l.strip().startswith("/*")]
+        # NOP and identity LEA are intentionally emitted as a bare comment.
+        dropped = [l for l in lines
+                   if l.strip().startswith("/*") and l.strip() != "/* nop */"]
         if dropped:
             unlifted.append((c["name"], mnemonics, dropped))
         prepared.append((c["name"], c["kind"], lines, c["inputs"]))

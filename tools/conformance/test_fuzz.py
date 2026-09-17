@@ -53,3 +53,16 @@ def test_seed_format_round_trips_negative_and_positive_values():
 def test_fuzz_count_must_be_positive():
     with pytest.raises(ValueError):
         generate_cases(0, 1)
+
+
+def test_runner_accepts_flag_preserving_nop_noise(monkeypatch):
+    from tools.conformance import __main__ as runner
+
+    if runner._find_vcvars() is None:
+        pytest.skip("needs 32-bit MSVC")
+    cases = generate_cases(1, 7)
+    assert "lea edi, [edi]" in cases[0]["asm"]
+    monkeypatch.setattr(runner, "CASES", cases)
+    monkeypatch.setattr(runner, "_WHY", {c["name"]: c["why"] for c in cases})
+    monkeypatch.setattr(runner, "_TOL", {})
+    assert runner.main_with_args(["--only", "snippets"]) == 0
