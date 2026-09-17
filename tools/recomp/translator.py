@@ -1090,6 +1090,18 @@ class FunctionTranslator:
                     preserved_writes.add(destination)
                 else:
                     constants.pop(destination, None)
+            elif (insn.mnemonic == "lea" and len(operands) >= 2
+                  and operands[0].type == "reg"
+                  and operands[1].type == "mem"):
+                raw_destination = operands[0].reg
+                destination = aliases.get(raw_destination, raw_destination)
+                source = operands[1]
+                if (raw_destination in full_registers
+                        and not source.mem_base and not source.mem_index):
+                    constants[destination] = source.mem_disp & 0xFFFFFFFF
+                    preserved_writes.add(destination)
+                else:
+                    constants.pop(destination, None)
 
             for written in getattr(insn, "regs_written", ()):
                 register = aliases.get(written, written)

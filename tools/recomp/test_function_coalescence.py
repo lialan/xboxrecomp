@@ -142,6 +142,15 @@ def test_rejects_register_call_to_interior_even_with_local_branch():
         subject.coalesce_function(BASE, BASE + len(body), [interior])
 
 
+def test_rejects_lea_register_call_to_interior():
+    interior = BASE + 10
+    body = (bytes.fromhex("8d05") + interior.to_bytes(4, "little")
+            + bytes.fromhex("ffd0eb00c3"))
+    subject = translator(body, [interior])
+    with pytest.raises(ValueError, match="called from"):
+        subject.coalesce_function(BASE, BASE + len(body), [interior])
+
+
 @pytest.mark.parametrize("padding", ["6690", "8d1b", "8da4240000000090"])
 def test_only_proven_alignment_padding_closes_a_decode_gap(padding):
     pad = bytes.fromhex(padding)
@@ -354,6 +363,16 @@ def test_register_indirect_continuation_follows_register_copy():
     continuation = BASE + 9
     body = (b"\xb8" + continuation.to_bytes(4, "little")
             + bytes.fromhex("89c3ffe340c3"))
+    subject = translator(body, [continuation])
+    subject.coalesce_function(BASE, BASE + len(body), [continuation])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert f"goto loc_{continuation:08X};" in code
+
+
+def test_register_indirect_continuation_follows_absolute_lea():
+    continuation = BASE + 8
+    body = (bytes.fromhex("8d05") + continuation.to_bytes(4, "little")
+            + bytes.fromhex("ffe040c3"))
     subject = translator(body, [continuation])
     subject.coalesce_function(BASE, BASE + len(body), [continuation])
     code = subject.translate_function(BASE, subject.func_db[BASE])
