@@ -368,3 +368,42 @@ def test_batch_discovers_callbacks_from_repaired_body(tmp_path, callback_offset)
     batch = batch_translator(tmp_path, subject, BASE + 15, [BASE + 12])
     assert BASE + 0x40 in batch.translator.recovered_function_starts
     assert "eax = 7;" in batch.translate_single(BASE + 0x40)
+
+
+@pytest.mark.parametrize("caller_first", [True, False])
+@pytest.mark.parametrize("separate_files", [True, False])
+def test_batch_preserves_callbacks_exposed_between_repairs(
+        tmp_path, caller_first, separate_files):
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:15] = (b"\xbe" + (BASE + 0x300).to_bytes(4, "little")
+                + b"\xbf" + (BASE + 0x304).to_bytes(4, "little")
+                + bytes.fromhex("39feffd0c3"))
+    # The second owner falls through into a separately callable tail.
+    raw[0x40:0x48] = bytes.fromhex("31c0b807000000c3")
+    raw[0x80] = 0xc3
+    raw[0x300:0x304] = (BASE + 0x42).to_bytes(4, "little")
+    entries = [function(BASE + start, BASE + end)
+               for start, end in ((0, 12), (12, 15), (0x40, 0x42),
+                                  (0x42, 0x48), (0x80, 0x81))]
+    for entry in entries:
+        entry["end"] = hex(entry["end"])
+    repairs = [{"start": hex(BASE), "end": hex(BASE + 15),
+                "coalesce_starts": [hex(BASE + 12)]},
+               {"start": hex(BASE + 0x40), "end": hex(BASE + 0x48),
+                "coalesce_starts": [hex(BASE + 0x42)]}]
+    if not caller_first:
+        repairs.reverse()
+    image = tmp_path / "synthetic.xbe"
+    functions = tmp_path / "functions.json"
+    bounds = tmp_path / "bounds.json"
+    image.write_bytes(raw)
+    functions.write_text(json.dumps(entries), encoding="utf-8")
+    paths = [bounds]
+    if separate_files:
+        paths.append(tmp_path / "more-bounds.json")
+        for path, repair in zip(paths, repairs):
+            path.write_text(json.dumps([repair]), encoding="utf-8")
+    else:
+        bounds.write_text(json.dumps(repairs), encoding="utf-8")
+    with pytest.raises(ValueError, match="independent evidence|callback"):
+        BatchTranslator(image, functions, coalesce_json_paths=paths)

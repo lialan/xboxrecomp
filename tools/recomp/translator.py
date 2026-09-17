@@ -341,7 +341,7 @@ class FunctionTranslator:
         self._recovered_cfg = {}
         self._ownership_ready = False
 
-    def discover_static_indirect_targets(self):
+    def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover function entries from bounded static callback tables."""
         original_starts = sorted(self.func_db)
         recovered_callers = {}
@@ -359,8 +359,22 @@ class FunctionTranslator:
                 if targets is None:
                     continue
                 for target in targets:
-                    if target not in self.func_db:
-                        recovered_callers.setdefault(target, set()).add(caller)
+                    if target in self.func_db:
+                        if coalescing:
+                            callers = self.func_db[target].get("called_by") or []
+                            if caller not in callers:
+                                self.func_db[target]["called_by"] = [*callers, caller]
+                        continue
+                    if coalescing:
+                        index = bisect.bisect_right(original_starts, target)
+                        if index:
+                            owner = original_starts[index - 1]
+                            if (owner in self.coalesced_function_starts
+                                    and target < self.func_db[owner]["end"]):
+                                raise ValueError(
+                                    f"Static callback 0x{target:08X} lies inside "
+                                    f"coalesced function 0x{owner:08X}")
+                    recovered_callers.setdefault(target, set()).add(caller)
 
         for target, callers in sorted(recovered_callers.items()):
             next_index = bisect.bisect_right(original_starts, target)
@@ -1548,12 +1562,13 @@ class BatchTranslator:
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions)
         if coalesce_json_paths:
-            self.translator.discover_static_indirect_targets()
+            self.translator.discover_static_indirect_targets(coalescing=True)
             for path in coalesce_json_paths:
                 for entry in load_coalescences(path):
                     self.translator.coalesce_function(
                         entry["start"], entry["end"], entry["coalesce_starts"])
-            self.translator.discover_static_indirect_targets()
+                    self.translator.discover_static_indirect_targets(
+                        coalescing=True)
 
         # Detect once here so the result can be reported and overridden from
         # the command line without retaining an address of a removed fragment.

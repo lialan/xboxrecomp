@@ -29,6 +29,8 @@ title-specific bounds beside that title's private analysis, outside this repo.
 Recovery runs after static callback discovery and before runtime helper detection,
 automatic CFG ownership and translation. It removes the named fragments and emits
 the complete owner. Without the option, translation is unchanged.
+Callback discovery repeats after each repair. Newly visible callbacks protect
+existing entries; a callback into an already coalesced interior aborts the batch.
 
 The operation rejects conflicting extents, independent entry evidence (prologue,
 callers, `external_entry`, or detector-recorded entries, seeds and code pointers),
