@@ -67,6 +67,16 @@ static HANDLE g_mapping_handle = NULL;
 
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
+
+/* The base view and its 28 mirrors occupy one contiguous span. Reserving that
+ * span up front is what makes the mirrors placeable at all: each one sits at
+ * base + N * 64 MB, and on a host that chose the base for us, those addresses
+ * run through whatever the loader already owns. Placing them one at a time
+ * means ~3 of 28 collide, and *which* three changes with ASLR. Claiming the
+ * whole range first, then carving views out of ground we hold, removes the
+ * question. */
+static void *g_span_base = NULL;
+static size_t g_span_size = 0;
 static void *g_tiled_view = NULL;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
@@ -1105,8 +1115,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * tried the fixed addresses and gave up. Invisible on Windows, where
          * one of the low bases succeeds -- fatal on arm64 macOS, where all of
          * them sit inside the 4 GB __PAGEZERO segment and none can. */
+        /* Reserve base + mirrors as one range, and map the base at its head.
+         * VirtualFree releases just the slice about to be used, so each view
+         * replaces our own reservation rather than racing for free space. */
+        g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        if (g_span_base) {
+            VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
+            g_memory_base = MapViewOfFileEx(g_mapping_handle,
+                                            FILE_MAP_ALL_ACCESS, 0, 0,
+                                            g_memory_size, g_span_base);
+            if (!g_memory_base) {
+                VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+                g_span_base = NULL;
+                g_span_size = 0;
+            }
+        }
+
         const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
-        for (size_t i = 0; i < n_bases; i++) {
+        for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
             g_memory_base = MapViewOfFileEx(
                 g_mapping_handle,
@@ -1163,9 +1190,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Best-effort: failing to protect it costs only the diagnostic. */
     if (XBOX_MAP_START == 0 && getenv("RECOMP_TRAP_NULL")) {
         DWORD old_protect;
-        if (VirtualProtect(g_memory_base, 0x1000, PAGE_NOACCESS, &old_protect))
-            fprintf(stderr, "  guest page 0 is PAGE_NOACCESS"
-                            " (null dereferences fault)\n");
+        /* Protection is applied at host page granularity, and the host page is
+         * not always the guest's 4 KB -- Apple Silicon uses 16 KB. Asking to
+         * protect one guest page there actually protects four, which reaches
+         * XBOX_TIB_MAIN at guest 0x1000 and takes the TIB with it. Since init
+         * writes the TIB moments later, enabling this on such a host crashed
+         * the run before it started. Skip rather than trap when the guard
+         * cannot be confined to page zero: this is an opt-in diagnostic, and
+         * losing it is better than breaking every run that asks for it. */
+        long host_page = sysconf(_SC_PAGESIZE);
+        if (host_page > 0 && (uint32_t)host_page > XBOX_TIB_MAIN) {
+            fprintf(stderr, "  RECOMP_TRAP_NULL: not available -- the host page "
+                    "is %ld bytes, so trapping guest page zero would also trap "
+                    "the TIB at 0x%08X\n", host_page, XBOX_TIB_MAIN);
+        } else {
+            if (VirtualProtect(g_memory_base, 0x1000, PAGE_NOACCESS, &old_protect)) {
+                fprintf(stderr, "  guest page 0 is PAGE_NOACCESS"
+                                " (null dereferences fault)\n");
+            }
+        }
     }
 
     if (g_memory_offset == 0) {
@@ -1782,6 +1825,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                         m + 1, (unsigned)XBOX_TILED_BASE);
                 continue;
             }
+            /* Inside the reservation this hands back the slice we are about
+             * to use; outside it (no reservation) this is a no-op on an
+             * address we never held. */
+            if (g_span_base)
+                VirtualFree((LPVOID)mirror_base, g_memory_size, MEM_RELEASE);
             g_mirror_views[m] = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,

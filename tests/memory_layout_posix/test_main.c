@@ -31,49 +31,65 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
-#include <setjmp.h>
-#include <signal.h>
+#include <sys/wait.h>
+
+
+/* Supplied by recompiled game code in a real build. The memory model links
+ * against them but never calls them here, and a standalone regression has no
+ * recompiled title to provide them. */
+typedef void (*recomp_func_t)(void);
+recomp_func_t recomp_lookup(unsigned int va) { (void)va; return 0; }
+recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
+const char *xbox_LastFileError(void) { return ""; }
+const char *xbox_LastHostPath(void) { return ""; }
 
 static int failures = 0;
-
-/* Probing a mirror that the layout could not place faults, and a test that
- * dies on a signal reports nothing about the other 27. Catch the fault and
- * treat it as "not accessible" so the run finishes and names every mirror. */
-static sigjmp_buf fault_jmp;
-static volatile sig_atomic_t faulted;
-
-static void on_fault(int sig) { (void)sig; faulted = 1; siglongjmp(fault_jmp, 1); }
-
-static void fault_guard_install(void)
-{
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_fault;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
-}
-
-/* Read one byte, or report that the address is not accessible. */
-static int try_read(const unsigned char *p, unsigned char *out)
-{
-    faulted = 0;
-    if (sigsetjmp(fault_jmp, 1) == 0) { *out = *p; return 1; }
-    return 0;
-}
-
-static int try_write(unsigned char *p, unsigned char v)
-{
-    faulted = 0;
-    if (sigsetjmp(fault_jmp, 1) == 0) { *p = v; return 1; }
-    return 0;
-}
 
 static void check(int ok, const char *what, const char *detail)
 {
     printf("  %-44s %s%s%s\n", what, ok ? "PASS" : "FAIL",
            detail && !ok ? " -- " : "", detail && !ok ? detail : "");
     if (!ok) failures++;
+}
+
+/* Read one byte in a forked child.
+ *
+ * The obvious approaches both failed here. Catching SIGSEGV and recovering
+ * with siglongjmp works until two unmapped mirrors fall next to each other,
+ * at which point the recovery itself dies. Asking mach_vm_region first reports
+ * some of these addresses as mapped when reading them still faults. A child
+ * process cannot be wrong about it: if the read faults, the child dies and the
+ * parent sees the signal, and the 27 other mirrors still get checked.
+ *
+ * Returns 1 and sets *out when the read succeeds, 0 when it faults.
+ */
+static int read_byte_in_child(const unsigned char *addr, unsigned char *out)
+{
+    int fd[2];
+    if (pipe(fd) != 0) return 0;
+
+    pid_t pid = fork();
+    if (pid < 0) { close(fd[0]); close(fd[1]); return 0; }
+
+    if (pid == 0) {
+        close(fd[0]);
+        unsigned char v = *addr;          /* faults here, or does not */
+        ssize_t n = write(fd[1], &v, 1);
+        _exit(n == 1 ? 0 : 1);
+    }
+
+    close(fd[1]);
+    unsigned char v = 0;
+    ssize_t got = read(fd[0], &v, 1);
+    close(fd[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (got == 1 && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        *out = v;
+        return 1;
+    }
+    return 0;
 }
 
 /* The model parses section layout from an XBE header; the synthetic one from
@@ -93,7 +109,6 @@ int main(int argc, char **argv)
      * output is discarded when they do -- leaving a crash with no indication
      * of which check reached it. */
     setvbuf(stdout, NULL, _IONBF, 0);
-    fault_guard_install();
 
     static unsigned char xbe[1 << 20];
     const char *path = argc > 1 ? argv[1] : "tools/conformance/test.xbe";
@@ -131,9 +146,10 @@ int main(int argc, char **argv)
 
     /* 3. The wrap. Write through the base, read through each mirror: the
      *    26-bit bus means every mirror is the same physical memory. */
-    fprintf(stderr, "\n[reached mirror section]\n");
     unsigned char *p = (unsigned char *)base;
-    const size_t probe = 0x70000;          /* the address the comment cites */
+    const size_t probe = 0x70000;
+    fprintf(stderr, "[base=%p size=0x%zx probe=0x%zx addr=%p]\n",
+            base, size, probe, (void *)(p + probe));          /* the address the comment cites */
     if (probe < size) {
         p[probe] = 0x5A;
         int aliased = 0, checked = 0, unmapped = 0;
@@ -144,7 +160,7 @@ int main(int argc, char **argv)
              * mapped at all, and dereferencing it would abort this test with a
              * signal instead of reporting which mirrors are missing. */
             unsigned char got = 0;
-            if (!try_read(mp, &got)) { unmapped++; continue; }
+            if (!read_byte_in_child(mp, &got)) { unmapped++; continue; }
             if (got == 0x5A) aliased++;
         }
         char detail[128];
@@ -155,7 +171,9 @@ int main(int argc, char **argv)
         /* And the other direction: a write through a mirror is visible at the
          * base, which is what a title's out-of-range write actually does. */
         unsigned char *m1 = p + size + probe;
-        if (try_write(m1, 0xA5)) {
+        unsigned char ignored = 0;
+        if (read_byte_in_child(m1, &ignored)) {
+            *m1 = 0xA5;
             check(p[probe] == 0xA5, "a write through mirror 1 reaches the base",
                   "mirror is a separate copy, not an alias");
         } else {
@@ -165,8 +183,6 @@ int main(int argc, char **argv)
     } else {
         check(0, "mapped region covers the 0x70000 probe", "region too small");
     }
-
-    fprintf(stderr, "[mirror section done]\n");
 
     /* 4. Teardown has to give the addresses back, or nothing can re-init. */
     xbox_MemoryLayoutShutdown();
