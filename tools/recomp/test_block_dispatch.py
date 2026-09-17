@@ -1,6 +1,10 @@
+import pytest
+
+from tools.recomp import config
 from tools.recomp.block_dispatch import (BlockRecord, _dedupe_records,
                                          _normalize_functions, build_manifest,
-                                         dispatch_stats)
+                                         collect_blocks, dispatch_stats)
+from tools.recomp.translator import FunctionTranslator
 
 
 def test_normalize_functions_accepts_list_and_hex_strings():
@@ -60,3 +64,26 @@ def test_empty_stats_are_well_defined():
     assert stats["blocks"] == 0
     assert stats["dense_table_bytes"] == 0
     assert stats["avg_instructions_per_block"] == 0.0
+
+
+@pytest.mark.parametrize("raw, targets", [
+    # mov edi, 0x100a; jmp edi; ret; nop; nop; mov eax, 1; ret
+    (bytes.fromhex("bf0a100000ffe7c39090b801000000c3"), {0x100a}),
+    # jmp [eax*4+0x1010]; ret; a misaligned decode before two switch arms.
+    (bytes.fromhex("ff248510100000c3b8b801000000c3c3") +
+     bytes.fromhex("091000000f100000"), {0x1009, 0x100f}),
+])
+def test_inventory_includes_production_indirect_targets(monkeypatch, raw, targets):
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", 0x1000, len(raw), 0, len(raw), True),
+    ])
+    records = collect_blocks(raw, [(0x1000, 0x1010)])
+    assert targets <= {record.start for record in records}
+    stats = dispatch_stats(records)
+    assert stats["code_end"] == 0x1010
+    assert stats["dense_table_bytes"] == 128
+    translator = FunctionTranslator(raw, {0x1000: {"end": 0x1010}})
+    code = translator.translate_function(0x1000, {"end": 0x1010})
+    for target in targets:
+        assert f"loc_{target:08X}: ;" in code
+        assert f"goto loc_{target:08X};" in code

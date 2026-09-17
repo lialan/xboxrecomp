@@ -23,8 +23,7 @@ import os
 from dataclasses import asdict, dataclass
 
 from . import config
-from .config import va_to_file_offset
-from .disasm import Disassembler
+from .translator import FunctionTranslator
 
 
 @dataclass(frozen=True)
@@ -77,20 +76,12 @@ def _dedupe_records(records):
 
 def collect_blocks(xbe_data: bytes, functions, disasm=None):
     """Return BlockRecords for every decodable recovered function."""
-    disasm = disasm or Disassembler()
+    translator = FunctionTranslator(xbe_data, {})
+    if disasm is not None:
+        translator.disasm = disasm
     records = []
     for start, end in functions:
-        file_off = va_to_file_offset(start)
-        if file_off is None:
-            continue
-        size = end - start
-        raw = xbe_data[file_off:file_off + size]
-        if len(raw) < size:
-            continue
-        instructions = disasm.disassemble_function(raw, start, end)
-        if not instructions:
-            continue
-        blocks = disasm.build_basic_blocks(instructions, start, end)
+        _, blocks = translator.decode_function(start, end)
         for block in blocks:
             records.append(BlockRecord(
                 start=block.start,
