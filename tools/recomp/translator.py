@@ -1169,40 +1169,41 @@ class FunctionTranslator:
 
         incoming_states = {start: {None: {}}}
         entry_states = {start: {}}
-        outgoing_edges = {}
+        dynamic_edges = {}
         worklist = [start]
         while worklist:
             address = worklist.pop()
-            if address in entry_states:
-                insn = by_address[address]
-                outgoing = transfer(insn, entry_states[address])
-                successors = set(static_successors(insn))
-                dynamic_target = target_from(insn, outgoing)
-                if dynamic_target in by_address:
-                    successors.add(dynamic_target)
-            else:
-                outgoing = None
-                successors = set()
+            if address not in entry_states:
+                continue
+            insn = by_address[address]
+            outgoing = transfer(insn, entry_states[address])
+            static = set(static_successors(insn))
+            dynamic_target = target_from(insn, outgoing)
+            observed = dynamic_edges.setdefault(address, set())
+            if dynamic_target in by_address:
+                observed.add(dynamic_target)
 
-            previous_successors = outgoing_edges.get(address, set())
-            outgoing_edges[address] = successors
-            for successor in previous_successors | successors:
+            # Dynamic edges are monotonic. Once a register jump has been proven
+            # to reach a local block, a later loop/join may weaken the register
+            # state so that exact target is no longer known. Removing the edge
+            # in that situation can make the worklist alternate forever between
+            # "edge present" and "edge absent". Keep the edge as a possible
+            # predecessor instead, but feed it unknown state unless it is still
+            # proven on this iteration. That can only discard constants and the
+            # finite dataflow therefore converges conservatively.
+            successors = static | observed
+            for successor in successors:
                 contributions = incoming_states.setdefault(successor, {})
-                if successor in successors:
-                    contributions[address] = dict(outgoing)
+                if successor in static or successor == dynamic_target:
+                    contribution = dict(outgoing)
                 else:
-                    contributions.pop(address, None)
-                if not contributions:
-                    incoming_states.pop(successor, None)
-                    merged = None
-                else:
-                    merged = merge_contributions(contributions)
+                    contribution = {}
+                if contributions.get(address) == contribution:
+                    continue
+                contributions[address] = contribution
+                merged = merge_contributions(contributions)
                 previous = entry_states.get(successor)
-                if merged is None:
-                    if successor in entry_states:
-                        del entry_states[successor]
-                        worklist.append(successor)
-                elif previous != merged:
+                if previous != merged:
                     entry_states[successor] = merged
                     worklist.append(successor)
 

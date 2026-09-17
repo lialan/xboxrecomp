@@ -388,6 +388,18 @@ def test_resolved_register_edge_participates_in_join_proof():
         subject.coalesce_function(BASE, BASE + len(body), [target, continuation])
 
 
+def test_register_jump_loop_clobber_converges_fail_closed():
+    target = BASE + 7
+    body = (b"\xb8" + target.to_bytes(4, "little")
+            + bytes.fromhex("ffe031c0ebfa"))
+    subject = translator(body, [])
+    instructions = subject.disasm.disassemble_function(
+        body, BASE, BASE + len(body))
+    refs = subject._indirect_code_refs(
+        instructions, BASE, BASE + len(body), proof_mode=True)
+    assert target not in refs
+
+
 @pytest.mark.parametrize("op", ["0fc101", "f00fc101", "0fb109", "f00fb109"])
 def test_multi_output_operations_clobber_eax_continuation_proof(op):
     continuation = BASE + 10 + (1 if op.startswith("f0") else 0)
