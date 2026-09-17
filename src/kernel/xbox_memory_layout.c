@@ -1995,10 +1995,40 @@ void xbox_MemoryLayoutShutdown(void)
         g_memory_base = NULL;
         g_memory_size = 0;
     }
+    /* The apertures. Left mapped, a second init cannot place them: the first
+     * run still owns 0x80000000, 0xFD000000, 0xFE800000, 0xFF000000 and the
+     * tiled alias, and every one of those comes back as "failed" while init
+     * still returns TRUE because they are best-effort. The result is a layout
+     * that looks initialised and has no device apertures at all. */
+    if (g_tiled_view) {
+        UnmapViewOfFile(g_tiled_view);
+        g_tiled_view = NULL;
+    }
+    if (g_contig_memory) {
+        VirtualFree(g_contig_memory, 0, MEM_RELEASE);
+        g_contig_memory = NULL;
+    }
+    if (g_mcpx_memory) {
+        VirtualFree(g_mcpx_memory, 0, MEM_RELEASE);
+        g_mcpx_memory = NULL;
+    }
+    if (g_flash_memory) {
+        VirtualFree(g_flash_memory, 0, MEM_RELEASE);
+        g_flash_memory = NULL;
+    }
+
     /* Close file mapping handle */
     if (g_mapping_handle) {
         CloseHandle(g_mapping_handle);
         g_mapping_handle = NULL;
+    }
+
+    /* Whatever is left of the base+mirrors reservation. The views carved out
+     * of it are already unmapped above; this releases the range itself. */
+    if (g_span_base) {
+        VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+        g_span_base = NULL;
+        g_span_size = 0;
     }
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
 }

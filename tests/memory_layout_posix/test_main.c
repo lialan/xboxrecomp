@@ -187,7 +187,40 @@ int main(int argc, char **argv)
     BOOL again = xbox_MemoryLayoutInit(xbe, n);
     check(again, "a second init after shutdown succeeds",
           "shutdown leaked views, so the addresses are still taken");
-    if (again) xbox_MemoryLayoutShutdown();
+
+    /* Returning TRUE is not the property worth asserting. The apertures are
+     * best-effort inside init, so a run that leaks them on shutdown still
+     * reports success on the second init while having no contiguous window and
+     * no device apertures at all -- initialised in name only. Check the memory
+     * is really there. */
+    if (again) {
+        void *base2 = xbox_GetMemoryBase();
+        check(base2 != NULL, "the second init produced a base", NULL);
+        if (base2) {
+            const struct { uint32_t va; const char *what; } apertures[] = {
+                { 0x80000000u, "contiguous window at 0x80000000" },
+                { 0xFD000000u, "NV2A aperture at 0xFD000000" },
+                { 0xFE800000u, "MCPX aperture at 0xFE800000" },
+                { 0xFF000000u, "flash aperture at 0xFF000000" },
+                { 0xF0000000u, "tiled aperture at 0xF0000000" },
+            };
+            for (size_t i = 0; i < sizeof apertures / sizeof apertures[0]; i++) {
+                /* host = guest + base: XBOX_MAP_START is 0, so the base
+                 * pointer corresponds to guest address 0, not to
+                 * XBOX_BASE_ADDRESS. Subtracting the latter probes 64 KB below
+                 * each aperture, which is unmapped, and reads as a failure of
+                 * the thing being tested rather than of the arithmetic. */
+                unsigned char *p2 = (unsigned char *)base2 + (size_t)apertures[i].va;
+                unsigned char got = 0;
+                char what[96];
+                snprintf(what, sizeof what, "re-init mapped the %s",
+                         apertures[i].what);
+                check(read_byte_in_child(p2, &got), what,
+                      "not mapped after shutdown + init");
+            }
+        }
+        xbox_MemoryLayoutShutdown();
+    }
 
     printf("\n%d failure(s)\n", failures);
     return failures ? 1 : 0;

@@ -1087,6 +1087,13 @@ static int prot_from_page(DWORD protect)
  * Memory from mach_vm_map is released by munmap like any other, because the
  * BSD and Mach halves of Darwin share one VM map, so VirtualFree is unchanged.
  */
+/* Length registry, defined with the view helpers below. Win32 frees by address
+ * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
+ * documented to take size 0 -- so the length has to be recoverable here or
+ * munmap cannot be called at all. */
+void view_register(void *addr, size_t len);
+size_t view_take(const void *addr);
+
 static void *mach_map_fixed(void *address, size_t size, int prot)
 {
     mach_vm_address_t addr = (mach_vm_address_t)(uintptr_t)address;
@@ -1145,6 +1152,9 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
+    /* Remember the length: VirtualFree(MEM_RELEASE) is passed size 0 by every
+     * Win32 caller, and munmap cannot be called without one. */
+    view_register(p, size);
 #if !defined(MAP_FIXED_NOREPLACE) && !defined(__APPLE__)
     /* Older kernels without MAP_FIXED_NOREPLACE: plain MAP_FIXED would silently
      * unmap whatever already lives there, so we pass the address as a hint and
@@ -1162,9 +1172,14 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
 {
     if (freeType & MEM_RELEASE) {
-        /* Win32 MEM_RELEASE passes size 0; we can't know the length, so this
-         * path is only safe when callers pass the real size. */
-        if (size == 0) return TRUE;
+        /* Win32 MEM_RELEASE passes size 0 and frees the whole allocation, so
+         * the length comes from the registry VirtualAlloc filled in. Returning
+         * TRUE without unmapping -- as this used to -- made every release a
+         * silent no-op: the caller believed the address was free, the next
+         * allocation there failed, and nothing connected the two. */
+        size_t len = view_take(address);
+        if (size == 0) size = len;
+        if (size == 0) return FALSE;
         return munmap(address, size) == 0;
     }
     if (freeType & MEM_DECOMMIT)
@@ -1534,7 +1549,7 @@ typedef struct { void *addr; size_t len; } w32_view;
 static w32_view        s_views[512];
 static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void view_register(void *addr, size_t len)
+void view_register(void *addr, size_t len)
 {
     pthread_mutex_lock(&s_views_lock);
     for (int i = 0; i < 512; i++)
@@ -1542,7 +1557,7 @@ static void view_register(void *addr, size_t len)
     pthread_mutex_unlock(&s_views_lock);
 }
 
-static size_t view_take(const void *addr)
+size_t view_take(const void *addr)
 {
     size_t len = 0;
     pthread_mutex_lock(&s_views_lock);
