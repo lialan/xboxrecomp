@@ -36,6 +36,7 @@ class Instruction:
     jump_target: Optional[int] = None
     memory_refs: list = field(default_factory=list)
     imm_values: list = field(default_factory=list)
+    regs_written: list = field(default_factory=list)
 
     @property
     def is_call(self):
@@ -164,6 +165,15 @@ class Disassembler:
             ops = cs_insn.operands
         except Exception:
             ops = []
+        try:
+            _, written = cs_insn.regs_access()
+            insn.regs_written = [
+                _reg_names.get(reg, self._cs.reg_name(reg))
+                for reg in written
+                if _reg_names.get(reg, self._cs.reg_name(reg))
+            ]
+        except Exception:
+            insn.regs_written = []
         for cs_op in ops:
             op = _parse_operand(self._cs, cs_op, cs_insn)
             insn.operands.append(op)

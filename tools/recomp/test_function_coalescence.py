@@ -369,6 +369,35 @@ def test_direct_cfg_edge_preserves_register_target_in_both_modes():
     assert f"goto loc_{continuation:08X};" in code
 
 
+def test_resolved_register_edge_participates_in_join_proof():
+    target = BASE + 18
+    continuation = BASE + 20
+    body = (bytes.fromhex("85c97407")
+            + b"\xb8" + target.to_bytes(4, "little")
+            + bytes.fromhex("ffe0")
+            + b"\xbb" + continuation.to_bytes(4, "little")
+            + bytes.fromhex("eb00ffe340c3"))
+    subject = translator(body, [target, continuation])
+    instructions = subject.disasm.disassemble_function(
+        body, BASE, BASE + len(body))
+    refs = subject._indirect_code_refs(
+        instructions, BASE, BASE + len(body), proof_mode=True)
+    assert target in refs
+    assert continuation not in refs
+    with pytest.raises(ValueError, match="not the requested end"):
+        subject.coalesce_function(BASE, BASE + len(body), [target, continuation])
+
+
+@pytest.mark.parametrize("op", ["0fc101", "f00fc101", "0fb109", "f00fb109"])
+def test_multi_output_operations_clobber_eax_continuation_proof(op):
+    continuation = BASE + 10 + (1 if op.startswith("f0") else 0)
+    body = (b"\xb8" + continuation.to_bytes(4, "little")
+            + bytes.fromhex(op + "ffe040c3"))
+    subject = translator(body, [continuation])
+    with pytest.raises(ValueError, match="not the requested end"):
+        subject.coalesce_function(BASE, BASE + len(body), [continuation])
+
+
 def test_xlatb_clobbers_eax_continuation_proof():
     continuation = BASE + 8
     body = (b"\xb8" + continuation.to_bytes(4, "little")
@@ -407,6 +436,18 @@ def test_jecxz_reads_but_does_not_clobber_ecx_continuation():
         body, BASE, BASE + len(body))
     assert continuation in subject._indirect_code_refs(
         instructions, BASE, BASE + len(body), proof_mode=True)
+
+
+def test_targeted_debug_slide_at_end_reaches_next_function():
+    slide = BASE + 4
+    end = BASE + 5
+    body = bytes.fromhex("7402cd2dccc3")
+    subject = translator(body, [slide, end])
+    subject.coalesce_function(BASE, end, [slide])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert f"goto loc_{end:08X}; /* int 0x2d skips slide int3 */" in code
+    assert f"loc_{end:08X}: ;" in code
+    assert f"sub_{end:08X}(); return;" in code
 
 
 @pytest.mark.parametrize("mutation, message", [

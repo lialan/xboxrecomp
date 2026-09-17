@@ -1055,6 +1055,7 @@ class FunctionTranslator:
         def transfer(insn, incoming):
             constants = dict(incoming)
             operands = insn.operands
+            preserved_writes = set()
             if (insn.mnemonic == "mov" and len(operands) >= 2
                     and operands[0].type == "reg"):
                 raw_destination = operands[0].reg
@@ -1064,16 +1065,24 @@ class FunctionTranslator:
                     constants.pop(destination, None)
                 elif source.type == "imm":
                     constants[destination] = source.imm
+                    preserved_writes.add(destination)
                 elif (source.type == "reg" and source.reg in full_registers
                       and source.reg in constants):
                     constants[destination] = constants[source.reg]
+                    preserved_writes.add(destination)
                 else:
                     constants.pop(destination, None)
-            elif (operands and operands[0].type == "reg"
-                  and insn.mnemonic not in non_writers
-                  and not insn.is_cond_jump):
-                destination = aliases.get(operands[0].reg, operands[0].reg)
-                constants.pop(destination, None)
+
+            for written in getattr(insn, "regs_written", ()):
+                register = aliases.get(written, written)
+                if register in full_registers and register not in preserved_writes:
+                    constants.pop(register, None)
+
+            mnemonic = insn.mnemonic.removeprefix("lock ")
+            if mnemonic in ("cmpxchg", "cmpxchg8b"):
+                constants.pop("eax", None)
+                if mnemonic == "cmpxchg8b":
+                    constants.pop("edx", None)
 
             if insn.is_call:
                 for register in ("eax", "ecx", "edx"):
@@ -1129,7 +1138,7 @@ class FunctionTranslator:
                 fallthrough[current.address] = following.address
         debug_slides = FunctionTranslator._debug_slide_int3s(ordered)
 
-        def successors(insn):
+        def static_successors(insn):
             if (insn.is_ret or insn.mnemonic in ("ud2", "hlt")
                     or (insn.mnemonic == "int3"
                         and insn.address not in debug_slides)):
@@ -1147,23 +1156,53 @@ class FunctionTranslator:
                 out.append(next_address)
             return tuple(dict.fromkeys(out))
 
+        def merge_contributions(contributions):
+            states = list(contributions.values())
+            if not states:
+                return None
+            first = states[0]
+            return {
+                register: value
+                for register, value in first.items()
+                if all(state.get(register) == value for state in states[1:])
+            }
+
+        incoming_states = {start: {None: {}}}
         entry_states = {start: {}}
+        outgoing_edges = {}
         worklist = [start]
         while worklist:
             address = worklist.pop()
-            insn = by_address[address]
-            outgoing = transfer(insn, entry_states[address])
-            for successor in successors(insn):
-                previous = entry_states.get(successor)
-                if previous is None:
-                    merged = dict(outgoing)
+            if address in entry_states:
+                insn = by_address[address]
+                outgoing = transfer(insn, entry_states[address])
+                successors = set(static_successors(insn))
+                dynamic_target = target_from(insn, outgoing)
+                if dynamic_target in by_address:
+                    successors.add(dynamic_target)
+            else:
+                outgoing = None
+                successors = set()
+
+            previous_successors = outgoing_edges.get(address, set())
+            outgoing_edges[address] = successors
+            for successor in previous_successors | successors:
+                contributions = incoming_states.setdefault(successor, {})
+                if successor in successors:
+                    contributions[address] = dict(outgoing)
                 else:
-                    merged = {
-                        register: value
-                        for register, value in previous.items()
-                        if outgoing.get(register) == value
-                    }
-                if previous != merged:
+                    contributions.pop(address, None)
+                if not contributions:
+                    incoming_states.pop(successor, None)
+                    merged = None
+                else:
+                    merged = merge_contributions(contributions)
+                previous = entry_states.get(successor)
+                if merged is None:
+                    if successor in entry_states:
+                        del entry_states[successor]
+                        worklist.append(successor)
+                elif previous != merged:
                     entry_states[successor] = merged
                     worklist.append(successor)
 
@@ -1372,7 +1411,8 @@ class FunctionTranslator:
             last_insn.is_terminator
             or last_insn.mnemonic in ("int3", "ud2", "hlt"))
         fallthrough_target = None
-        if (continues_past_end and end in self.func_db
+        bypasses_to_end = end in debug_slide_bypasses.values()
+        if ((continues_past_end or bypasses_to_end) and end in self.func_db
                 and end not in self.owned_function_starts):
             fallthrough_target = end
 
@@ -1719,6 +1759,8 @@ class FunctionTranslator:
 
         # Continue into the next function when control runs off the bottom.
         if fallthrough_target is not None:
+            if fallthrough_target in debug_slide_bypasses.values():
+                lines.append(f"loc_{fallthrough_target:08X}: ;")
             ft_name = self.lifter._call_target_name(fallthrough_target)
             lines.append(f"    g_seh_ebp = ebp; {ft_name}(); return;"
                          f" /* fallthrough 0x{fallthrough_target:08X} */")
