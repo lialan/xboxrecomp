@@ -101,6 +101,21 @@ def test_independent_entry_evidence_is_never_discarded(evidence):
     assert subject.func_db == before
 
 
+@pytest.mark.parametrize("method, body, split", [
+    ("cc_boundary", "c3ccccb807000000c3", 3),
+    ("gap_prologue", "b801000000c3b807000000c3", 6),
+])
+def test_layout_heuristics_do_not_allow_merging_unreachable_functions(
+        method, body, split):
+    body = bytes.fromhex(body)
+    subject = translator(body, [BASE + split])
+    subject.func_db[BASE + split]["detection_method"] = method
+    before = copy.deepcopy(subject.func_db)
+    with pytest.raises(ValueError, match="not the requested end"):
+        subject.coalesce_function(BASE, BASE + len(body), [BASE + split])
+    assert subject.func_db == before
+
+
 def test_rejects_call_to_interior_even_with_incomplete_metadata():
     # call inner; jmp inner; inner: ret
     subject = translator(bytes.fromhex("e802000000eb00c3"), [BASE + 7])
@@ -116,6 +131,18 @@ def test_only_proven_alignment_padding_closes_a_decode_gap(padding):
     subject = translator(body, [interior])
     subject.coalesce_function(BASE, BASE + len(body), [interior])
     assert subject._recovered_cfg[BASE]["end"] == BASE + len(body)
+
+
+def test_unreachable_padding_does_not_discard_incoming_comparison_flags():
+    # cmp eax,6; jmp join; nop (alignment); join: jge done; mov eax,6; done: ret
+    body = bytes.fromhex("83f806eb0266907d05b806000000c3")
+    subject = translator(body, [BASE + 7])
+    subject.coalesce_function(BASE, BASE + len(body), [BASE + 7])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert "CMP_GE(" in code
+    assert "if (_flags /* jge" not in code
+    assert BASE + 5 not in {
+        insn.address for insn in subject._recovered_cfg[BASE]["instructions"]}
 
 
 def test_unreached_live_instructions_are_not_alignment_padding():
@@ -318,3 +345,26 @@ def test_default_helper_detection_precedes_static_callback_discovery(
     batch = batch_translator(tmp_path, subject, BASE + 15, [], coalesce=False)
     assert BASE + 0x40 in batch.translator.recovered_function_starts
     assert getattr(batch.translator.lifter, helper) is None
+
+
+@pytest.mark.parametrize("callback_offset", [0x40, 12])
+def test_batch_discovers_callbacks_from_repaired_body(tmp_path, callback_offset):
+    raw = bytearray(b"\xcc" * 0x400)
+    # The range setup and indirect call initially belong to separate fragments.
+    raw[:15] = (b"\xbe" + (BASE + 0x300).to_bytes(4, "little")
+                + b"\xbf" + (BASE + 0x304).to_bytes(4, "little")
+                + bytes.fromhex("39feffd0c3"))
+    raw[0x40:0x46] = bytes.fromhex("b807000000c3")
+    raw[0x80] = 0xc3
+    raw[0x300:0x304] = (BASE + callback_offset).to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    for start, end in ((0, 12), (12, 15), (0x80, 0x81)):
+        subject.func_db[BASE + start] = function(BASE + start, BASE + end)
+    if callback_offset == 12:
+        with pytest.raises(ValueError, match="callback"):
+            batch_translator(tmp_path, subject, BASE + 15, [BASE + 12])
+        return
+    batch = batch_translator(tmp_path, subject, BASE + 15, [BASE + 12])
+    assert BASE + 0x40 in batch.translator.recovered_function_starts
+    assert "eax = 7;" in batch.translate_single(BASE + 0x40)

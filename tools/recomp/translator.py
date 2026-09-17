@@ -477,16 +477,14 @@ class FunctionTranslator:
         if recovered is None:
             reject("could not decode CFG")
         instructions, jump_tables, _ = recovered
-        # Unreached alignment padding may separate otherwise reachable blocks.
-        # Only resume at the decoder's coverage stop, never a supplied offset
-        # that might be inside a real instruction.
+        # Padding can close coverage gaps, but must not become an executable
+        # predecessor that discards flags at the following real block.
         padding = self._alignment_padding_gaps(target, end, instructions)
-        if padding:
-            recovered = self._recover_cfg(
-                target, analysis_end, padding, set(), coalescing=True)
-            if recovered is None:
-                reject("could not decode CFG")
-            instructions, jump_tables, _ = recovered
+        for lower, upper in self._find_static_indirect_ranges(instructions):
+            callbacks = self._read_static_callback_table(
+                lower, upper, current_starts)
+            if callbacks and any(start in actual for start in callbacks):
+                reject("interior start is a callback from the requested owner")
         if any(instruction.is_call and instruction.call_target in actual
                for instruction in instructions):
             reject("interior start is called from the requested owner")
@@ -494,6 +492,8 @@ class FunctionTranslator:
             reject("CFG does not start at the requested start")
         covered_end = target
         for instruction in instructions:
+            if covered_end in padding and instruction.address > covered_end:
+                covered_end = instruction.address
             if instruction.address != covered_end:
                 reject(f"CFG gap at 0x{covered_end:08X}")
             if instruction.end_address > end:
@@ -561,9 +561,8 @@ class FunctionTranslator:
         A decode gap is only treated as padding when the bytes at the coverage
         stop must start with a multi-byte no-op, contain only no-ops, and end
         precisely where the decode picks up again. Real unreached code fails
-        that test, so this cannot invent a body: it only re-seeds the walk
-        across padding the assembler inserted to align the following branch
-        target.
+        that test, so this cannot invent a body: it only identifies padding
+        the assembler inserted before an already reachable branch target.
         """
         covered = {}
         for instruction in instructions:
@@ -1554,6 +1553,7 @@ class BatchTranslator:
                 for entry in load_coalescences(path):
                     self.translator.coalesce_function(
                         entry["start"], entry["end"], entry["coalesce_starts"])
+            self.translator.discover_static_indirect_targets()
 
         # Detect once here so the result can be reported and overridden from
         # the command line without retaining an address of a removed fragment.
