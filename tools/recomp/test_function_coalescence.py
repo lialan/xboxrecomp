@@ -347,7 +347,7 @@ def test_default_helper_detection_precedes_static_callback_discovery(
     assert getattr(batch.translator.lifter, helper) is None
 
 
-@pytest.mark.parametrize("callback_offset", [0x40, 12])
+@pytest.mark.parametrize("callback_offset", [0x40, 12, 14])
 def test_batch_discovers_callbacks_from_repaired_body(tmp_path, callback_offset):
     raw = bytearray(b"\xcc" * 0x400)
     # The range setup and indirect call initially belong to separate fragments.
@@ -361,13 +361,20 @@ def test_batch_discovers_callbacks_from_repaired_body(tmp_path, callback_offset)
     subject.func_db.clear()
     for start, end in ((0, 12), (12, 15), (0x80, 0x81)):
         subject.func_db[BASE + start] = function(BASE + start, BASE + end)
-    if callback_offset == 12:
+    if callback_offset < 15:
+        before = copy.deepcopy(subject.func_db)
         with pytest.raises(ValueError, match="callback"):
-            batch_translator(tmp_path, subject, BASE + 15, [BASE + 12])
+            subject.coalesce_function(BASE, BASE + 15, [BASE + 12])
+        assert subject.func_db == before
         return
     batch = batch_translator(tmp_path, subject, BASE + 15, [BASE + 12])
     assert BASE + 0x40 in batch.translator.recovered_function_starts
     assert "eax = 7;" in batch.translate_single(BASE + 0x40)
+    callback = batch.func_db[BASE + 0x40]
+    callback["called_by"] = [hex(BASE), BASE + 0xAB]
+    for _ in range(2):
+        batch.translator.discover_static_indirect_targets(coalescing=True)
+        assert callback["called_by"] == ["0x00010000", "0x000100AB"]
 
 
 @pytest.mark.parametrize("caller_first", [True, False])

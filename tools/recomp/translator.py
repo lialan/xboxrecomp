@@ -361,9 +361,13 @@ class FunctionTranslator:
                 for target in targets:
                     if target in self.func_db:
                         if coalescing:
-                            callers = self.func_db[target].get("called_by") or []
-                            if caller not in callers:
-                                self.func_db[target]["called_by"] = [*callers, caller]
+                            callers = {
+                                int(value, 16) if isinstance(value, str) else value
+                                for value in self.func_db[target].get("called_by") or []
+                            }
+                            callers.add(caller)
+                            self.func_db[target]["called_by"] = [
+                                f"0x{value:08X}" for value in sorted(callers)]
                         continue
                     if coalescing:
                         index = bisect.bisect_right(original_starts, target)
@@ -497,7 +501,7 @@ class FunctionTranslator:
         for lower, upper in self._find_static_indirect_ranges(instructions):
             callbacks = self._read_static_callback_table(
                 lower, upper, current_starts)
-            if callbacks and any(start in actual for start in callbacks):
+            if callbacks and any(target < callback < end for callback in callbacks):
                 reject("interior start is a callback from the requested owner")
         if any(instruction.is_call and instruction.call_target in actual
                for instruction in instructions):
