@@ -1607,10 +1607,40 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     off_t  off = ((off_t)offHigh << 32) | offLow;
     SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
     int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED | (baseAddr ? MAP_FIXED : 0);
+    int flags  = MAP_SHARED;
+
+    /* Win32 MapViewOfFileEx *fails* when the requested address is unavailable.
+     * Plain MAP_FIXED does the opposite: it silently unmaps whatever is there
+     * and succeeds. The Xbox memory model asks for 28 mirror views at computed
+     * addresses, so with a base the OS chose rather than one we picked, that
+     * difference is the process quietly destroying its own libraries and heap
+     * and dying somewhere unrelated a moment later. */
+    if (baseAddr) {
+#if defined(MAP_FIXED_NOREPLACE)
+        flags |= MAP_FIXED_NOREPLACE;
+#elif defined(__APPLE__)
+        /* Darwin has no MAP_FIXED_NOREPLACE. Claim the range first with
+         * mach_vm_map(VM_FLAGS_FIXED), which refuses rather than displaces;
+         * MAP_FIXED below can then only replace the placeholder we now own. */
+        if (mach_map_fixed(baseAddr, len, PROT_READ | PROT_WRITE) == MAP_FAILED) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+        flags |= MAP_FIXED;
+#else
+        flags |= MAP_FIXED;
+#endif
+    }
 
     void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
     if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    if (baseAddr && p != baseAddr) {
+        /* MAP_FIXED_NOREPLACE hands back a different address instead of
+         * failing on some kernels; treat that as the refusal it means. */
+        munmap(p, len);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return NULL;
+    }
     view_register(p, len);
     return p;
 }

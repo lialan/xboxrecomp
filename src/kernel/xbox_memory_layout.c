@@ -1099,7 +1099,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             0,                      /* sentinel - let OS choose */
         };
 
-        for (int i = 0; try_bases[i] != 0 || i == 0; i++) {
+        /* Iterate the whole array, sentinel included. The old condition
+         * (try_bases[i] != 0 || i == 0) stopped *at* the zero rather than
+         * using it, so the "let the OS choose" fallback never ran: the loop
+         * tried the fixed addresses and gave up. Invisible on Windows, where
+         * one of the low bases succeeds -- fatal on arm64 macOS, where all of
+         * them sit inside the 4 GB __PAGEZERO segment and none can. */
+        const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
+        for (size_t i = 0; i < n_bases; i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
             g_memory_base = MapViewOfFileEx(
                 g_mapping_handle,
