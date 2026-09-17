@@ -84,6 +84,13 @@ def test_requires_exact_sorted_interior_census(starts):
     {"detection_method": "tail_jump_alias"},
     {"detection_method": "imm_ref_target"},
     {"detection_method": "data_ptr_target"},
+    {"detection_method": "indirect_call_slot"},
+    {"detection_method": "seed_vtable_thunk"},
+    {"detection_method": "entry_point"},
+    {"detection_method": "call_target"},
+    {"detection_method": "prologue"},
+    {"detection_method": "prologue_alt"},
+    {"detection_method": "static_indirect_table"},
 ])
 def test_independent_entry_evidence_is_never_discarded(evidence):
     subject = translator()
@@ -115,6 +122,48 @@ def test_unreached_live_instructions_are_not_alignment_padding():
     subject = translator(bytes.fromhex("eb0231c0c3"), [BASE + 4])
     with pytest.raises(ValueError, match="CFG gap"):
         subject.coalesce_function(BASE, BASE + 5, [BASE + 4])
+
+
+@pytest.mark.parametrize("trap", ["cc", "0f0b", "f4"])
+@pytest.mark.parametrize("has_other_edge", [False, True])
+def test_traps_do_not_prove_reachability_of_a_following_entry(trap, has_other_edge):
+    trap = bytes.fromhex(trap)
+    prefix = b"\x85\xc9\x74" + bytes([len(trap)]) if has_other_edge else b""
+    interior = BASE + len(prefix) + len(trap)
+    body = prefix + trap + bytes.fromhex("b807000000c3")
+    subject = translator(body, [interior])
+    end = BASE + len(body)
+    # Ordinary recovery retains its pre-coalescence behavior.
+    assert subject._recover_cfg(BASE, end, set(), set())[0][-1].end_address == end
+    if has_other_edge:
+        subject.coalesce_function(BASE, end, [interior])
+        assert list(subject.func_db) == [BASE]
+    else:
+        before = copy.deepcopy(subject.func_db)
+        with pytest.raises(ValueError, match="not the requested end"):
+            subject.coalesce_function(BASE, end, [interior])
+        assert subject.func_db == before
+
+
+def test_default_ownership_does_not_follow_base_only_tables():
+    raw = bytearray(b"\xcc" * 0x400)
+    # test ecx,ecx; jz bridge; jmp [eax*4 + indexed_table]
+    raw[:11] = bytes.fromhex("85c9742cff2485") + (BASE + 0x100).to_bytes(4, "little")
+    raw[0x20:0x22] = b"\xc3\xc3"
+    raw[0x30:0x36] = b"\xff\xa0" + (BASE + 0x120).to_bytes(4, "little")
+    raw[0x40:0x42] = b"\xc3\xc3"
+    raw[0x200] = 0xc3
+    for offset, target in zip((0x100, 0x104, 0x120, 0x124),
+                              (0x20, 0x21, 0x40, 0x41)):
+        raw[offset:offset + 4] = (BASE + target).to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    for start, end in ((0, 11), (0x30, 0x36), (0x40, 0x42), (0x200, 0x201)):
+        subject.func_db[BASE + start] = function(BASE + start, BASE + end)
+    subject.func_db[BASE]["called_by"] = [hex(BASE + 0x200)]
+    subject.func_db[BASE + 0x200]["has_prologue"] = True
+    subject.discover_cfg_ownership()
+    assert subject.owned_function_starts == {BASE + 0x30}
 
 
 @pytest.mark.parametrize("jump", ["ff2485", "ffa0"])
@@ -182,7 +231,7 @@ def test_invalid_recovery_json_fails_closed(tmp_path, entry):
         load_coalescences(path)
 
 
-def batch_translator(tmp_path, subject, end, splits, **kwargs):
+def batch_translator(tmp_path, subject, end, splits, coalesce=True, **kwargs):
     entries = list(copy.deepcopy(subject.func_db).values())
     for entry in entries:
         entry["end"] = hex(entry["end"])
@@ -195,7 +244,8 @@ def batch_translator(tmp_path, subject, end, splits, **kwargs):
         "start": hex(BASE), "end": hex(end),
         "coalesce_starts": [hex(start) for start in splits],
     }]), encoding="utf-8")
-    return BatchTranslator(image, functions, coalesce_json_paths=[bounds],
+    return BatchTranslator(image, functions,
+                           coalesce_json_paths=[bounds] if coalesce else None,
                            **kwargs)
 
 
@@ -242,3 +292,29 @@ def test_batch_preserves_seh_overrides_after_repair(tmp_path, helper, override):
                              BASE + len(body), [BASE + 6], **{helper: override})
     assert getattr(batch, helper) == override
     assert getattr(batch.translator.lifter, helper.upper()) == override
+
+
+@pytest.mark.parametrize("helper, body", [
+    ("SEH_PROLOG", "64a1000000008d6c2410c3"),
+    ("SEH_EPILOG", "64890d00000000c951c3"),
+    ("SETJMP_FN", "c7422030324356c3"),
+    ("LONGJMP_FN", "3d30324356c3"),
+])
+def test_default_helper_detection_precedes_static_callback_discovery(
+        tmp_path, helper, body):
+    raw = bytearray(b"\xcc" * 0x400)
+    # mov esi, table; mov edi, table+4; cmp esi,edi; call eax; ret
+    raw[:15] = (b"\xbe" + (BASE + 0x300).to_bytes(4, "little")
+                + b"\xbf" + (BASE + 0x304).to_bytes(4, "little")
+                + bytes.fromhex("39feffd0c3"))
+    body = bytes.fromhex(body)
+    raw[0x40:0x40 + len(body)] = body
+    raw[0x80] = 0xc3
+    raw[0x300:0x304] = (BASE + 0x40).to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({BASE: function(BASE, BASE + 15),
+                           BASE + 0x80: function(BASE + 0x80, BASE + 0x81)})
+    batch = batch_translator(tmp_path, subject, BASE + 15, [], coalesce=False)
+    assert BASE + 0x40 in batch.translator.recovered_function_starts
+    assert getattr(batch.translator.lifter, helper) is None

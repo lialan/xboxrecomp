@@ -447,6 +447,9 @@ class FunctionTranslator:
                   if self._is_strong_entry(self.func_db[start])
                   or self.func_db[start].get("external_entry")
                   or self.func_db[start].get("detection_method") in (
+                      "entry_point", "call_target", "indirect_call_slot",
+                      "seed_vtable_thunk", "static_indirect_table",
+                      "prologue", "prologue_alt",
                       "tail_jump_target", "tail_jump_alias",
                       "imm_ref_target", "data_ptr_target")]
         if strong:
@@ -470,7 +473,7 @@ class FunctionTranslator:
         if next_index < len(current_starts):
             analysis_end = min(analysis_end, current_starts[next_index])
         recovered = self._recover_cfg(
-            target, analysis_end, set(), set())
+            target, analysis_end, set(), set(), coalescing=True)
         if recovered is None:
             reject("could not decode CFG")
         instructions, jump_tables, _ = recovered
@@ -480,7 +483,7 @@ class FunctionTranslator:
         padding = self._alignment_padding_gaps(target, end, instructions)
         if padding:
             recovered = self._recover_cfg(
-                target, analysis_end, padding, set())
+                target, analysis_end, padding, set(), coalescing=True)
             if recovered is None:
                 reject("could not decode CFG")
             instructions, jump_tables, _ = recovered
@@ -731,7 +734,8 @@ class FunctionTranslator:
                     "jump_tables": jump_tables,
                 }
 
-    def _recover_cfg(self, start, upper, bridge_targets, stop_addresses):
+    def _recover_cfg(self, start, upper, bridge_targets, stop_addresses,
+                     *, coalescing=False):
         """Decode direct CFG edges and local indexed-table destinations."""
         raw_bytes = self._read_func_bytes(start, upper)
         if not raw_bytes:
@@ -742,7 +746,8 @@ class FunctionTranslator:
         while True:
             instructions = self.disasm.disassemble_cfg(
                 raw_bytes, start, upper, entry_points,
-                stop_addresses=stop_addresses)
+                stop_addresses=stop_addresses,
+                stop_mnemonics=("int3", "ud2", "hlt") if coalescing else ())
             changed = False
             for insn in instructions:
                 if not insn.is_jump or insn.jump_target is not None:
@@ -753,6 +758,8 @@ class FunctionTranslator:
                 if not (operand.mem_index or operand.mem_base):
                     continue
                 if operand.mem_index and operand.mem_base:
+                    continue
+                if operand.mem_base and not coalescing:
                     continue
                 table_va = operand.mem_disp
                 if not (start <= table_va < upper):
@@ -1541,11 +1548,12 @@ class BatchTranslator:
             self.classification_db, self.abi_db,
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions)
-        self.translator.discover_static_indirect_targets()
-        for path in coalesce_json_paths or ():
-            for entry in load_coalescences(path):
-                self.translator.coalesce_function(
-                    entry["start"], entry["end"], entry["coalesce_starts"])
+        if coalesce_json_paths:
+            self.translator.discover_static_indirect_targets()
+            for path in coalesce_json_paths:
+                for entry in load_coalescences(path):
+                    self.translator.coalesce_function(
+                        entry["start"], entry["end"], entry["coalesce_starts"])
 
         # Detect once here so the result can be reported and overridden from
         # the command line without retaining an address of a removed fragment.
@@ -1564,6 +1572,8 @@ class BatchTranslator:
         self.translator.lifter.SEH_EPILOG = seh_epilog
         self.translator.lifter.SETJMP_FN = setjmp_fn
         self.translator.lifter.LONGJMP_FN = longjmp_fn
+        if not coalesce_json_paths:
+            self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
 
     def get_functions_by_category(self, categories=None, exclude_categories=None):

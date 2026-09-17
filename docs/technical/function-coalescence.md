@@ -31,10 +31,12 @@ automatic CFG ownership and translation. It removes the named fragments and emit
 the complete owner. Without the option, translation is unchanged.
 
 The operation rejects conflicting extents, independent entry evidence (prologue,
-callers, `external_entry`, or detector-recorded tail jumps and code pointers),
+callers, `external_entry`, or detector-recorded entries, seeds and code pointers),
 calls to an interior entry from the owner, and code that does not cover the
-requested extent. Only proven alignment no-ops may close a decode gap. A local
-jump table using a sole base or index register can be read beyond the owned end,
+requested extent. Traps (`int3`, `ud2`, `hlt`) terminate the validation walk;
+later blocks need another incoming edge. Only proven alignment no-ops may close
+a decode gap. A local jump table using a sole base or index register can be read
+beyond the owned end,
 bounded by the next detected function, if any, and the backed code section. This
 validates supplied bounds; it does not infer them or prove that unknown indirect
 callers cannot exist. Review those callers before supplying a recovery file.
