@@ -1215,13 +1215,15 @@ class FunctionTranslator:
         return refs
 
     @staticmethod
-    def _debug_slide_int3s(instructions, include_direct_targets=False):
+    def _debug_slide_int3s(instructions, include_direct_targets=False,
+                           extra_entry_targets=()):
         """Return INT3 bytes that are unambiguous Xbox INT 2D slide bytes."""
         slides = set()
-        direct_targets = {
+        direct_targets = set(extra_entry_targets)
+        direct_targets.update({
             insn.jump_target for insn in instructions
             if insn.jump_target is not None
-        }
+        })
         previous = None
         for instruction in instructions:
             if (instruction.mnemonic == "int3" and previous is not None
@@ -1236,12 +1238,13 @@ class FunctionTranslator:
         return slides
 
     @staticmethod
-    def _debug_slide_bypasses(instructions):
+    def _debug_slide_bypasses(instructions, extra_entry_targets=()):
         """Map INT 2D instructions to post-INT3 targets when INT3 has another entry."""
-        direct_targets = {
+        direct_targets = set(extra_entry_targets)
+        direct_targets.update({
             insn.jump_target for insn in instructions
             if insn.jump_target is not None
-        }
+        })
         bypasses = {}
         previous = None
         for instruction in instructions:
@@ -1279,11 +1282,6 @@ class FunctionTranslator:
                         self.disasm.disassemble_function(raw_bytes, start, end))
         if not instructions:
             return [], []
-        coalesced = start in self.coalesced_function_starts
-        debug_slide_int3s = self._debug_slide_int3s(instructions)
-        debug_slide_bypasses = (self._debug_slide_bypasses(instructions)
-                                if coalesced else {})
-
         # Addresses this function loads as immediates into a register and
         # then jumps to. `mov ebx, 0x3A0DC; ... ; jmp ebx` is a continuation
         # chain inside one function, and its targets need labels for the
@@ -1294,8 +1292,25 @@ class FunctionTranslator:
         imm_refs = self._indirect_code_refs(instructions, start, end)
         self.lifter.imm_code_refs = imm_refs
 
+        computed_entries = set(imm_refs)
+        for targets in self.lifter.jump_table_targets.values():
+            computed_entries.update(t for t in targets if start <= t < end)
+        for insn in instructions:
+            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
+                targets = self.lifter._analyze_switch_table(insn.operands)
+                computed_entries.update(t for t in targets if start <= t < end)
+
+        coalesced = start in self.coalesced_function_starts
+        extra_entries = computed_entries if coalesced else ()
+        debug_slide_int3s = self._debug_slide_int3s(
+            instructions, extra_entry_targets=extra_entries)
+        debug_slide_bypasses = (
+            self._debug_slide_bypasses(
+                instructions, extra_entry_targets=extra_entries)
+            if coalesced else {})
+
         # Collect switch table targets as extra block leaders
-        switch_leaders = set(imm_refs)
+        switch_leaders = set(computed_entries)
         switch_leaders.update(debug_slide_bypasses.values())
         if coalesced:
             instruction_starts = {insn.address for insn in instructions}
@@ -1303,13 +1318,6 @@ class FunctionTranslator:
                 insn.end_address for insn in instructions
                 if (insn.mnemonic == "int3"
                     and insn.end_address in instruction_starts))
-        for insn in instructions:
-            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
-                targets = self.lifter._analyze_switch_table(insn.operands)
-                for t in targets:
-                    if start <= t < end:
-                        switch_leaders.add(t)
-
         # A switch target the decode never produced an instruction for cannot
         # become a block leader, so it gets no label and its `goto` is dropped
         # as dead code -- the case then falls through to an unresolved indirect
@@ -1403,9 +1411,20 @@ class FunctionTranslator:
         # callable symbol.
         last_insn = instructions[-1]
         coalesced = start in self.coalesced_function_starts
-        debug_slide_int3s = self._debug_slide_int3s(instructions)
-        debug_slide_bypasses = (self._debug_slide_bypasses(instructions)
-                                if coalesced else {})
+        computed_entries = set(self.lifter.imm_code_refs)
+        for targets in self.lifter.jump_table_targets.values():
+            computed_entries.update(t for t in targets if start <= t < end)
+        for insn in instructions:
+            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
+                targets = self.lifter._analyze_switch_table(insn.operands)
+                computed_entries.update(t for t in targets if start <= t < end)
+        extra_entries = computed_entries if coalesced else ()
+        debug_slide_int3s = self._debug_slide_int3s(
+            instructions, extra_entry_targets=extra_entries)
+        debug_slide_bypasses = (
+            self._debug_slide_bypasses(
+                instructions, extra_entry_targets=extra_entries)
+            if coalesced else {})
         last_is_debug_slide = (coalesced
                                and last_insn.address in debug_slide_int3s)
         continues_past_end = last_is_debug_slide or not (
@@ -1929,11 +1948,16 @@ class BatchTranslator:
                     self.translator.discover_static_indirect_targets(
                         coalescing=True)
 
+        helper_func_db = {
+            addr: info for addr, info in self.func_db.items()
+            if info.get("detection_method") != "static_indirect_table"
+        }
+
         # Detect once here so the result can be reported and overridden from
         # the command line without retaining an address of a removed fragment.
         if seh_prolog is None or seh_epilog is None:
             found_prologs, found_epilog = detect_seh_helpers(
-                self.func_db, self.xbe_data, verbose=True)
+                helper_func_db, self.xbe_data, verbose=True)
             seh_prolog = seh_prolog if seh_prolog is not None else found_prologs
             seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
         seh_prologs = tuple(sorted(_as_addr_set(seh_prolog)))
@@ -1943,7 +1967,7 @@ class BatchTranslator:
         self.seh_epilog = seh_epilog
 
         setjmp_fn, longjmp_fn = detect_setjmp_helpers(
-            self.func_db, self.xbe_data, verbose=True)
+            helper_func_db, self.xbe_data, verbose=True)
 
         seh_prologs = frozenset(seh_prologs)
         self.translator.lifter.SEH_PROLOGS = seh_prologs

@@ -219,6 +219,23 @@ def test_targeted_int3_traps_but_int2d_path_bypasses_it():
     assert "return; /* trap ends recovered control flow */" in int3_body
 
 
+def test_computed_entry_into_int3_traps_but_int2d_path_bypasses_it():
+    int2d = BASE + 11
+    int3 = BASE + 13
+    continuation = BASE + 14
+    body = (bytes.fromhex("85c97407")
+            + b"\xb8" + int3.to_bytes(4, "little")
+            + bytes.fromhex("ffe0cd2dcc40c3"))
+    subject = translator(body, [int2d, int3, continuation])
+    subject.coalesce_function(
+        BASE, BASE + len(body), [int2d, int3, continuation])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    before_int3, after_int3 = code.split(f"loc_{int3:08X}:", 1)
+    int3_body, _ = after_int3.split(f"loc_{continuation:08X}:", 1)
+    assert f"goto loc_{continuation:08X}; /* int 0x2d skips slide int3 */" in before_int3
+    assert "return; /* trap ends recovered control flow */" in int3_body
+
+
 def test_noncoalesced_int2d_int3_does_not_tail_fallthrough():
     next_start = BASE + 3
     body = bytes.fromhex("cd2dcc40c3")
@@ -595,6 +612,34 @@ def test_default_helper_detection_precedes_static_callback_discovery(
     subject.func_db.update({BASE: function(BASE, BASE + 15),
                            BASE + 0x80: function(BASE + 0x80, BASE + 0x81)})
     batch = batch_translator(tmp_path, subject, BASE + 15, [], coalesce=False)
+    assert BASE + 0x40 in batch.translator.recovered_function_starts
+    assert getattr(batch.translator.lifter, helper) is None
+
+
+@pytest.mark.parametrize("helper, body", [
+    ("SEH_PROLOG", "64a1000000008d6c2410c3"),
+    ("SEH_EPILOG", "64890d00000000c951c3"),
+    ("SETJMP_FN", "c7422030324356c3"),
+    ("LONGJMP_FN", "3d30324356c3"),
+])
+def test_coalescence_helper_detection_ignores_callback_only_entries(
+        tmp_path, helper, body):
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:15] = (b"\xbe" + (BASE + 0x300).to_bytes(4, "little")
+                + b"\xbf" + (BASE + 0x304).to_bytes(4, "little")
+                + bytes.fromhex("39feffd0c3"))
+    marker = bytes.fromhex(body)
+    raw[0x40:0x40 + len(marker)] = marker
+    raw[0x80] = 0xc3
+    raw[0x300:0x304] = (BASE + 0x40).to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + 12),
+        BASE + 12: function(BASE + 12, BASE + 15),
+        BASE + 0x80: function(BASE + 0x80, BASE + 0x81),
+    })
+    batch = batch_translator(tmp_path, subject, BASE + 15, [BASE + 12])
     assert BASE + 0x40 in batch.translator.recovered_function_starts
     assert getattr(batch.translator.lifter, helper) is None
 
