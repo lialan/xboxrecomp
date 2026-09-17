@@ -512,6 +512,14 @@ class FunctionTranslator:
         for instruction in instructions:
             if covered_end in padding and instruction.address > covered_end:
                 covered_end = instruction.address
+            if instruction.address > covered_end:
+                gap = self._read_func_bytes(covered_end, instruction.address)
+                for table_va, targets in jump_tables.items():
+                    if (covered_end <= table_va < instruction.address
+                            and (table_va - covered_end) % 4 == 0
+                            and gap == b"".join(struct.pack("<I", t) for t in targets)):
+                        covered_end = instruction.address
+                        break
             if instruction.address != covered_end:
                 reject(f"CFG gap at 0x{covered_end:08X}")
             if instruction.end_address > end:
@@ -766,6 +774,11 @@ class FunctionTranslator:
                 stop_addresses=stop_addresses,
                 stop_mnemonics=("int3", "ud2", "hlt") if coalescing else ())
             changed = False
+            if coalescing:
+                refs = self._indirect_code_refs(instructions, start, upper)
+                if refs - entry_points:
+                    entry_points.update(refs)
+                    changed = True
             for insn in instructions:
                 if not insn.is_jump or insn.jump_target is not None:
                     continue
@@ -781,7 +794,13 @@ class FunctionTranslator:
                 table_va = operand.mem_disp
                 if not (start <= table_va < upper):
                     continue
-                targets = self._read_local_jump_table(table_va, start, upper)
+                # Embedded tables must not absorb the jump's own displacement
+                # (or other decoded code) when scanning backward from the base.
+                minimum = max((i.end_address for i in instructions
+                               if i.end_address <= table_va), default=start)
+                targets = self._read_local_jump_table(
+                    table_va, start, upper,
+                    min_entry_va=minimum if coalescing else None)
                 if not targets:
                     continue
                 jump_tables[table_va] = targets
@@ -837,12 +856,14 @@ class FunctionTranslator:
         return 0
 
     def _read_local_jump_table(self, table_va, lower, upper,
-                               max_entries=256):
+                               max_entries=256, min_entry_va=None):
         """Read the contiguous pointer cluster around an indexed-jump base."""
         def scan(step, first):
             targets = []
             for index in range(first, max_entries + first):
                 entry_va = table_va + step * index * 4
+                if min_entry_va is not None and entry_va < min_entry_va:
+                    break
                 offset = va_to_file_offset(entry_va)
                 if offset is None or offset + 4 > len(self.xbe_data):
                     break
@@ -944,6 +965,20 @@ class FunctionTranslator:
         return any(getattr(insn, "call_target", None) in seh_prologs
                    for insn in instructions)
 
+    @staticmethod
+    def _indirect_code_refs(instructions, start, end):
+        """Immediate continuations used by the lifter's register-jump dispatch."""
+        refs = set()
+        if any(insn.mnemonic == "jmp" and not insn.jump_target and insn.operands
+               and insn.operands[0].type == "reg" for insn in instructions):
+            for insn in instructions:
+                if (insn.mnemonic == "mov" and len(insn.operands) >= 2
+                        and insn.operands[0].type == "reg"
+                        and insn.operands[1].type == "imm"
+                        and start <= insn.operands[1].imm < end):
+                    refs.add(insn.operands[1].imm)
+        return refs
+
     def decode_function(self, start, end):
         """Recover instructions and blocks, including indirect-entry leaders."""
         recovered = self._recovered_cfg.get(start)
@@ -976,19 +1011,7 @@ class FunctionTranslator:
         # that actually contain a register-operand indirect jmp, so a plain
         # `mov reg, <address of a function>` for a callback does not start
         # splitting blocks everywhere.
-        imm_refs = set()
-        if any(insn.mnemonic == "jmp" and not insn.jump_target and insn.operands
-               and insn.operands[0].type == "reg" for insn in instructions):
-            for insn in instructions:
-                if insn.mnemonic != "mov" or len(insn.operands) < 2:
-                    continue
-                if insn.operands[0].type != "reg":
-                    continue
-                if insn.operands[1].type != "imm":
-                    continue
-                value = insn.operands[1].imm
-                if start <= value < end:
-                    imm_refs.add(value)
+        imm_refs = self._indirect_code_refs(instructions, start, end)
         self.lifter.imm_code_refs = imm_refs
 
         # Collect switch table targets as extra block leaders
@@ -1016,7 +1039,9 @@ class FunctionTranslator:
         # Build basic blocks
         blocks = self.disasm.build_basic_blocks(
             instructions, start, end,
-            extra_leaders=switch_leaders if switch_leaders else None)
+            extra_leaders=switch_leaders if switch_leaders else None,
+            stop_mnemonics=("int3", "ud2", "hlt")
+            if start in self.coalesced_function_starts else ())
         return instructions, blocks
 
     def translate_function(self, func_addr, func_info):
@@ -1405,6 +1430,9 @@ class FunctionTranslator:
                 self.lifter, bb, flag_state=incoming)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
+            if (start in self.coalesced_function_starts
+                    and bb.last_insn.mnemonic in ("int3", "ud2", "hlt")):
+                lines.append("    return; /* trap ends recovered control flow */")
 
             lines.append(f"")
 

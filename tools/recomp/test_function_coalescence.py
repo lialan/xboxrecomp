@@ -165,6 +165,12 @@ def test_traps_do_not_prove_reachability_of_a_following_entry(trap, has_other_ed
     if has_other_edge:
         subject.coalesce_function(BASE, end, [interior])
         assert list(subject.func_db) == [BASE]
+        _, blocks = subject.decode_function(BASE, end)
+        trap_block = next(bb for bb in blocks if bb.last_insn.mnemonic
+                          in ("int3", "ud2", "hlt"))
+        assert trap_block.successors == []
+        code = subject.translate_function(BASE, subject.func_db[BASE])
+        assert "return;" in code.split(f"loc_{interior:08X}:")[0]
     else:
         before = copy.deepcopy(subject.func_db)
         with pytest.raises(ValueError, match="not the requested end"):
@@ -216,6 +222,39 @@ def test_jump_table_can_follow_owned_code(jump, has_next_function):
     assert "switch: 2 entries, 2 targets" in code
     assert f"loc_{first_case:08X}:" in code
     assert f"loc_{first_case + 2:08X}:" in code
+
+
+@pytest.mark.parametrize("table_index", [0, 1])
+@pytest.mark.parametrize("extra_code", [b"", bytes.fromhex("31c0")])
+def test_embedded_jump_table_is_data_coverage(table_index, extra_code):
+    table = BASE + 9
+    first_case = table + 8 + len(extra_code)
+    body = (bytes.fromhex("31c0ff2485")
+            + (table + 4 * table_index).to_bytes(4, "little")
+            + first_case.to_bytes(4, "little")
+            + (first_case + 2).to_bytes(4, "little")
+            + extra_code + bytes.fromhex("40c34bc3"))
+    subject = translator(body, [first_case])
+    if extra_code:
+        with pytest.raises(ValueError, match="CFG gap"):
+            subject.coalesce_function(BASE, BASE + len(body), [first_case])
+        return
+    subject.coalesce_function(BASE, BASE + len(body), [first_case])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert "switch: 2 entries, 2 targets" in code
+    assert f"loc_{first_case:08X}:" in code
+    assert f"loc_{first_case + 2:08X}:" in code
+
+
+def test_register_indirect_continuation_is_recovered():
+    continuation = BASE + 7
+    body = b"\xb8" + continuation.to_bytes(4, "little") + bytes.fromhex("ffe040c3")
+    subject = translator(body, [continuation])
+    subject.coalesce_function(BASE, BASE + len(body), [continuation])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert f"goto loc_{continuation:08X};" in code
+    assert f"loc_{continuation:08X}:" in code
+    assert "/* [UNRESOLVED]" not in code
 
 
 @pytest.mark.parametrize("mutation, message", [
