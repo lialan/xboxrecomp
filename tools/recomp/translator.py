@@ -338,6 +338,7 @@ class FunctionTranslator:
         self.owned_function_starts = set()
         self.recovered_function_starts = set()
         self.coalesced_function_starts = set()
+        self.protected_function_starts = set()
         self._recovered_cfg = {}
         self._ownership_ready = False
 
@@ -461,6 +462,11 @@ class FunctionTranslator:
         if actual != expected:
             formatted = ", ".join(f"0x{start:08X}" for start in actual)
             reject(f"current interior starts are [{formatted}]")
+        protected = [start for start in actual
+                     if start in self.protected_function_starts]
+        if protected:
+            reject(
+                f"interior start 0x{protected[0]:08X} is protected by manual code")
         strong = [start for start in actual
                   if self._is_strong_entry(self.func_db[start])
                   or self.func_db[start].get("external_entry")
@@ -515,10 +521,24 @@ class FunctionTranslator:
             if instruction.address > covered_end:
                 gap = self._read_func_bytes(covered_end, instruction.address)
                 for table_va, targets in jump_tables.items():
-                    if (covered_end <= table_va < instruction.address
-                            and (table_va - covered_end) % 4 == 0
-                            and gap == b"".join(struct.pack("<I", t) for t in targets)):
-                        covered_end = instruction.address
+                    table = b"".join(struct.pack("<I", t) for t in targets)
+                    offset = gap.find(table) if gap is not None else -1
+                    while offset >= 0:
+                        table_start = covered_end + offset
+                        table_end = table_start + len(table)
+                        before = (table_start == covered_end
+                                  or self._is_alignment_padding_range(
+                                      covered_end, table_start))
+                        after = (table_end == instruction.address
+                                 or self._is_alignment_padding_range(
+                                     table_end, instruction.address))
+                        if (table_start <= table_va < table_end
+                                and (table_va - table_start) % 4 == 0
+                                and before and after):
+                            covered_end = instruction.address
+                            break
+                        offset = gap.find(table, offset + 1)
+                    if covered_end == instruction.address:
                         break
             if instruction.address != covered_end:
                 reject(f"CFG gap at 0x{covered_end:08X}")
@@ -621,6 +641,23 @@ class FunctionTranslator:
                             break
             cursor = max(cursor, covered[address])
         return gaps
+
+    def _is_alignment_padding_range(self, start, end):
+        """Return whether an exact byte range is proven alignment padding."""
+        raw = self._read_func_bytes(start, end)
+        if not raw:
+            return False
+        decoded = self.disasm.disassemble_function(raw, start, end)
+        if not decoded or not self._is_multi_byte_nop(decoded[0]):
+            return False
+        cursor = start
+        for instruction in decoded:
+            if (instruction.address != cursor or instruction.end_address > end
+                    or (instruction.mnemonic != "nop"
+                        and not self._is_multi_byte_nop(instruction))):
+                return False
+            cursor = instruction.end_address
+        return cursor == end
 
     @staticmethod
     def _find_static_indirect_ranges(instructions, max_bytes=0x10000):
@@ -778,6 +815,15 @@ class FunctionTranslator:
                 refs = self._indirect_code_refs(instructions, start, upper)
                 if refs - entry_points:
                     entry_points.update(refs)
+                    changed = True
+                debug_slides = self._debug_slide_int3s(instructions)
+                slide_continuations = {
+                    insn.end_address for insn in instructions
+                    if (insn.address in debug_slides
+                        and insn.end_address < upper)
+                }
+                if slide_continuations - entry_points:
+                    entry_points.update(slide_continuations)
                     changed = True
             for insn in instructions:
                 if not insn.is_jump or insn.jump_target is not None:
@@ -969,15 +1015,75 @@ class FunctionTranslator:
     def _indirect_code_refs(instructions, start, end):
         """Immediate continuations used by the lifter's register-jump dispatch."""
         refs = set()
-        if any(insn.mnemonic == "jmp" and not insn.jump_target and insn.operands
-               and insn.operands[0].type == "reg" for insn in instructions):
-            for insn in instructions:
-                if (insn.mnemonic == "mov" and len(insn.operands) >= 2
-                        and insn.operands[0].type == "reg"
-                        and insn.operands[1].type == "imm"
-                        and start <= insn.operands[1].imm < end):
-                    refs.add(insn.operands[1].imm)
+        constants = {}
+        aliases = {
+            "eax": "eax", "ax": "eax", "al": "eax", "ah": "eax",
+            "ebx": "ebx", "bx": "ebx", "bl": "ebx", "bh": "ebx",
+            "ecx": "ecx", "cx": "ecx", "cl": "ecx", "ch": "ecx",
+            "edx": "edx", "dx": "edx", "dl": "edx", "dh": "edx",
+            "esi": "esi", "si": "esi", "edi": "edi", "di": "edi",
+            "ebp": "ebp", "bp": "ebp", "esp": "esp", "sp": "esp",
+        }
+        full_registers = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"}
+        non_writers = {
+            "cmp", "test", "push", "jmp", "bt",
+            "prefetchnta", "prefetcht0", "prefetcht1", "prefetcht2",
+        }
+        for insn in instructions:
+            operands = insn.operands
+            if (insn.mnemonic == "mov" and len(operands) >= 2
+                    and operands[0].type == "reg"):
+                raw_destination = operands[0].reg
+                destination = aliases.get(raw_destination, raw_destination)
+                source = operands[1]
+                if raw_destination not in full_registers:
+                    constants.pop(destination, None)
+                elif source.type == "imm":
+                    constants[destination] = source.imm
+                elif (source.type == "reg" and source.reg in full_registers
+                      and source.reg in constants):
+                    constants[destination] = constants[source.reg]
+                else:
+                    constants.pop(destination, None)
+            elif (operands and operands[0].type == "reg"
+                  and insn.mnemonic not in non_writers
+                  and not insn.is_cond_jump):
+                destination = aliases.get(operands[0].reg, operands[0].reg)
+                constants.pop(destination, None)
+
+            if insn.is_call:
+                for register in ("eax", "ecx", "edx"):
+                    constants.pop(register, None)
+            elif insn.mnemonic == "xchg":
+                for operand in operands[:2]:
+                    if operand.type == "reg":
+                        constants.pop(aliases.get(operand.reg, operand.reg), None)
+            elif insn.mnemonic in ("mul", "imul", "div", "idiv"):
+                constants.pop("eax", None)
+                constants.pop("edx", None)
+
+            if (insn.mnemonic == "jmp" and not insn.jump_target and operands
+                    and operands[0].type == "reg"):
+                target = constants.get(aliases.get(
+                    operands[0].reg, operands[0].reg))
+                if target is not None and start <= target < end:
+                    refs.add(target)
         return refs
+
+    @staticmethod
+    def _debug_slide_int3s(instructions):
+        """Return INT3 addresses that are the Xbox INT 2D slide byte."""
+        slides = set()
+        previous = None
+        for instruction in instructions:
+            if (instruction.mnemonic == "int3" and previous is not None
+                    and previous.end_address == instruction.address
+                    and previous.mnemonic == "int" and previous.operands
+                    and previous.operands[0].type == "imm"
+                    and previous.operands[0].imm == 0x2D):
+                slides.add(instruction.address)
+            previous = instruction
+        return slides
 
     def decode_function(self, start, end):
         """Recover instructions and blocks, including indirect-entry leaders."""
@@ -1003,6 +1109,8 @@ class FunctionTranslator:
                         self.disasm.disassemble_function(raw_bytes, start, end))
         if not instructions:
             return [], []
+        coalesced = start in self.coalesced_function_starts
+        debug_slide_int3s = self._debug_slide_int3s(instructions)
 
         # Addresses this function loads as immediates into a register and
         # then jumps to. `mov ebx, 0x3A0DC; ... ; jmp ebx` is a continuation
@@ -1016,6 +1124,12 @@ class FunctionTranslator:
 
         # Collect switch table targets as extra block leaders
         switch_leaders = set(imm_refs)
+        if coalesced:
+            instruction_starts = {insn.address for insn in instructions}
+            switch_leaders.update(
+                insn.end_address for insn in instructions
+                if (insn.mnemonic == "int3"
+                    and insn.end_address in instruction_starts))
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
                 targets = self.lifter._analyze_switch_table(insn.operands)
@@ -1040,8 +1154,13 @@ class FunctionTranslator:
         blocks = self.disasm.build_basic_blocks(
             instructions, start, end,
             extra_leaders=switch_leaders if switch_leaders else None,
-            stop_mnemonics=("int3", "ud2", "hlt")
-            if start in self.coalesced_function_starts else ())
+            stop_mnemonics=("ud2", "hlt") if coalesced else ())
+        if coalesced:
+            for block in blocks:
+                if (block.last_insn is not None
+                        and block.last_insn.mnemonic == "int3"
+                        and block.last_insn.address not in debug_slide_int3s):
+                    block.successors = []
         return instructions, blocks
 
     def translate_function(self, func_addr, func_info):
@@ -1100,7 +1219,9 @@ class FunctionTranslator:
         # usable target; anything else is an analysis boundary gap with no
         # callable symbol.
         last_insn = instructions[-1]
-        continues_past_end = not (
+        debug_slide_int3s = self._debug_slide_int3s(instructions)
+        last_is_debug_slide = last_insn.address in debug_slide_int3s
+        continues_past_end = last_is_debug_slide or not (
             last_insn.is_terminator
             or last_insn.mnemonic in ("int3", "ud2", "hlt"))
         fallthrough_target = None
@@ -1354,7 +1475,9 @@ class FunctionTranslator:
                 preds[last.jump_target].add(bb.start)
             # A conditional jump also falls through; ret and an unconditional
             # jmp do not.
-            leaves = last.is_ret or last.mnemonic in ("jmp", "int3", "ud2", "hlt")
+            leaves = (last.is_ret or last.mnemonic in ("jmp", "ud2", "hlt")
+                      or (last.mnemonic == "int3"
+                          and last.address not in debug_slide_int3s))
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
@@ -1431,7 +1554,9 @@ class FunctionTranslator:
             for stmt in stmts:
                 lines.append(f"    {stmt}")
             if (start in self.coalesced_function_starts
-                    and bb.last_insn.mnemonic in ("int3", "ud2", "hlt")):
+                    and (bb.last_insn.mnemonic in ("ud2", "hlt")
+                         or (bb.last_insn.mnemonic == "int3"
+                             and bb.last_insn.address not in debug_slide_int3s))):
                 lines.append("    return; /* trap ends recovered control flow */")
 
             lines.append(f"")
@@ -1537,7 +1662,8 @@ class BatchTranslator:
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
                  output_dir=None, seh_prolog=None, seh_epilog=None,
-                 trace_functions=None, coalesce_json_paths=None):
+                 trace_functions=None, coalesce_json_paths=None,
+                 protected_function_starts=None):
         self.xbe_path = xbe_path
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(__file__), "output")
@@ -1593,6 +1719,8 @@ class BatchTranslator:
             self.classification_db, self.abi_db,
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions)
+        self.translator.protected_function_starts = set(
+            protected_function_starts or ())
         if coalesce_json_paths:
             self.translator.discover_static_indirect_targets(coalescing=True)
             for path in coalesce_json_paths:

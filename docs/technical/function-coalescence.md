@@ -34,13 +34,16 @@ existing entries; a callback into an already coalesced interior aborts the batch
 
 The operation rejects conflicting extents, independent entry evidence (prologue,
 callers, `external_entry`, or detector-recorded entries, seeds and code pointers),
-calls to an interior entry from the owner, and code that does not cover the
-requested extent. Traps (`int3`, `ud2`, `hlt`) terminate the validation walk and
-the recovered generated path; later blocks need another incoming edge. Only
-proven alignment no-ops or an exact validated jump-table byte range may close
-a decode gap. Register jumps use the same immediate-target discovery as normal
-translation. A local jump table using a sole base or index register can be read
-beyond the owned end,
+manual/wrapped/referenced project entries, calls to an interior entry from the
+owner, and code that does not cover the requested extent. Traps (`int3`, `ud2`,
+`hlt`) terminate the validation walk and the recovered generated path; later
+blocks need another incoming edge. The Xbox debug-service sequence `int 0x2d;
+int3` is the exception: the kernel skips that `int3`, so recovery preserves its
+fallthrough. Only proven alignment no-ops, an exact validated jump-table byte
+range, or those two combined around the same gap may close a decode gap.
+Register-jump continuations are accepted only when the jumped register can be
+tracked from an in-range immediate load, including simple register copies. A
+local jump table using a sole base or index register can be read beyond the owned end,
 bounded by the next detected function, if any, and the backed code section. This
 validates supplied bounds; it does not infer them or prove that unknown indirect
 callers cannot exist. Review those callers before supplying a recovery file.

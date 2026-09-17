@@ -145,6 +145,23 @@ def test_unreachable_padding_does_not_discard_incoming_comparison_flags():
         insn.address for insn in subject._recovered_cfg[BASE]["instructions"]}
 
 
+def test_jump_table_with_surrounding_alignment_padding_closes_gap():
+    prefix_size = 9
+    before = bytes.fromhex("6690")
+    after = bytes.fromhex("6690")
+    table = BASE + prefix_size + len(before)
+    first_case = table + 8 + len(after)
+    body = (bytes.fromhex("31c0ff2485") + table.to_bytes(4, "little")
+            + before
+            + first_case.to_bytes(4, "little")
+            + (first_case + 2).to_bytes(4, "little")
+            + after + bytes.fromhex("40c34bc3"))
+    subject = translator(body, [first_case])
+    subject.coalesce_function(BASE, BASE + len(body), [first_case])
+    recovered = subject._recovered_cfg[BASE]
+    assert recovered["jump_tables"][table] == [first_case, first_case + 2]
+
+
 def test_unreached_live_instructions_are_not_alignment_padding():
     subject = translator(bytes.fromhex("eb0231c0c3"), [BASE + 4])
     with pytest.raises(ValueError, match="CFG gap"):
@@ -176,6 +193,17 @@ def test_traps_do_not_prove_reachability_of_a_following_entry(trap, has_other_ed
         with pytest.raises(ValueError, match="not the requested end"):
             subject.coalesce_function(BASE, end, [interior])
         assert subject.func_db == before
+
+
+def test_xbox_int2d_int3_slide_preserves_fallthrough():
+    continuation = BASE + 3
+    body = bytes.fromhex("cd2dccb807000000c3")
+    subject = translator(body, [continuation])
+    subject.coalesce_function(BASE, BASE + len(body), [continuation])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    prefix = code.split(f"loc_{continuation:08X}:")[0]
+    assert "recomp_debug_service(eax, ecx)" in prefix
+    assert "trap ends recovered control flow" not in prefix
 
 
 def test_default_ownership_does_not_follow_base_only_tables():
@@ -257,6 +285,24 @@ def test_register_indirect_continuation_is_recovered():
     assert "/* [UNRESOLVED]" not in code
 
 
+def test_register_indirect_continuation_requires_matching_jump_register():
+    continuation = BASE + 7
+    body = b"\xb8" + continuation.to_bytes(4, "little") + bytes.fromhex("ffe340c3")
+    subject = translator(body, [continuation])
+    with pytest.raises(ValueError, match="not the requested end"):
+        subject.coalesce_function(BASE, BASE + len(body), [continuation])
+
+
+def test_register_indirect_continuation_follows_register_copy():
+    continuation = BASE + 9
+    body = (b"\xb8" + continuation.to_bytes(4, "little")
+            + bytes.fromhex("89c3ffe340c3"))
+    subject = translator(body, [continuation])
+    subject.coalesce_function(BASE, BASE + len(body), [continuation])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert f"goto loc_{continuation:08X};" in code
+
+
 @pytest.mark.parametrize("mutation, message", [
     (lambda s: s.func_db[BASE].update(end=END + 1), "shrinks"),
     (lambda s: s.func_db[SPLITS[0]].update(end=END + 1), "crosses end"),
@@ -321,6 +367,14 @@ def test_batch_wires_repair_before_ownership_and_emission(tmp_path):
     assert list(batch.func_db) == [BASE]
     assert "CMP_GE(" in batch.translate_single(BASE)
     assert batch.translate_single(SPLITS[0]) is None
+
+
+def test_batch_protects_manual_function_start_before_coalescence(tmp_path):
+    with pytest.raises(ValueError, match="protected by manual code"):
+        batch_translator(
+            tmp_path, translator(), END, SPLITS,
+            protected_function_starts={SPLITS[0]},
+            seh_prolog=0, seh_epilog=0)
 
 
 @pytest.mark.parametrize("helper, body, split, call_code", [
