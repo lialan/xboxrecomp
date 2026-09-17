@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from tools.doctor import (_flatten_recomp_stats, build_report, parse_icall_feedback,
                           parse_runtime_log, rank_priorities)
 
@@ -117,3 +119,57 @@ def test_rank_priorities_has_clean_fallback():
     out = rank_priorities(report)
     assert out == [{"severity": "info", "area": "bring-up",
                     "reason": "no known blockers found in supplied artifacts/logs"}]
+
+
+@pytest.mark.parametrize("name, value", [
+    ("functions", 42), ("functions", [42]), ("functions", [{"start": "bad"}]),
+    ("identified", 42), ("identified", [{"start": "0x1000", "category": []}]),
+    ("abi", 42), ("abi", [{"address": None}]),
+    ("recomp", 42), ("recomp", {"game": 42}),
+    ("recomp", {"total": "bad", "translated": 0, "failed": 0}),
+    ("recomp", {"total": 1, "translated": 0, "failed": -1}),
+    ("recomp", {"total": 1, "translated": 1, "failed": 0, "unimplemented": []}),
+    ("recomp", {"total": 1, "translated": 1, "failed": 0,
+                "unimplemented": {"fxam": "bad"}}),
+])
+def test_build_report_rejects_invalid_artifact_shapes(tmp_path, name, value):
+    paths = {key: tmp_path / f"{key}.json"
+             for key in ("functions", "identified", "abi", "recomp")}
+    for path in paths.values():
+        path.write_text("{}")
+    paths[name].write_text(json.dumps(value))
+    report = build_report(**paths)
+    assert report["pipeline"]["invalid_artifacts"] == [name]
+    assert any("invalid/unreadable artifacts" in item["reason"]
+               for item in report["priorities"])
+
+
+def test_kernel_log_preserves_real_thunk_and_apc_ordinals(tmp_path):
+    path = tmp_path / "run.log"
+    path.write_text(
+        "[12:34:56.789] ERROR [THUNK ] Unresolved kernel ordinal 999\n"
+        "[KERNEL] file I/O APC 0x00123456 unresolved (kernel ordinal 219)\n"
+        "[KERNEL] file I/O APC 0x00123456 unresolved (kernel ordinal 236)\n"
+    )
+    assert parse_runtime_log(path)["kernel_stub"] == {
+        "ordinal 999": 1, "ordinal 219": 1, "ordinal 236": 1,
+    }
+
+
+@pytest.mark.parametrize("mapping", [False, True])
+def test_identified_count_excludes_unknown_functions(tmp_path, mapping):
+    from tools.func_id.output import _build_enriched_db
+
+    functions = [{"start": f"0x{addr:x}", "end": f"0x{addr+16:x}", "size": 16,
+                  "name": f"sub_{addr:x}", "section": ".text"}
+                 for addr in (0x1000, 0x2000)]
+    identified = _build_enriched_db(functions, {}, {
+        0x1000: {"name": "memcpy", "confidence": 1.0, "method": "signature"},
+    }, {}, {})
+    if mapping:
+        identified = {entry["start"]: entry for entry in identified}
+    path = tmp_path / "identified.json"
+    path.write_text(json.dumps(identified))
+    report = build_report(identified=path)
+    assert report["pipeline"]["invalid_artifacts"] == []
+    assert report["pipeline"]["identified_functions"] == 1

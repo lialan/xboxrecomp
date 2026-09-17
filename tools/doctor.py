@@ -29,20 +29,40 @@ DEFAULTS = {
 }
 
 
-def _load_json_with_status(path):
+def _valid_address(value):
+    if isinstance(value, str):
+        try:
+            value = int(value, 0)
+        except ValueError:
+            return False
+    return type(value) is int and 0 <= value <= 0xFFFFFFFF
+
+
+def _load_json_with_status(path, kind):
     """Return (value, status), distinguishing absent from malformed input."""
     if not path or not os.path.exists(path):
         return None, "missing"
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh), "ok"
+            value = json.load(fh)
+        if kind == "recomp":
+            if not isinstance(value, dict):
+                raise ValueError("expected recompiler summary")
+            _flatten_recomp_stats(value)
+        else:
+            if not isinstance(value, (list, dict)):
+                raise ValueError("expected function entries")
+            entries = (value.items() if isinstance(value, dict)
+                       else ((None, entry) for entry in value))
+            address_field = "address" if kind == "abi" else "start"
+            for key, entry in entries:
+                if not isinstance(entry, dict) or not _valid_address(entry.get(address_field, key)):
+                    raise ValueError("expected function address")
+                if kind == "identified" and not isinstance(entry.get("category", "unknown"), str):
+                    raise ValueError("expected category string")
+        return value, "ok"
     except (OSError, ValueError):
         return None, "invalid"
-
-
-def _load_json(path):
-    """Compatibility wrapper returning only the decoded JSON value."""
-    return _load_json_with_status(path)[0]
 
 
 def _count_entries(value):
@@ -54,21 +74,31 @@ def _count_entries(value):
 def _flatten_recomp_stats(stats):
     """Normalize single-batch and per-category recompiler summary shapes."""
     out = {"total": 0, "translated": 0, "failed": 0, "unimplemented": Counter()}
-    if not isinstance(stats, dict):
+    if stats is None:
         return out
-    batches = [stats] if "total" in stats else [v for v in stats.values() if isinstance(v, dict)]
+    if not isinstance(stats, dict):
+        raise ValueError("expected recompiler summary")
+    batches = [stats] if "total" in stats else stats.values()
     for batch in batches:
-        out["total"] += int(batch.get("total", 0) or 0)
-        out["translated"] += int(batch.get("translated", 0) or 0)
-        out["failed"] += int(batch.get("failed", 0) or 0)
-        for mnemonic, addrs in (batch.get("unimplemented") or {}).items():
+        if not isinstance(batch, dict):
+            raise ValueError("expected category summary")
+        for key in ("total", "translated", "failed"):
+            count = batch.get(key)
+            if type(count) is not int or count < 0:
+                raise ValueError("expected nonnegative translation count")
+            out[key] += count
+        unimplemented = batch.get("unimplemented", {})
+        if not isinstance(unimplemented, dict):
+            raise ValueError("expected unimplemented mnemonic map")
+        for mnemonic, addrs in unimplemented.items():
             if isinstance(addrs, list):
+                if not all(_valid_address(addr) for addr in addrs):
+                    raise ValueError("expected unimplemented instruction addresses")
                 out["unimplemented"][mnemonic] += len(addrs)
+            elif type(addrs) is int and addrs >= 0:
+                out["unimplemented"][mnemonic] += addrs
             else:
-                try:
-                    out["unimplemented"][mnemonic] += int(addrs)
-                except (TypeError, ValueError):
-                    pass
+                raise ValueError("expected unimplemented instruction count")
     out["unimplemented"] = dict(out["unimplemented"].most_common())
     return out
 
@@ -119,7 +149,8 @@ _LOG_PATTERNS = (
         r"^(?=.*(?:icall|indirect call))(?=.*(?:unresolved|failed|failed to resolve)).*?(0x[0-9a-fA-F]+)",
         re.I)),
     ("kernel_stub", re.compile(
-        r"(?:kernel|xboxkrnl).*?(?:stub|unimplemented|unsupported|unresolved|failed).*?(ordinal\s+\d+|[A-Za-z_][A-Za-z0-9_]*)",
+        r"^(?=.*(?:kernel|xboxkrnl))(?=.*(?:stub|unimplemented|unsupported|unresolved|failed))"
+        r".*?((?:kernel|xboxkrnl|stub|unimplemented|unsupported|unresolved|failed).*)",
         re.I)),
     ("d3d_unsupported", re.compile(r"(?:D3D8|D3D|NV2A).*?(?:unsupported|unimplemented|unknown).*?([^\r\n]+)", re.I)),
     ("audio_unsupported", re.compile(r"(?:DSOUND|DirectSound|APU|audio|WMA).*?(?:unsupported|unimplemented|stub).*?([^\r\n]+)", re.I)),
@@ -144,6 +175,10 @@ def parse_runtime_log(path):
                     match = pattern.search(line)
                     if match:
                         value = " ".join(match.group(1).strip().split())[:160]
+                        if name == "kernel_stub":
+                            ordinal = re.search(r"\bordinal\s+\d+\b", line, re.I)
+                            if ordinal:
+                                value = " ".join(ordinal.group().lower().split())
                         counters[name][value] += 1
     except OSError:
         pass
@@ -153,19 +188,22 @@ def parse_runtime_log(path):
 def build_report(functions=None, identified=None, abi=None, recomp=None,
                  icall_feedback=None, runtime_log=None):
     artifacts = {
-        "functions": _load_json_with_status(functions),
-        "identified": _load_json_with_status(identified),
-        "abi": _load_json_with_status(abi),
-        "recomp": _load_json_with_status(recomp),
+        "functions": _load_json_with_status(functions, "functions"),
+        "identified": _load_json_with_status(identified, "identified"),
+        "abi": _load_json_with_status(abi, "abi"),
+        "recomp": _load_json_with_status(recomp, "recomp"),
     }
     fns = artifacts["functions"][0]
-    ids = artifacts["identified"][0]
+    ids = artifacts["identified"][0] or []
+    if isinstance(ids, dict):
+        ids = ids.values()
     abi_data = artifacts["abi"][0]
     recomp_data = artifacts["recomp"][0]
     report = {
         "pipeline": {
             "functions": _count_entries(fns),
-            "identified_functions": _count_entries(ids),
+            "identified_functions": sum(entry.get("category", "unknown") not in ("unknown", "")
+                                        for entry in ids),
             "abi_functions": _count_entries(abi_data),
             "missing_artifacts": [name for name, (_, status) in artifacts.items()
                                   if status == "missing"],
