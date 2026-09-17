@@ -816,7 +816,8 @@ class FunctionTranslator:
                 if refs - entry_points:
                     entry_points.update(refs)
                     changed = True
-                debug_slides = self._debug_slide_int3s(instructions)
+                debug_slides = self._debug_slide_int3s(
+                    instructions, include_direct_targets=True)
                 slide_continuations = {
                     insn.end_address for insn in instructions
                     if (insn.address in debug_slides
@@ -1016,6 +1017,10 @@ class FunctionTranslator:
         """Immediate continuations used by the lifter's register-jump dispatch."""
         refs = set()
         constants = {}
+        direct_targets = {
+            insn.jump_target for insn in instructions
+            if insn.jump_target is not None
+        }
         aliases = {
             "eax": "eax", "ax": "eax", "al": "eax", "ah": "eax",
             "ebx": "ebx", "bx": "ebx", "bl": "ebx", "bh": "ebx",
@@ -1029,7 +1034,28 @@ class FunctionTranslator:
             "cmp", "test", "push", "jmp", "bt",
             "prefetchnta", "prefetcht0", "prefetcht1", "prefetcht2",
         }
+        implicit_clobbers = {
+            "cbw": {"eax"}, "cwde": {"eax"}, "cdq": {"edx"},
+            "cwd": {"edx"}, "cpuid": {"eax", "ebx", "ecx", "edx"},
+            "rdtsc": {"eax", "edx"}, "lahf": {"eax"},
+            "lodsb": {"eax", "esi"}, "lodsw": {"eax", "esi"},
+            "lodsd": {"eax", "esi"},
+            "movsb": {"esi", "edi"}, "movsw": {"esi", "edi"},
+            "movsd": {"esi", "edi"},
+            "stosb": {"edi"}, "stosw": {"edi"}, "stosd": {"edi"},
+            "scasb": {"edi"}, "scasw": {"edi"}, "scasd": {"edi"},
+            "cmpsb": {"esi", "edi"}, "cmpsw": {"esi", "edi"},
+            "cmpsd": {"esi", "edi"},
+            "loop": {"ecx"}, "loope": {"ecx"}, "loopne": {"ecx"},
+            "jecxz": {"ecx"}, "leave": {"esp", "ebp"},
+            "popad": set(full_registers),
+        }
         for insn in instructions:
+            # This list is address ordered, not a single execution path. A
+            # direct target may have predecessors that never executed the load
+            # immediately above it, so never carry constants into a join.
+            if insn.address in direct_targets and insn.address != start:
+                constants.clear()
             operands = insn.operands
             if (insn.mnemonic == "mov" and len(operands) >= 2
                     and operands[0].type == "reg"):
@@ -1058,9 +1084,13 @@ class FunctionTranslator:
                 for operand in operands[:2]:
                     if operand.type == "reg":
                         constants.pop(aliases.get(operand.reg, operand.reg), None)
-            elif insn.mnemonic in ("mul", "imul", "div", "idiv"):
+            elif (insn.mnemonic in ("mul", "div", "idiv")
+                  or (insn.mnemonic == "imul" and len(operands) == 1)):
                 constants.pop("eax", None)
                 constants.pop("edx", None)
+
+            for register in implicit_clobbers.get(insn.mnemonic, ()):
+                constants.pop(register, None)
 
             if (insn.mnemonic == "jmp" and not insn.jump_target and operands
                     and operands[0].type == "reg"):
@@ -1068,22 +1098,54 @@ class FunctionTranslator:
                     operands[0].reg, operands[0].reg))
                 if target is not None and start <= target < end:
                     refs.add(target)
+
+            # Address ordering after a branch/return is not reachability.
+            # Clearing here is conservative for fallthrough, which is the
+            # correct bias when this evidence can authorize destructive repair.
+            if insn.is_jump or insn.is_ret:
+                constants.clear()
         return refs
 
     @staticmethod
-    def _debug_slide_int3s(instructions):
-        """Return INT3 addresses that are the Xbox INT 2D slide byte."""
+    def _debug_slide_int3s(instructions, include_direct_targets=False):
+        """Return INT3 bytes that are unambiguous Xbox INT 2D slide bytes."""
         slides = set()
+        direct_targets = {
+            insn.jump_target for insn in instructions
+            if insn.jump_target is not None
+        }
         previous = None
         for instruction in instructions:
             if (instruction.mnemonic == "int3" and previous is not None
                     and previous.end_address == instruction.address
                     and previous.mnemonic == "int" and previous.operands
                     and previous.operands[0].type == "imm"
-                    and previous.operands[0].imm == 0x2D):
+                    and previous.operands[0].imm == 0x2D
+                    and (include_direct_targets
+                         or instruction.address not in direct_targets)):
                 slides.add(instruction.address)
             previous = instruction
         return slides
+
+    @staticmethod
+    def _debug_slide_bypasses(instructions):
+        """Map INT 2D instructions to post-INT3 targets when INT3 has another entry."""
+        direct_targets = {
+            insn.jump_target for insn in instructions
+            if insn.jump_target is not None
+        }
+        bypasses = {}
+        previous = None
+        for instruction in instructions:
+            if (instruction.mnemonic == "int3" and previous is not None
+                    and instruction.address in direct_targets
+                    and previous.end_address == instruction.address
+                    and previous.mnemonic == "int" and previous.operands
+                    and previous.operands[0].type == "imm"
+                    and previous.operands[0].imm == 0x2D):
+                bypasses[previous.address] = instruction.end_address
+            previous = instruction
+        return bypasses
 
     def decode_function(self, start, end):
         """Recover instructions and blocks, including indirect-entry leaders."""
@@ -1111,6 +1173,8 @@ class FunctionTranslator:
             return [], []
         coalesced = start in self.coalesced_function_starts
         debug_slide_int3s = self._debug_slide_int3s(instructions)
+        debug_slide_bypasses = (self._debug_slide_bypasses(instructions)
+                                if coalesced else {})
 
         # Addresses this function loads as immediates into a register and
         # then jumps to. `mov ebx, 0x3A0DC; ... ; jmp ebx` is a continuation
@@ -1124,6 +1188,7 @@ class FunctionTranslator:
 
         # Collect switch table targets as extra block leaders
         switch_leaders = set(imm_refs)
+        switch_leaders.update(debug_slide_bypasses.values())
         if coalesced:
             instruction_starts = {insn.address for insn in instructions}
             switch_leaders.update(
@@ -1157,6 +1222,16 @@ class FunctionTranslator:
             stop_mnemonics=("ud2", "hlt") if coalesced else ())
         if coalesced:
             for block in blocks:
+                bypass = (debug_slide_bypasses.get(block.last_insn.address)
+                          if block.last_insn is not None else None)
+                if bypass is not None:
+                    slide = block.last_insn.end_address
+                    block.successors = [
+                        bypass if successor == slide else successor
+                        for successor in block.successors
+                    ]
+                    if bypass not in block.successors:
+                        block.successors.append(bypass)
                 if (block.last_insn is not None
                         and block.last_insn.mnemonic == "int3"
                         and block.last_insn.address not in debug_slide_int3s):
@@ -1219,8 +1294,12 @@ class FunctionTranslator:
         # usable target; anything else is an analysis boundary gap with no
         # callable symbol.
         last_insn = instructions[-1]
+        coalesced = start in self.coalesced_function_starts
         debug_slide_int3s = self._debug_slide_int3s(instructions)
-        last_is_debug_slide = last_insn.address in debug_slide_int3s
+        debug_slide_bypasses = (self._debug_slide_bypasses(instructions)
+                                if coalesced else {})
+        last_is_debug_slide = (coalesced
+                               and last_insn.address in debug_slide_int3s)
         continues_past_end = last_is_debug_slide or not (
             last_insn.is_terminator
             or last_insn.mnemonic in ("int3", "ud2", "hlt"))
@@ -1453,6 +1532,7 @@ class FunctionTranslator:
             if insn.jump_target and start <= insn.jump_target < end:
                 label_addrs.add(insn.jump_target)
         label_addrs |= self.lifter.imm_code_refs
+        label_addrs.update(debug_slide_bypasses.values())
         # Add switch table targets (indirect jmp with intra-function table)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
@@ -1470,6 +1550,10 @@ class FunctionTranslator:
         for i, bb in enumerate(blocks):
             last = bb.instructions[-1] if bb.instructions else None
             if last is None:
+                continue
+            bypass = debug_slide_bypasses.get(last.address)
+            if bypass in preds:
+                preds[bypass].add(bb.start)
                 continue
             if last.jump_target in preds:
                 preds[last.jump_target].add(bb.start)
@@ -1553,6 +1637,10 @@ class FunctionTranslator:
                 self.lifter, bb, flag_state=incoming)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
+            bypass = debug_slide_bypasses.get(bb.last_insn.address)
+            if bypass is not None:
+                lines.append(
+                    f"    goto loc_{bypass:08X}; /* int 0x2d skips slide int3 */")
             if (start in self.coalesced_function_starts
                     and (bb.last_insn.mnemonic in ("ud2", "hlt")
                          or (bb.last_insn.mnemonic == "int3"

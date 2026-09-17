@@ -206,6 +206,27 @@ def test_xbox_int2d_int3_slide_preserves_fallthrough():
     assert "trap ends recovered control flow" not in prefix
 
 
+def test_targeted_int3_traps_but_int2d_path_bypasses_it():
+    continuation = BASE + 5
+    int3 = BASE + 4
+    body = bytes.fromhex("7402cd2dcc40c3")
+    subject = translator(body, [continuation])
+    subject.coalesce_function(BASE, BASE + len(body), [continuation])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    before_int3, after_int3 = code.split(f"loc_{int3:08X}:", 1)
+    int3_body, _ = after_int3.split(f"loc_{continuation:08X}:", 1)
+    assert f"goto loc_{continuation:08X}; /* int 0x2d skips slide int3 */" in before_int3
+    assert "return; /* trap ends recovered control flow */" in int3_body
+
+
+def test_noncoalesced_int2d_int3_does_not_tail_fallthrough():
+    next_start = BASE + 3
+    body = bytes.fromhex("cd2dcc40c3")
+    subject = translator(body, [next_start])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert "fallthrough" not in code
+
+
 def test_default_ownership_does_not_follow_base_only_tables():
     raw = bytearray(b"\xcc" * 0x400)
     # test ecx,ecx; jz bridge; jmp [eax*4 + indexed_table]
@@ -297,6 +318,35 @@ def test_register_indirect_continuation_follows_register_copy():
     continuation = BASE + 9
     body = (b"\xb8" + continuation.to_bytes(4, "little")
             + bytes.fromhex("89c3ffe340c3"))
+    subject = translator(body, [continuation])
+    subject.coalesce_function(BASE, BASE + len(body), [continuation])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert f"goto loc_{continuation:08X};" in code
+
+
+def test_register_indirect_continuation_does_not_cross_cfg_join():
+    continuation = BASE + 9
+    body = (bytes.fromhex("7405")
+            + b"\xb8" + continuation.to_bytes(4, "little")
+            + bytes.fromhex("ffe040c3"))
+    subject = translator(body, [continuation])
+    with pytest.raises(ValueError, match="not the requested end"):
+        subject.coalesce_function(BASE, BASE + len(body), [continuation])
+
+
+def test_register_indirect_continuation_does_not_cross_implicit_clobber():
+    continuation = BASE + 8
+    body = (b"\xb8" + continuation.to_bytes(4, "little")
+            + bytes.fromhex("adffe040c3"))
+    subject = translator(body, [continuation])
+    with pytest.raises(ValueError, match="not the requested end"):
+        subject.coalesce_function(BASE, BASE + len(body), [continuation])
+
+
+def test_multi_operand_imul_preserves_unrelated_continuation_register():
+    continuation = BASE + 10
+    body = (b"\xb8" + continuation.to_bytes(4, "little")
+            + bytes.fromhex("6bdb02ffe040c3"))
     subject = translator(body, [continuation])
     subject.coalesce_function(BASE, BASE + len(body), [continuation])
     code = subject.translate_function(BASE, subject.func_db[BASE])

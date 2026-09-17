@@ -411,9 +411,6 @@ def main():
         # used above -- the `manual` set (declare-only) and func_db name pinning
         # -- so the translator needs no changes.
         if args.exclude_manual:
-            if manual_scan_result is None:
-                from .manual_scan import scan as _scan_manual
-                manual_scan_result = _scan_manual(args.exclude_manual)
             skip, wrap, referenced = manual_scan_result
             known = set(translator.func_db)
 
