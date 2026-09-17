@@ -1557,6 +1557,30 @@ void view_register(void *addr, size_t len)
     pthread_mutex_unlock(&s_views_lock);
 }
 
+/* Non-destructive counterpart to view_take, and interior-aware: VirtualQuery
+ * is asked about addresses *within* a region at least as often as about its
+ * base -- a translated guest VA lands in the middle of the 64 MB window.
+ * Picks the containing region and reports where it starts. */
+int view_lookup(const void *addr, void **base_out, size_t *len_out)
+{
+    int found = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        if (!s_views[i].addr)
+            continue;
+        uintptr_t lo = (uintptr_t)s_views[i].addr;
+        uintptr_t hi = lo + s_views[i].len;
+        if ((uintptr_t)addr >= lo && (uintptr_t)addr < hi) {
+            if (base_out) *base_out = s_views[i].addr;
+            if (len_out)  *len_out  = s_views[i].len;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    return found;
+}
+
 size_t view_take(const void *addr)
 {
     size_t len = 0;
@@ -1676,16 +1700,53 @@ BOOL UnmapViewOfFile(LPCVOID baseAddr)
 /* VirtualQuery                                                           */
 /* ===================================================================== */
 
+/*
+ * Answers from the view registry rather than from a constant.
+ *
+ * This used to report RegionSize 0x1000, MEM_COMMIT, PAGE_READWRITE and
+ * AllocationBase NULL for every address it was handed, mapped or not. Four
+ * kernel entry points are built on it, and one of them chooses a deallocator
+ * with it: MmFreeContiguousMemory frees via VirtualFree only when
+ * AllocationBase equals the pointer, so a hardcoded NULL sent every
+ * contiguous buffer -- all of which come from VirtualAlloc, i.e. mmap -- to
+ * _aligned_free, which is free(). The allocator aborts on the foreign
+ * pointer. MmQueryAllocationSize answered 0x1000 for everything and
+ * NtQueryVirtualMemory called unmapped addresses committed and readable.
+ *
+ * Everything the shim maps -- VirtualAlloc and MapViewOfFileEx alike -- is in
+ * the registry, so it can answer for exactly the memory it owns and say
+ * MEM_FREE for the rest. Saying MEM_FREE for an address it did not map is the
+ * honest answer: a host heap pointer is not a Win32 reservation, and the
+ * callers that branch on this want to know which allocator owns the pointer.
+ */
 SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T length)
 {
     if (!buffer || length < sizeof(*buffer)) return 0;
     memset(buffer, 0, sizeof(*buffer));
-    buffer->BaseAddress    = (PVOID)address;
-    buffer->AllocationBase = NULL;       /* != address -> freed via _aligned_free */
-    buffer->RegionSize     = 0x1000;
-    buffer->State          = MEM_COMMIT;
-    buffer->Protect        = PAGE_READWRITE;
-    buffer->Type           = 0x20000;    /* MEM_PRIVATE */
+
+    void  *base = NULL;
+    size_t len  = 0;
+
+    if (!view_lookup(address, &base, &len)) {
+        /* Not ours. Report it free rather than inventing a committed page. */
+        buffer->BaseAddress    = (PVOID)address;
+        buffer->AllocationBase = NULL;
+        buffer->RegionSize     = 0;
+        buffer->State          = MEM_FREE;
+        buffer->Protect        = PAGE_NOACCESS;
+        buffer->Type           = 0;
+        return sizeof(*buffer);
+    }
+
+    buffer->BaseAddress      = (PVOID)address;
+    buffer->AllocationBase   = base;
+    buffer->AllocationProtect = PAGE_READWRITE;
+    /* From the queried address to the end of the region, which is what Win32
+     * reports and what callers sizing a copy out of it depend on. */
+    buffer->RegionSize       = len - (size_t)((uintptr_t)address - (uintptr_t)base);
+    buffer->State            = MEM_COMMIT;
+    buffer->Protect          = PAGE_READWRITE;
+    buffer->Type             = MEM_PRIVATE;
     return sizeof(*buffer);
 }
 

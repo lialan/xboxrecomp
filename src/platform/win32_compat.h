@@ -56,6 +56,8 @@ extern "C" {
 #define MEM_RESERVE    0x00002000u
 #define MEM_DECOMMIT   0x00004000u
 #define MEM_RELEASE    0x00008000u
+#define MEM_FREE       0x00010000u
+#define MEM_PRIVATE    0x00020000u
 #define MEM_TOP_DOWN   0x00100000u
 #define PAGE_NOACCESS          0x01u
 #define PAGE_READONLY          0x02u
