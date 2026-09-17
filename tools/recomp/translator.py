@@ -512,6 +512,11 @@ class FunctionTranslator:
         if any(instruction.is_call and instruction.call_target in actual
                for instruction in instructions):
             reject("interior start is called from the requested owner")
+        _, indirect_calls = self._indirect_code_refs(
+            instructions, target, end, proof_mode=True,
+            return_call_refs=True)
+        if indirect_calls.intersection(actual):
+            reject("interior start is called from the requested owner")
         if not instructions or instructions[0].address != target:
             reject("CFG does not start at the requested start")
         covered_end = target
@@ -1014,16 +1019,18 @@ class FunctionTranslator:
                    for insn in instructions)
 
     @staticmethod
-    def _indirect_code_refs(instructions, start, end, proof_mode=False):
+    def _indirect_code_refs(instructions, start, end, proof_mode=False,
+                            return_call_refs=False):
         """Immediate continuations used by register-jump dispatch.
 
-        Normal translation keeps the historical address-ordered heuristic so
-        existing generated code does not lose labels. ``proof_mode`` is only
-        for destructive coalescence: there, a target must survive conservative
-        control-flow and clobber checks before it can justify deleting an
-        interior function entry.
+        Track constants along reachable CFG paths in both modes. Normal
+        translation conservatively unions targets proven on incoming edges so
+        unreachable bytes cannot erase a real local label. ``proof_mode`` is
+        stricter: a jump target must survive the merged incoming state before
+        it can justify deleting an interior function entry.
         """
         refs = set()
+        call_refs = set()
         aliases = {
             "eax": "eax", "ax": "eax", "al": "eax", "ah": "eax",
             "ebx": "ebx", "bx": "ebx", "bl": "ebx", "bh": "ebx",
@@ -1106,7 +1113,7 @@ class FunctionTranslator:
                 constants.pop(register, None)
             return constants
 
-        def target_from(insn, constants):
+        def jump_target_from(insn, constants):
             operands = insn.operands
             if (insn.mnemonic == "jmp" and not insn.jump_target and operands
                     and operands[0].type == "reg"):
@@ -1116,21 +1123,22 @@ class FunctionTranslator:
                     return target
             return None
 
-        if not proof_mode:
-            constants = {}
-            for insn in instructions:
-                constants = transfer(insn, constants)
-                target = target_from(insn, constants)
-                if target is not None:
-                    refs.add(target)
-            return refs
+        def call_target_from(insn, constants):
+            operands = insn.operands
+            if (insn.is_call and not getattr(insn, "call_target", None)
+                    and operands and operands[0].type == "reg"):
+                target = constants.get(aliases.get(
+                    operands[0].reg, operands[0].reg))
+                if target is not None and start <= target < end:
+                    return target
+            return None
 
-        # Coalescence uses these references as reachability evidence before
-        # deleting interior function entries. Track constants along actual CFG
-        # edges and keep one only when every incoming path agrees on its value.
+        # Track constants along actual CFG edges. Destructive coalescence keeps
+        # a jump target only when every incoming path agrees; ordinary
+        # translation may keep the union of per-edge targets for dispatch labels.
         ordered = sorted(instructions, key=lambda insn: insn.address)
         if not ordered or ordered[0].address != start:
-            return refs
+            return (refs, call_refs) if return_call_refs else refs
         by_address = {insn.address: insn for insn in ordered}
         fallthrough = {}
         for current, following in zip(ordered, ordered[1:]):
@@ -1176,9 +1184,10 @@ class FunctionTranslator:
             if address not in entry_states:
                 continue
             insn = by_address[address]
-            outgoing = transfer(insn, entry_states[address])
+            incoming = entry_states[address]
+            outgoing = transfer(insn, incoming)
             static = set(static_successors(insn))
-            dynamic_target = target_from(insn, outgoing)
+            dynamic_target = jump_target_from(insn, incoming)
             observed = dynamic_edges.setdefault(address, set())
             if dynamic_target in by_address:
                 observed.add(dynamic_target)
@@ -1209,10 +1218,28 @@ class FunctionTranslator:
 
         for address, incoming in entry_states.items():
             insn = by_address[address]
-            target = target_from(insn, transfer(insn, incoming))
-            if target is not None:
-                refs.add(target)
-        return refs
+            if proof_mode:
+                target = jump_target_from(insn, incoming)
+                if target is not None:
+                    refs.add(target)
+            else:
+                # Translation only needs a conservative target census. Keep
+                # every target proven on an incoming CFG edge so unreachable
+                # bytes in address order cannot erase a real continuation.
+                for contribution in incoming_states.get(address, {}).values():
+                    target = jump_target_from(insn, contribution)
+                    if target is not None:
+                        refs.add(target)
+
+            if return_call_refs:
+                # A single proven path to an indirect call is independent entry
+                # evidence, even when other predecessors weaken the merged state.
+                for contribution in incoming_states.get(address, {}).values():
+                    target = call_target_from(insn, contribution)
+                    if target is not None:
+                        call_refs.add(target)
+
+        return (refs, call_refs) if return_call_refs else refs
 
     @staticmethod
     def _debug_slide_int3s(instructions, include_direct_targets=False,

@@ -4,7 +4,9 @@ import json
 
 import pytest
 
+from . import __main__ as recomp_main
 from . import config
+from . import manual_scan
 from .translator import BatchTranslator, FunctionTranslator, load_coalescences
 
 
@@ -121,6 +123,15 @@ def test_rejects_call_to_interior_even_with_incomplete_metadata():
     subject = translator(bytes.fromhex("e802000000eb00c3"), [BASE + 7])
     with pytest.raises(ValueError, match="called from"):
         subject.coalesce_function(BASE, BASE + 8, [BASE + 7])
+
+
+def test_rejects_register_call_to_interior_even_with_local_branch():
+    interior = BASE + 9
+    body = (b"\xb8" + interior.to_bytes(4, "little")
+            + bytes.fromhex("ffd0eb0040c3"))
+    subject = translator(body, [interior])
+    with pytest.raises(ValueError, match="called from"):
+        subject.coalesce_function(BASE, BASE + len(body), [interior])
 
 
 @pytest.mark.parametrize("padding", ["6690", "8d1b", "8da4240000000090"])
@@ -386,6 +397,16 @@ def test_direct_cfg_edge_preserves_register_target_in_both_modes():
     assert f"goto loc_{continuation:08X};" in code
 
 
+def test_default_translation_ignores_unreachable_register_clobber():
+    continuation = BASE + 11
+    body = (b"\xbb" + continuation.to_bytes(4, "little")
+            + bytes.fromhex("eb0231dbffe340c3"))
+    subject = translator(body, [])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert f"goto loc_{continuation:08X};" in code
+    assert f"loc_{continuation:08X}:" in code
+
+
 def test_resolved_register_edge_participates_in_join_proof():
     target = BASE + 18
     continuation = BASE + 20
@@ -551,6 +572,18 @@ def test_batch_protects_manual_function_start_before_coalescence(tmp_path):
             tmp_path, translator(), END, SPLITS,
             protected_function_starts={SPLITS[0]},
             seh_prolog=0, seh_epilog=0)
+
+
+def test_manual_protection_inputs_do_not_depend_on_split(tmp_path, monkeypatch):
+    manual = tmp_path / "manual.json"
+    manual.write_text(json.dumps([hex(BASE)]), encoding="utf-8")
+    scan_result = ({BASE + 1}, {BASE + 2}, {BASE + 3})
+    monkeypatch.setattr(manual_scan, "scan", lambda _: scan_result)
+
+    protected, result = recomp_main._load_manual_protection(manual, "manual-src")
+
+    assert result == scan_result
+    assert protected == {BASE, BASE + 1, BASE + 2, BASE + 3}
 
 
 @pytest.mark.parametrize("helper, body, split, call_code", [

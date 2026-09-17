@@ -75,6 +75,17 @@ def _load_addrs(path):
     return out
 
 
+def _load_manual_protection(manual_functions, exclude_manual):
+    """Load manual entry points before any destructive boundary repair."""
+    protected = _load_addrs(manual_functions)
+    scan_result = None
+    if exclude_manual:
+        from .manual_scan import scan as _scan_manual
+        scan_result = _scan_manual(exclude_manual)
+        protected.update(set().union(*scan_result))
+    return protected, scan_result
+
+
 def check_data_matches_binary(xbe_path, summary_path):
     """Refuse to lift one binary's code using another binary's disassembly.
 
@@ -229,15 +240,8 @@ def main():
     # once it is coalesced into its owner. Load hand-written entry points before
     # constructing BatchTranslator so coalescence cannot delete a symbol the
     # project implements, wraps, or references manually.
-    protected_function_starts = set()
-    manual_scan_result = None
-    if args.split:
-        protected_function_starts |= _load_addrs(args.manual_functions)
-        if args.exclude_manual:
-            from .manual_scan import scan as _scan_manual
-            manual_scan_result = _scan_manual(args.exclude_manual)
-            protected_function_starts.update(
-                set().union(*manual_scan_result))
+    protected_function_starts, manual_scan_result = _load_manual_protection(
+        args.manual_functions, args.exclude_manual)
 
     if args.game_name:
         config.set_game_name(args.game_name)
