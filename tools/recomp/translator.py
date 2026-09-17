@@ -1334,55 +1334,67 @@ class FunctionTranslator:
                         self.disasm.disassemble_function(raw_bytes, start, end))
         if not instructions:
             return [], []
-        # Addresses this function loads as immediates into a register and
-        # then jumps to. `mov ebx, 0x3A0DC; ... ; jmp ebx` is a continuation
-        # chain inside one function, and its targets need labels for the
-        # goto the lifter emits -- see _lift_jmp. Restricted to functions
-        # that actually contain a register-operand indirect jmp, so a plain
-        # `mov reg, <address of a function>` for a callback does not start
-        # splitting blocks everywhere.
-        imm_refs, computed_jump_edges = self._indirect_code_refs(
-            instructions, start, end, return_jump_edges=True)
-        self.lifter.imm_code_refs = imm_refs
-
-        computed_entries = set(imm_refs)
-        for targets in self.lifter.jump_table_targets.values():
-            computed_entries.update(t for t in targets if start <= t < end)
-        for insn in instructions:
-            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
-                targets = self.lifter._analyze_switch_table(insn.operands)
-                computed_entries.update(t for t in targets if start <= t < end)
-
         coalesced = start in self.coalesced_function_starts
-        extra_entries = computed_entries if coalesced else ()
-        debug_slide_int3s = self._debug_slide_int3s(
-            instructions, extra_entry_targets=extra_entries)
-        debug_slide_bypasses = (
-            self._debug_slide_bypasses(
-                instructions, extra_entry_targets=extra_entries)
-            if coalesced else {})
 
-        # Collect switch table targets as extra block leaders
-        switch_leaders = set(computed_entries)
-        switch_leaders.update(debug_slide_bypasses.values())
-        if coalesced:
-            instruction_starts = {insn.address for insn in instructions}
-            switch_leaders.update(
-                insn.end_address for insn in instructions
-                if (insn.mnemonic == "int3"
-                    and insn.end_address in instruction_starts))
+        def control_flow_census(decoded):
+            # Addresses this function loads into a register and then jumps to.
+            # These are local continuation labels, not separate functions.
+            imm_refs, computed_jump_edges = self._indirect_code_refs(
+                decoded, start, end, return_jump_edges=True)
+            computed_entries = set(imm_refs)
+            for targets in self.lifter.jump_table_targets.values():
+                computed_entries.update(t for t in targets if start <= t < end)
+            for insn in decoded:
+                if (insn.mnemonic == "jmp" and not insn.jump_target
+                        and insn.operands):
+                    targets = self.lifter._analyze_switch_table(insn.operands)
+                    computed_entries.update(
+                        t for t in targets if start <= t < end)
+
+            extra_entries = computed_entries if coalesced else ()
+            debug_slide_int3s = self._debug_slide_int3s(
+                decoded, extra_entry_targets=extra_entries)
+            debug_slide_bypasses = (
+                self._debug_slide_bypasses(
+                    decoded, extra_entry_targets=extra_entries)
+                if coalesced else {})
+
+            switch_leaders = set(computed_entries)
+            switch_leaders.update(debug_slide_bypasses.values())
+            if coalesced:
+                instruction_starts = {insn.address for insn in decoded}
+                switch_leaders.update(
+                    insn.end_address for insn in decoded
+                    if (insn.mnemonic == "int3"
+                        and insn.end_address in instruction_starts))
+            return (imm_refs, computed_jump_edges, debug_slide_int3s,
+                    debug_slide_bypasses, switch_leaders)
+
+        (imm_refs, computed_jump_edges, debug_slide_int3s,
+         debug_slide_bypasses, switch_leaders) = control_flow_census(instructions)
+
         # A switch target the decode never produced an instruction for cannot
         # become a block leader, so it gets no label and its `goto` is dropped
-        # as dead code -- the case then falls through to an unresolved indirect
-        # branch. That happens whenever the jump table sits in .text ahead of
-        # the code it points at: decoding the table as instructions leaves the
-        # stream misaligned across the first case. Re-decode, telling the
-        # disassembler where the real instruction boundaries are.
+        # as dead code. Re-decode at every newly discovered leader and refresh
+        # the computed-edge census until both describe the same instruction set.
         if recovered is None:
-            missing = switch_leaders - {insn.address for insn in instructions}
-            if missing:
+            resync = set()
+            while True:
+                missing = switch_leaders - {
+                    insn.address for insn in instructions}
+                new_missing = missing - resync
+                if not new_missing:
+                    break
+                resync.update(new_missing)
                 instructions = self.disasm.disassemble_function(
-                    raw_bytes, start, end, resync=missing)
+                    raw_bytes, start, end, resync=resync)
+                if not instructions:
+                    return [], []
+                (imm_refs, computed_jump_edges, debug_slide_int3s,
+                 debug_slide_bypasses,
+                 switch_leaders) = control_flow_census(instructions)
+
+        self.lifter.imm_code_refs = imm_refs
 
         # Build basic blocks
         blocks = self.disasm.build_basic_blocks(

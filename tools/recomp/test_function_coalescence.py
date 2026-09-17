@@ -318,6 +318,44 @@ def test_jump_table_can_follow_owned_code(jump, has_next_function):
     assert f"loc_{first_case + 2:08X}:" in code
 
 
+def test_resync_recomputes_register_jump_edges():
+    leader = BASE + 5
+    continuation = BASE + 7
+    raw = bytes.fromhex("ffe0909090ffe3c3")
+    subject = translator(raw, [])
+
+    original = subject.disasm.disassemble_function
+    full = original(raw, BASE, BASE + len(raw))
+    initial = [insn for insn in full if insn.address != leader]
+    calls = []
+
+    def recording_disasm(*args, **kwargs):
+        resync = set(kwargs.get("resync", ()))
+        calls.append(resync)
+        return full if resync else initial
+
+    def indirect_refs(decoded, start, end, proof_mode=False,
+                      return_jump_edges=False):
+        if any(insn.address == leader for insn in decoded):
+            refs = {continuation}
+            edges = {leader: {continuation}}
+        else:
+            refs = set()
+            edges = {BASE: {BASE + 2}}
+        return (refs, edges) if return_jump_edges else refs
+
+    subject.disasm.disassemble_function = recording_disasm
+    subject._indirect_code_refs = indirect_refs
+    subject.lifter._analyze_switch_table = lambda operands: [leader]
+
+    _, blocks = subject.decode_function(BASE, BASE + len(raw))
+
+    assert calls == [set(), {leader}]
+    case_block = next(block for block in blocks if block.start == leader)
+    assert continuation in case_block.successors
+    assert continuation in subject.lifter.imm_code_refs
+
+
 @pytest.mark.parametrize("table_index", [0, 1])
 @pytest.mark.parametrize("extra_code", [b"", bytes.fromhex("31c0")])
 def test_embedded_jump_table_is_data_coverage(table_index, extra_code):
