@@ -1,14 +1,26 @@
 # Xbox memory model on a POSIX host
 
-No game files are required -- the model reads an XBE only for its section
-header, so any XBE works and a synthetic one is enough. The test takes the path
-as its one argument, defaulting to `tools/conformance/test.xbe`.
+No game files are required: a synthetic XBE exercises every mapping check. The
+test takes the image path as its one argument, defaulting to
+`tools/conformance/test.xbe`.
 
 ```
 cmake -S tests/memory_layout_posix -B build/memory-layout
 cmake --build build/memory-layout
 ctest --test-dir build/memory-layout --output-on-failure
 ```
+
+A real title is still worth running, because the model does more than read
+section headers -- it copies each section's data to its Xbox VA, and some of
+what lands there is load-bearing. The kernel thunk table sits in `.rdata`, and
+a synthetic image has none, so only a real title shows whether imports resolve:
+
+```
+./build/memory-layout/memory_layout_posix_test game_files/default.xbe
+```
+
+Look for `Kernel thunks: N entries` in the output. `0 entries` on a real title
+means the image did not arrive intact, whatever the section tally says.
 
 If you have no XBE to hand, `tools/conformance/mkxbe.py` builds a synthetic one
 (five framed leaf functions in a minimal header). It is not on every branch; the

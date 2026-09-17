@@ -91,14 +91,37 @@ static int read_byte_in_child(const unsigned char *addr, unsigned char *out)
 }
 
 /* The model parses section layout from an XBE header; the synthetic one from
- * tools/conformance/mkxbe.py is enough to get through init. */
-static size_t load_xbe(const char *path, unsigned char *buf, size_t cap)
+ * tools/conformance/mkxbe.py is enough to get through init.
+ *
+ * Reads the whole file, however big. A fixed buffer is what this used to do,
+ * and a real title overran it: default.xbe is 4MB, the buffer was 1MB, and
+ * fread stopped at the cap without saying so. Every section's raw data lives
+ * past the first megabyte, so the loader copied nothing while still reporting
+ * "Loaded 17/17 sections", and the kernel thunk table -- which sits at the
+ * start of .rdata, 3.5MB in -- read back as zeroes. The truncation was
+ * indistinguishable from a title that imports no kernel functions. */
+static unsigned char *load_xbe(const char *path, size_t *out_len)
 {
     FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-    size_t n = fread(buf, 1, cap, f);
+    if (!f) return NULL;
+
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long len = ftell(f);
+    if (len <= 0) { fclose(f); return NULL; }
+    rewind(f);
+
+    unsigned char *buf = malloc((size_t)len);
+    if (!buf) { fclose(f); return NULL; }
+
+    size_t n = fread(buf, 1, (size_t)len, f);
     fclose(f);
-    return n;
+
+    /* A short read means the bytes the loader is about to be judged on are
+     * not the bytes on disk. Refuse rather than test a truncated image. */
+    if (n != (size_t)len) { free(buf); return NULL; }
+
+    *out_len = n;
+    return buf;
 }
 
 int main(int argc, char **argv)
@@ -108,14 +131,15 @@ int main(int argc, char **argv)
      * of which check reached it. */
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    static unsigned char xbe[1 << 20];
     const char *path = argc > 1 ? argv[1] : "tools/conformance/test.xbe";
-    size_t n = load_xbe(path, xbe, sizeof xbe);
-    if (!n) {
+    size_t n = 0;
+    unsigned char *xbe = load_xbe(path, &n);
+    if (!xbe) {
         fprintf(stderr, "cannot read %s -- run: python3 tools/conformance/mkxbe.py\n",
                 path);
         return 2;
     }
+    printf("XBE %s: %zu bytes\n", path, n);
 
     long host_page = sysconf(_SC_PAGESIZE);
     printf("host page size %ld, %d mirrors expected\n\n",
@@ -127,6 +151,7 @@ int main(int argc, char **argv)
           "base view unmappable: every try_bases[] entry is inside __PAGEZERO");
     if (!ok) {
         printf("\n%d failure(s); later checks need a live mapping.\n", failures);
+        free(xbe);
         return 1;
     }
 
@@ -223,5 +248,6 @@ int main(int argc, char **argv)
     }
 
     printf("\n%d failure(s)\n", failures);
+    free(xbe);
     return failures ? 1 : 0;
 }

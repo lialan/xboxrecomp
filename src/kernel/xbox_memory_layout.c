@@ -1266,6 +1266,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         DWORD sect_headers_va = *(const DWORD *)(xbe + XBE_SECTION_HEADERS_OFFSET);
         DWORD sect_headers_off = sect_headers_va - base_addr;
         int sections_loaded = 0;
+        int sections_short = 0;
         size_t total_bytes = 0;
 
         if (num_sections > 64) num_sections = 64;  /* sanity cap */
@@ -1299,9 +1300,27 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             /* Zero the full virtual size first (handles BSS) */
             memset(XBOX_VA(sec_va), 0, sec_vsize);
 
-            /* Copy initialized data from XBE */
-            if (copy_size > 0 && sec_raw_off + copy_size <= xbe_size) {
+            /*
+             * Copy initialized data from XBE.
+             *
+             * A section whose raw data runs past the end of the buffer is a
+             * truncated or corrupt image, not a BSS section, and it must not
+             * be counted among the sections loaded. Reporting it as loaded is
+             * how a 4MB title read through a 1MB buffer produced "Loaded
+             * 17/17 sections" with every byte of every section still zero --
+             * including the kernel thunk table, which then resolved 0 imports
+             * and looked like a title that calls no kernel functions.
+             */
+            int have_data = (copy_size == 0) ||
+                            (sec_raw_off + copy_size <= xbe_size);
+            if (copy_size > 0 && have_data) {
                 memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
+            } else if (!have_data) {
+                fprintf(stderr,
+                        "  WARNING: section %u (%s) raw data 0x%08X+%u runs past "
+                        "the %zu-byte image -- left zeroed\n",
+                        si, sec_name, sec_raw_off, copy_size, xbe_size);
+                sections_short++;
             }
 
             /* Every loaded section, executable or not. Anything that writes
@@ -1323,8 +1342,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     g_xbox_code_hi = sec_va + sec_vsize;
             }
 
-            sections_loaded++;
-            total_bytes += copy_size;
+            if (have_data) {
+                sections_loaded++;
+                total_bytes += copy_size;
+            }
 
             fprintf(stderr, "  [%2u] %-12s VA=0x%08X vsize=%-8u raw=0x%08X rsize=%-8u%s\n",
                     si, sec_name, sec_va, sec_vsize, sec_raw_off, sec_raw_size,
@@ -1333,6 +1354,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
         fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
                 sections_loaded, num_sections, total_bytes);
+        if (sections_short) {
+            fprintf(stderr,
+                    "  ERROR: %d section(s) had no data in the image -- the XBE "
+                    "is truncated or was read short; the title will not run\n",
+                    sections_short);
+        }
     }
 
     /*
