@@ -43,6 +43,29 @@ def test_normalize_functions_preserves_keyed_addresses_and_entry_evidence():
     assert functions[0x3000]["end"] == 0x3010
 
 
+def test_normalize_functions_skips_non_address_keys():
+    assert _normalize_functions({"metadata": {"size": 4}}) == {}
+
+
+def test_inventory_recovers_missing_static_callback(monkeypatch):
+    raw = bytearray(b"\xcc" * 0x31)
+    # mov esi, 0x1040; mov edi, 0x1044; cmp esi, edi; call eax; ret
+    raw[:15] = bytes.fromhex("be40100000bf4410000039feffd0c3")
+    raw[0x20:0x26] = bytes.fromhex("b801000000c3")
+    raw[0x30] = 0xc3
+    raw.extend(b"\0" * (0x44 - len(raw)))
+    raw[0x40:0x44] = bytes.fromhex("20100000")
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", 0x1000, len(raw), 0, len(raw), True),
+    ])
+    functions = _normalize_functions([
+        {"start": 0x1000, "end": 0x100f, "section": ".text"},
+        {"start": 0x1030, "end": 0x1031, "section": ".text"},
+    ])
+    records = collect_blocks(bytes(raw), functions)
+    assert any(record.start == record.owner == 0x1020 for record in records)
+
+
 def test_inventory_recovers_split_switch_ownership(monkeypatch):
     raw = bytearray(b"\xcc" * 0x31)
     raw[:12] = bytes.fromhex("83f8017723ff248510100000")

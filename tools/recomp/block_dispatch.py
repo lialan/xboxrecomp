@@ -48,6 +48,11 @@ def _normalize_functions(raw):
     for key, item in items:
         if not isinstance(item, dict):
             continue
+        if not any(field in item for field in ("start", "address", "_addr")):
+            try:
+                key = _parse_addr(key)
+            except (TypeError, ValueError):
+                continue
         start = _parse_addr(item.get("start", item.get("address", item.get("_addr", key))))
         if "end" in item:
             end = _parse_addr(item["end"])
@@ -56,7 +61,7 @@ def _normalize_functions(raw):
             # rather than {start, end}.  Treat both shapes equivalently.
             end = start + _parse_addr(item.get("size", 0))
         if start and end > start:
-            out[start] = {**item, "start": start, "end": end}
+            out[start] = {**item, "_addr": start, "start": start, "end": end}
     return dict(sorted(out.items()))
 
 
