@@ -33,7 +33,7 @@ MSVC generator and fails under Ninja or Unix Makefiles.
 
 The model maps 64 MB at a base address and then 28 mirror views of the same
 pages at 64 MB intervals, because the console's 26-bit address bus wraps: guest
-`0x04070000` has to read what `0x00070000` holds. Four properties, each naming a
+`0x04070000` has to read what `0x00070000` holds. Five properties, each naming a
 distinct way that went wrong on arm64 macOS:
 
 1. **`xbox_MemoryLayoutInit` succeeds.** Every entry in `try_bases[]` sits below
@@ -49,6 +49,13 @@ distinct way that went wrong on arm64 macOS:
    out-of-range write actually depends on.
 4. **Shutdown then re-init works**, so teardown releases every view rather than
    leaving addresses claimed.
+5. **`RECOMP_TRAP_NULL` actually traps, and leaves the TIB standing.** Both
+   halves matter. The guard is applied at host page granularity, so on a
+   16 KB-page host a request to protect guest page zero covers guest
+   `0..0x3FFF`; with the TIB at `0x1000` that killed init, so the guard
+   disabled itself and the diagnostic silently did nothing on every Apple
+   Silicon host. Asserting only "page zero faults" would be satisfied by a fix
+   that traps it and clobbers the TIB, which is why the TIB is checked too.
 
 Deliberately not asserted: the tiled aperture at `0xF0000000`. That is a
 specific architectural alias the layout protects by sacrificing a wrap mirror,

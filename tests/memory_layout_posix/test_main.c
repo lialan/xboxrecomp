@@ -247,6 +247,52 @@ int main(int argc, char **argv)
         xbox_MemoryLayoutShutdown();
     }
 
+    /*
+     * 5. RECOMP_TRAP_NULL has to actually trap.
+     *
+     * The guard is opt-in, and on a 16 KB-page host it currently opts itself
+     * back out: protecting guest page zero is done at host page granularity,
+     * so the 4 KB request covers guest 0..0x3FFF and takes XBOX_TIB_MAIN at
+     * 0x1000 with it. Init writes the TIB moments later and the run dies, so
+     * the code declines to install the guard at all.
+     *
+     * Declining is not the same as working. On every Apple Silicon host the
+     * diagnostic silently does nothing: a guest null dereference reads zero
+     * and the bug surfaces somewhere else entirely, which is the failure the
+     * guard exists to catch. Both halves are asserted here, because a fix
+     * that traps page zero by clobbering the TIB is not a fix.
+     */
+    {
+        setenv("RECOMP_TRAP_NULL", "1", 1);
+        BOOL trapped = xbox_MemoryLayoutInit(xbe, n);
+        check(trapped, "init succeeds with RECOMP_TRAP_NULL set",
+              "the guard must not cost the run");
+
+        if (trapped) {
+            unsigned char *b = (unsigned char *)xbox_GetMemoryBase();
+            unsigned char got = 0;
+
+            /* Guest address 0 must fault. Today it reads back as zero. */
+            check(!read_byte_in_child(b + 0, &got),
+                  "RECOMP_TRAP_NULL faults on a read of guest address 0",
+                  "page zero is readable, so the guard never installed");
+
+            /* ...and the TIB must survive it. The first dword of the TIB is
+             * the SEH chain terminator, 0xFFFFFFFF, so its low byte is 0xFF;
+             * a zero here means the protect reached past page zero and the
+             * TIB was never written. */
+            unsigned char tib = 0;
+            int tib_ok = read_byte_in_child(b + XBOX_FS_BASE, &tib);
+            check(tib_ok && tib == 0xFF,
+                  "the TIB is intact with RECOMP_TRAP_NULL set",
+                  tib_ok ? "TIB reads zero -- the trap clobbered it"
+                         : "TIB is unmapped -- the trap covered it");
+
+            xbox_MemoryLayoutShutdown();
+        }
+        unsetenv("RECOMP_TRAP_NULL");
+    }
+
     printf("\n%d failure(s)\n", failures);
     free(xbe);
     return failures ? 1 : 0;

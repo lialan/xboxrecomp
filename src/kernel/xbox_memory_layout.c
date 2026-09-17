@@ -1190,14 +1190,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Best-effort: failing to protect it costs only the diagnostic. */
     if (XBOX_MAP_START == 0 && getenv("RECOMP_TRAP_NULL")) {
         DWORD old_protect;
-        /* Protection is applied at host page granularity, and the host page is
-         * not always the guest's 4 KB -- Apple Silicon uses 16 KB. Asking to
-         * protect one guest page there actually protects four, which reaches
-         * XBOX_TIB_MAIN at guest 0x1000 and takes the TIB with it. Since init
-         * writes the TIB moments later, enabling this on such a host crashed
-         * the run before it started. Skip rather than trap when the guard
-         * cannot be confined to page zero: this is an opt-in diagnostic, and
-         * losing it is better than breaking every run that asks for it. */
+        /* Protection is applied at host page granularity, and the host page
+         * is not always the guest's 4 KB -- Apple Silicon uses 16 KB, so this
+         * 0x1000 request actually covers guest 0..0x3FFF. That is why
+         * XBOX_TIB_MAIN sits at 0x4000: the widest page any supported host
+         * uses fits below the TIB, so the rounding costs nothing and the
+         * guard installs everywhere.
+         *
+         * The check below is what remains of an earlier bug rather than dead
+         * code. With the TIB at 0x1000 the rounding reached it, init wrote the
+         * TIB moments later, and every run that asked for the guard died at
+         * startup -- so the guard disabled itself on all of Apple Silicon and
+         * the diagnostic silently did nothing. It stays as a floor for a host
+         * with pages wider than the TIB offset, where skipping really is
+         * better than breaking the run. */
         long host_page = sysconf(_SC_PAGESIZE);
         if (host_page > 0 && (uint32_t)host_page > XBOX_TIB_MAIN) {
             fprintf(stderr, "  RECOMP_TRAP_NULL: not available -- the host page "
