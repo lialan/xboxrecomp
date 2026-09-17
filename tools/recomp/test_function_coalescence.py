@@ -56,6 +56,14 @@ def test_repaired_clamp_matches_unsplit_translation():
     assert split.func_db[BASE]["detection_method"] == "external_coalescence"
 
 
+def test_rejects_previously_coalesced_interior_owner():
+    subject = translator()
+    subject.coalesce_function(SPLITS[0], END, SPLITS[1:])
+    assert subject.func_db[SPLITS[0]]["detection_method"] == "external_coalescence"
+    with pytest.raises(ValueError, match="independent evidence"):
+        subject.coalesce_function(BASE, END, [SPLITS[0]])
+
+
 def test_removes_stale_fragment_ownership():
     subject = translator()
     subject._recovered_cfg[SPLITS[0]] = {"end": END}
@@ -405,6 +413,17 @@ def test_default_translation_ignores_unreachable_register_clobber():
     code = subject.translate_function(BASE, subject.func_db[BASE])
     assert f"goto loc_{continuation:08X};" in code
     assert f"loc_{continuation:08X}:" in code
+
+
+def test_register_jump_edge_preserves_flag_state():
+    target = BASE + 10
+    body = (bytes.fromhex("83f805")
+            + b"\xbb" + target.to_bytes(4, "little")
+            + bytes.fromhex("ffe37d05b805000000c3"))
+    subject = translator(body, [])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert f"goto loc_{target:08X};" in code
+    assert "if (_flags /* jge" not in code
 
 
 def test_resolved_register_edge_participates_in_join_proof():

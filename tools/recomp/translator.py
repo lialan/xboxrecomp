@@ -475,7 +475,8 @@ class FunctionTranslator:
                       "seed_vtable_thunk", "static_indirect_table",
                       "prologue", "prologue_alt",
                       "tail_jump_target", "tail_jump_alias",
-                      "imm_ref_target", "data_ptr_target")]
+                      "imm_ref_target", "data_ptr_target",
+                      "external_coalescence")]
         if strong:
             reject(
                 f"interior start 0x{strong[0]:08X} has independent evidence")
@@ -1020,7 +1021,7 @@ class FunctionTranslator:
 
     @staticmethod
     def _indirect_code_refs(instructions, start, end, proof_mode=False,
-                            return_call_refs=False):
+                            return_call_refs=False, return_jump_edges=False):
         """Immediate continuations used by register-jump dispatch.
 
         Track constants along reachable CFG paths in both modes. Normal
@@ -1031,6 +1032,16 @@ class FunctionTranslator:
         """
         refs = set()
         call_refs = set()
+        jump_edges = {}
+
+        def pack_result():
+            if return_call_refs and return_jump_edges:
+                return refs, call_refs, jump_edges
+            if return_call_refs:
+                return refs, call_refs
+            if return_jump_edges:
+                return refs, jump_edges
+            return refs
         aliases = {
             "eax": "eax", "ax": "eax", "al": "eax", "ah": "eax",
             "ebx": "ebx", "bx": "ebx", "bl": "ebx", "bh": "ebx",
@@ -1138,7 +1149,7 @@ class FunctionTranslator:
         # translation may keep the union of per-edge targets for dispatch labels.
         ordered = sorted(instructions, key=lambda insn: insn.address)
         if not ordered or ordered[0].address != start:
-            return (refs, call_refs) if return_call_refs else refs
+            return pack_result()
         by_address = {insn.address: insn for insn in ordered}
         fallthrough = {}
         for current, following in zip(ordered, ordered[1:]):
@@ -1222,6 +1233,7 @@ class FunctionTranslator:
                 target = jump_target_from(insn, incoming)
                 if target is not None:
                     refs.add(target)
+                    jump_edges.setdefault(address, set()).add(target)
             else:
                 # Translation only needs a conservative target census. Keep
                 # every target proven on an incoming CFG edge so unreachable
@@ -1230,6 +1242,7 @@ class FunctionTranslator:
                     target = jump_target_from(insn, contribution)
                     if target is not None:
                         refs.add(target)
+                        jump_edges.setdefault(address, set()).add(target)
 
             if return_call_refs:
                 # A single proven path to an indirect call is independent entry
@@ -1239,7 +1252,7 @@ class FunctionTranslator:
                     if target is not None:
                         call_refs.add(target)
 
-        return (refs, call_refs) if return_call_refs else refs
+        return pack_result()
 
     @staticmethod
     def _debug_slide_int3s(instructions, include_direct_targets=False,
@@ -1316,7 +1329,8 @@ class FunctionTranslator:
         # that actually contain a register-operand indirect jmp, so a plain
         # `mov reg, <address of a function>` for a callback does not start
         # splitting blocks everywhere.
-        imm_refs = self._indirect_code_refs(instructions, start, end)
+        imm_refs, computed_jump_edges = self._indirect_code_refs(
+            instructions, start, end, return_jump_edges=True)
         self.lifter.imm_code_refs = imm_refs
 
         computed_entries = set(imm_refs)
@@ -1363,6 +1377,14 @@ class FunctionTranslator:
             instructions, start, end,
             extra_leaders=switch_leaders if switch_leaders else None,
             stop_mnemonics=("ud2", "hlt") if coalesced else ())
+        block_starts = {block.start for block in blocks}
+        for block in blocks:
+            last = block.last_insn
+            if last is None:
+                continue
+            for target in computed_jump_edges.get(last.address, ()):
+                if target in block_starts and target not in block.successors:
+                    block.successors.append(target)
         if coalesced:
             for block in blocks:
                 bypass = (debug_slide_bypasses.get(block.last_insn.address)
@@ -1710,6 +1732,9 @@ class FunctionTranslator:
             if bypass in preds:
                 preds[bypass].add(bb.start)
                 continue
+            for successor in bb.successors:
+                if successor in preds:
+                    preds[successor].add(bb.start)
             if last.jump_target in preds:
                 preds[last.jump_target].add(bb.start)
             # A conditional jump also falls through; ret and an unconditional
