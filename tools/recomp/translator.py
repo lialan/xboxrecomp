@@ -517,7 +517,7 @@ class FunctionTranslator:
         if any(instruction.mnemonic == "jmp" and not instruction.jump_target
                and instruction.operands
                and instruction.operands[0].type == "mem"
-               and instruction.operands[0].mem_seg
+               and instruction.operands[0].mem_seg == "fs"
                for instruction in instructions):
             reject("segmented indirect jump cannot prove local ownership")
         computed_jump_edges = self._computed_jump_edges(
@@ -864,9 +864,9 @@ class FunctionTranslator:
                 if not insn.operands or insn.operands[0].type != "mem":
                     continue
                 operand = insn.operands[0]
-                if operand.mem_seg:
+                if operand.mem_seg == "fs":
                     # Segment-relative memory does not use mem_disp as a linear
-                    # Xbox VA (notably fs: adds XBOX_FS_BASE at runtime). Never
+                    # Xbox VA because fs: adds XBOX_FS_BASE at runtime. Never
                     # use the raw displacement as destructive table evidence.
                     continue
                 if not (operand.mem_index or operand.mem_base):

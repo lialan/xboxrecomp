@@ -216,6 +216,33 @@ def test_segmented_jump_table_is_not_coalescence_evidence(monkeypatch):
         subject.coalesce_function(BASE, end, [first_case, second_case])
 
 
+def test_flat_segment_jump_table_still_recovers(monkeypatch):
+    table = BASE + 0x1000
+    first_case = BASE + 8
+    second_case = BASE + 10
+    end = BASE + 12
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", BASE, 0x400, 0, 0x400, True),
+        config.Section(".rdata", table, 0x100, 0x400, 0x100, False),
+    ])
+    image = bytearray(b"\xcc" * 0x500)
+    image[:12] = (bytes.fromhex("2eff2485") + table.to_bytes(4, "little")
+                  + bytes.fromhex("40c34bc3"))
+    image[0x400:0x408] = (
+        first_case.to_bytes(4, "little")
+        + second_case.to_bytes(4, "little"))
+    subject = FunctionTranslator(bytes(image), {
+        BASE: function(BASE, first_case),
+        first_case: function(first_case, second_case),
+        second_case: function(second_case, end),
+    })
+
+    subject.coalesce_function(BASE, end, [first_case, second_case])
+
+    assert subject._recovered_cfg[BASE]["jump_tables"][table] == [
+        first_case, second_case]
+
+
 def test_segmented_memory_store_does_not_alias_plain_indirect_call():
     interior = BASE + 13
     body = (bytes.fromhex("64c70424") + interior.to_bytes(4, "little")
