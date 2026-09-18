@@ -278,6 +278,15 @@ def test_push_register_tracks_new_stack_indirect_call_target():
         subject.coalesce_function(BASE, BASE + len(body), [interior])
 
 
+def test_pop_carried_target_is_indirect_call_evidence():
+    interior = BASE + 10
+    body = (b"\x68" + interior.to_bytes(4, "little")
+            + bytes.fromhex("58ffd0eb00c3"))
+    subject = translator(body, [interior])
+    with pytest.raises(ValueError, match="called from"):
+        subject.coalesce_function(BASE, BASE + len(body), [interior])
+
+
 def test_push_invalidates_other_symbolic_stack_slots():
     interior = BASE + 13
     body = (bytes.fromhex("c745fc") + interior.to_bytes(4, "little")
@@ -520,6 +529,59 @@ def test_coalescence_recovers_external_jump_table(monkeypatch):
     code = subject.translate_function(BASE, subject.func_db[BASE])
     assert f"loc_{first_case:08X}:" in code
     assert f"loc_{second_case:08X}:" in code
+
+
+def test_coalescence_rejects_non_dword_jump_table_stride(monkeypatch):
+    table = BASE + 0x1000
+    first_case = BASE + 7
+    second_case = BASE + 9
+    end = BASE + 11
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", BASE, 0x400, 0, 0x400, True),
+        config.Section(".rdata", table, 0x100, 0x400, 0x100, False),
+    ])
+    image = bytearray(b"\xcc" * 0x500)
+    image[:11] = (bytes.fromhex("ff24c5") + table.to_bytes(4, "little")
+                  + bytes.fromhex("40c34bc3"))
+    image[0x400:0x408] = (
+        first_case.to_bytes(4, "little")
+        + second_case.to_bytes(4, "little"))
+    subject = FunctionTranslator(bytes(image), {
+        BASE: function(BASE, first_case),
+        first_case: function(first_case, second_case),
+        second_case: function(second_case, end),
+    })
+
+    with pytest.raises(ValueError, match="not the requested end"):
+        subject.coalesce_function(BASE, end, [first_case, second_case])
+
+
+def test_static_callback_rescan_uses_recovered_cfg():
+    table = BASE + 0x300
+    callback = BASE + 0x80
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[0] = 0xC3
+    raw[0x80] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        callback: function(callback, callback + 1),
+    })
+    subject._recovered_cfg[BASE] = {
+        "end": BASE + len(pattern),
+        "instructions": subject.disasm.disassemble_function(
+            pattern, BASE, BASE + len(pattern)),
+        "jump_tables": {},
+    }
+
+    subject.discover_static_indirect_targets(coalescing=True)
+
+    assert subject.func_db[callback]["called_by"] == [f"0x{BASE:08X}"]
 
 
 def test_jump_table_case_can_recover_register_continuation():
@@ -765,6 +827,25 @@ def test_register_jump_edge_preserves_flag_state():
     assert "if (_flags /* jge" not in code
 
 
+def test_backward_computed_edge_preserves_flag_state():
+    target = BASE + 2
+    done = BASE + 9
+    compare = BASE + 10
+    body = (bytes.fromhex("eb08")
+            + bytes.fromhex("7d05b801000000c3")
+            + bytes.fromhex("83f805")
+            + b"\xbb" + target.to_bytes(4, "little")
+            + bytes.fromhex("ffe3"))
+    subject = translator(body, [])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+
+    assert f"goto loc_{target:08X};" in code
+    target_body = code.split(f"loc_{target:08X}:", 1)[1]
+    target_body = target_body.split(f"loc_{done:08X}:", 1)[0]
+    assert "CMP_GE(" in target_body
+    assert "if (_flags /* jge" not in target_body
+
+
 def test_resolved_register_edge_participates_in_join_proof():
     target = BASE + 18
     continuation = BASE + 20
@@ -930,6 +1011,15 @@ def test_batch_protects_manual_function_start_before_coalescence(tmp_path):
             tmp_path, translator(), END, SPLITS,
             protected_function_starts={SPLITS[0]},
             seh_prolog=0, seh_epilog=0)
+
+
+@pytest.mark.parametrize("helper", ["seh_prolog", "seh_epilog"])
+def test_batch_protects_explicit_seh_override_before_coalescence(
+        tmp_path, helper):
+    with pytest.raises(ValueError, match="protected by manual code"):
+        batch_translator(
+            tmp_path, translator(), END, SPLITS,
+            **{helper: SPLITS[0]})
 
 
 def test_manual_protection_inputs_do_not_depend_on_split(tmp_path, monkeypatch):

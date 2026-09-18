@@ -358,11 +358,16 @@ class FunctionTranslator:
 
         for caller, func_info in list(self.func_db.items()):
             end = func_info.get("end", caller)
-            raw_bytes = self._read_func_bytes(caller, end)
-            if not raw_bytes:
-                continue
-            instructions = self.disasm.disassemble_function(
-                raw_bytes, caller, end)
+            recovered = self._recovered_cfg.get(caller)
+            if recovered and recovered.get("instructions"):
+                end = recovered.get("end", end)
+                instructions = recovered["instructions"]
+            else:
+                raw_bytes = self._read_func_bytes(caller, end)
+                if not raw_bytes:
+                    continue
+                instructions = self.disasm.disassemble_function(
+                    raw_bytes, caller, end)
             for lower, upper in self._find_static_indirect_ranges(instructions):
                 targets = self._read_static_callback_table(
                     lower, upper, original_starts)
@@ -875,6 +880,12 @@ class FunctionTranslator:
                     continue
                 if operand.mem_base and not coalescing:
                     continue
+                if operand.mem_index and operand.mem_scale != 4:
+                    # Destructive ownership proof only understands a dword
+                    # pointer table indexed by entry number. Other SIB scales
+                    # can skip/interleave dwords, so scanning every 4 bytes
+                    # would invent case targets that runtime cannot select.
+                    continue
                 table_va = operand.mem_disp
                 if va_to_file_offset(table_va) is None:
                     continue
@@ -1184,6 +1195,15 @@ class FunctionTranslator:
             preserved_writes = set()
             pushed_value = (pushed_value_from(operands, constants)
                             if insn.mnemonic == "push" else None)
+            popped_value = None
+            pop_destination = None
+            if (insn.mnemonic == "pop" and operands
+                    and operands[0].type == "reg"
+                    and operands[0].reg in full_registers):
+                pop_destination = aliases.get(
+                    operands[0].reg, operands[0].reg)
+                popped_value = constants.get(
+                    ("mem", None, "esp", None, 1, 0, 4))
             if (insn.mnemonic == "mov" and len(operands) >= 2
                     and operands[0].type == "reg"):
                 raw_destination = operands[0].reg
@@ -1248,6 +1268,9 @@ class FunctionTranslator:
                 clear_memory(constants)
                 if pushed_value is not None:
                     constants[("mem", None, "esp", None, 1, 0, 4)] = pushed_value
+
+            if pop_destination is not None and popped_value is not None:
+                constants[pop_destination] = popped_value
 
             if (operands and operands[0].type == "mem"
                     and insn.mnemonic not in non_writers
@@ -2245,6 +2268,9 @@ class BatchTranslator:
             trace_functions=trace_functions)
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
+        for explicit_helper in (seh_prolog, seh_epilog):
+            if explicit_helper not in (None, 0):
+                self.translator.protected_function_starts.add(explicit_helper)
         if coalesce_json_paths:
             self.translator.discover_static_indirect_targets(coalescing=True)
             for path in coalesce_json_paths:
