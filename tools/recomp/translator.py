@@ -708,7 +708,7 @@ class FunctionTranslator:
                         and upper % 4 == 0 and upper - lower <= max_bytes):
                     ranges.add((lower, upper))
             elif (insn.is_call and insn.call_target is None
-                    and operands and operands[0].type == "reg"):
+                    and operands and operands[0].type in ("reg", "mem")):
                 has_indirect_call = True
 
         return sorted(ranges) if has_indirect_call else []
@@ -838,10 +838,12 @@ class FunctionTranslator:
         entry_points = {start, *bridge_targets}
         jump_tables = {}
         while True:
+            stop_mnemonics = (("int3", "ud2", "hlt", "iret", "iretd")
+                              if coalescing else ("iret", "iretd"))
             instructions = self.disasm.disassemble_cfg(
                 raw_bytes, start, upper, entry_points,
                 stop_addresses=stop_addresses,
-                stop_mnemonics=("int3", "ud2", "hlt") if coalescing else ())
+                stop_mnemonics=stop_mnemonics)
             changed = False
             if coalescing:
                 computed_jump_edges = self._computed_jump_edges(
@@ -1356,7 +1358,7 @@ class FunctionTranslator:
         debug_slides = FunctionTranslator._debug_slide_int3s(ordered)
 
         def static_successors(insn):
-            if (insn.is_ret or insn.mnemonic in ("ud2", "hlt")
+            if (insn.is_ret or insn.mnemonic in ("ud2", "hlt", "iret", "iretd")
                     or (insn.mnemonic == "int3"
                         and insn.address not in debug_slides)):
                 return ()
@@ -1666,7 +1668,8 @@ class FunctionTranslator:
         blocks = self.disasm.build_basic_blocks(
             instructions, start, end,
             extra_leaders=switch_leaders if switch_leaders else None,
-            stop_mnemonics=("ud2", "hlt") if coalesced else ())
+            stop_mnemonics=("ud2", "hlt", "iret", "iretd")
+            if coalesced else ("iret", "iretd"))
         block_starts = {block.start for block in blocks}
         for block in blocks:
             last = block.last_insn
@@ -1760,7 +1763,7 @@ class FunctionTranslator:
                                and last_insn.address in debug_slide_int3s)
         continues_past_end = last_is_debug_slide or not (
             last_insn.is_terminator
-            or last_insn.mnemonic in ("int3", "ud2", "hlt"))
+            or last_insn.mnemonic in ("int3", "ud2", "hlt", "iret", "iretd"))
         fallthrough_target = None
         bypasses_to_end = end in debug_slide_bypasses.values()
         if ((continues_past_end or bypasses_to_end) and end in self.func_db
@@ -2016,7 +2019,8 @@ class FunctionTranslator:
                 preds[last.jump_target].add(bb.start)
             # A conditional jump also falls through; ret and an unconditional
             # jmp do not.
-            leaves = (last.is_ret or last.mnemonic in ("jmp", "ud2", "hlt")
+            leaves = (last.is_ret or last.mnemonic in (
+                "jmp", "ud2", "hlt", "iret", "iretd")
                       or (last.mnemonic == "int3"
                           and last.address not in debug_slide_int3s))
             if not leaves and i + 1 < len(blocks):
@@ -2098,7 +2102,10 @@ class FunctionTranslator:
             if bypass is not None:
                 lines.append(
                     f"    goto loc_{bypass:08X}; /* int 0x2d skips slide int3 */")
-            if (start in self.coalesced_function_starts
+            if bb.last_insn.mnemonic in ("iret", "iretd"):
+                lines.append(
+                    "    return; /* interrupt return terminates translated control flow */")
+            elif (start in self.coalesced_function_starts
                     and (bb.last_insn.mnemonic in ("ud2", "hlt")
                          or (bb.last_insn.mnemonic == "int3"
                              and bb.last_insn.address not in debug_slide_int3s))):

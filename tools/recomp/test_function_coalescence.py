@@ -160,6 +160,21 @@ def test_rejects_memory_indirect_call_to_interior():
         subject.coalesce_function(BASE, BASE + len(body), [interior])
 
 
+def test_rejects_bounded_memory_indirect_callback_to_interior():
+    table = BASE + 0x300
+    interior = BASE + 16
+    body = (b"\xbe" + table.to_bytes(4, "little")
+            + b"\xbf" + (table + 4).to_bytes(4, "little")
+            + bytes.fromhex("39feff16eb00c3"))
+    subject = translator(body, [interior])
+    raw = bytearray(subject.xbe_data)
+    raw[0x300:0x304] = interior.to_bytes(4, "little")
+    subject.xbe_data = bytes(raw)
+
+    with pytest.raises(ValueError, match="callback"):
+        subject.coalesce_function(BASE, BASE + len(body), [interior])
+
+
 def test_rejects_spilled_reload_register_call_to_interior():
     interior = BASE + 16
     body = (bytes.fromhex("c7442404") + interior.to_bytes(4, "little")
@@ -370,6 +385,21 @@ def test_traps_do_not_prove_reachability_of_a_following_entry(trap, has_other_ed
         with pytest.raises(ValueError, match="not the requested end"):
             subject.coalesce_function(BASE, end, [interior])
         assert subject.func_db == before
+
+
+@pytest.mark.parametrize("iret", ["cf", "66cf"])
+def test_interrupt_return_is_terminal_for_recovery_and_emission(iret):
+    iret = bytes.fromhex(iret)
+    interior = BASE + len(iret)
+    body = iret + bytes.fromhex("40c3")
+    subject = translator(body, [interior])
+
+    with pytest.raises(ValueError, match="not the requested end"):
+        subject.coalesce_function(BASE, BASE + len(body), [interior])
+
+    whole = translator(body, [])
+    code = whole.translate_function(BASE, whole.func_db[BASE])
+    assert "interrupt return terminates translated control flow" in code
 
 
 def test_xbox_int2d_int3_slide_preserves_fallthrough():
