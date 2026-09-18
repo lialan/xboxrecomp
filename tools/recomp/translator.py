@@ -761,6 +761,11 @@ class FunctionTranslator:
             strong_starts.sort()
             weak_starts = sorted(weak_by_section.get(section, []))
             for index, start in enumerate(strong_starts[:-1]):
+                # Explicit coalescence already established this owner's exact
+                # extent. Keep it as a strong boundary for neighboring owners,
+                # but never use it as a seed for heuristic re-expansion.
+                if start in self.coalesced_function_starts:
+                    continue
                 original_end = self.func_db[start].get("end", start)
                 upper = strong_starts[index + 1]
                 if original_end >= upper:
@@ -860,12 +865,25 @@ class FunctionTranslator:
                 if operand.mem_base and not coalescing:
                     continue
                 table_va = operand.mem_disp
-                if not (start <= table_va < upper):
+                if va_to_file_offset(table_va) is None:
                     continue
+                embedded = start <= table_va < upper
+                if not embedded:
+                    table_section = next((
+                        section for section in _config._SECTIONS
+                        if (section.va <= table_va
+                            and table_va + 4 <= section.va + section.raw_size)
+                    ), None)
+                    # Outside the owner's analysis extent, only accept a
+                    # mapped data-section table. Arbitrary bytes in another
+                    # code region are not strong enough deletion evidence.
+                    if table_section is None or table_section.is_code:
+                        continue
                 # Embedded tables must not absorb the jump's own displacement
                 # (or other decoded code) when scanning backward from the base.
-                minimum = max((i.end_address for i in instructions
-                               if i.end_address <= table_va), default=start)
+                minimum = (max((i.end_address for i in instructions
+                                if i.end_address <= table_va), default=start)
+                           if embedded else table_va)
                 targets = self._read_local_jump_table(
                     table_va, start, upper,
                     min_entry_va=minimum if coalescing else None)
@@ -1120,8 +1138,9 @@ class FunctionTranslator:
         def memory_key(operand):
             if operand.type != "mem":
                 return None
-            return ("mem", operand.mem_base, operand.mem_index,
-                    operand.mem_scale, operand.mem_disp)
+            return ("mem", operand.mem_seg, operand.mem_base,
+                    operand.mem_index, operand.mem_scale,
+                    operand.mem_disp, operand.mem_size)
 
         def memory_keys(constants):
             return [key for key in constants
@@ -1133,13 +1152,27 @@ class FunctionTranslator:
 
         def clear_memory_using_register(constants, register):
             for key in memory_keys(constants):
-                if register in key[1:3]:
+                if register in key[2:4]:
                     constants.pop(key, None)
+
+        def pushed_value_from(operands, constants):
+            if not operands:
+                return None
+            source = operands[0]
+            if source.type == "imm":
+                return source.imm
+            if source.type == "reg" and source.reg in full_registers:
+                return constants.get(source.reg)
+            if source.type == "mem" and source.mem_size == 4:
+                return constants.get(memory_key(source))
+            return None
 
         def transfer(insn, incoming):
             constants = dict(incoming)
             operands = insn.operands
             preserved_writes = set()
+            pushed_value = (pushed_value_from(operands, constants)
+                            if insn.mnemonic == "push" else None)
             if (insn.mnemonic == "mov" and len(operands) >= 2
                     and operands[0].type == "reg"):
                 raw_destination = operands[0].reg
@@ -1185,9 +1218,21 @@ class FunctionTranslator:
 
             for written in getattr(insn, "regs_written", ()):
                 register = aliases.get(written, written)
+                if register in full_registers:
+                    # A tracked symbolic slot [reg+...] names a different
+                    # address after *any* assignment to that register, even
+                    # when the new register value itself remains provable.
+                    clear_memory_using_register(constants, register)
                 if register in full_registers and register not in preserved_writes:
                     constants.pop(register, None)
-                    clear_memory_using_register(constants, register)
+
+            if insn.mnemonic == "push":
+                # PUSH writes the guest stack through the newly decremented ESP.
+                # Without concrete alias analysis, conservatively forget every
+                # prior spill fact, then model only the new dword at [esp].
+                clear_memory(constants)
+                if pushed_value is not None:
+                    constants[("mem", None, "esp", None, 1, 0, 4)] = pushed_value
 
             if (operands and operands[0].type == "mem"
                     and insn.mnemonic not in non_writers

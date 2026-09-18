@@ -160,6 +160,54 @@ def test_rejects_memory_indirect_call_to_interior():
         subject.coalesce_function(BASE, BASE + len(body), [interior])
 
 
+def test_segmented_memory_store_does_not_alias_plain_indirect_call():
+    interior = BASE + 13
+    body = (bytes.fromhex("64c70424") + interior.to_bytes(4, "little")
+            + bytes.fromhex("ff1424eb00c3"))
+    subject = translator(body, [interior])
+    instructions = subject.disasm.disassemble_function(
+        body, BASE, BASE + len(body))
+    _, calls = subject._indirect_code_refs(
+        instructions, BASE, BASE + len(body), proof_mode=True,
+        return_call_refs=True)
+    assert interior not in calls
+
+
+def test_reassigning_memory_base_invalidates_indirect_call_slot():
+    interior = BASE + 13
+    body = (bytes.fromhex("c700") + interior.to_bytes(4, "little")
+            + bytes.fromhex("b800200100ff10c3"))
+    subject = translator(body, [])
+    instructions = subject.disasm.disassemble_function(
+        body, BASE, BASE + len(body))
+    _, calls = subject._indirect_code_refs(
+        instructions, BASE, BASE + len(body), proof_mode=True,
+        return_call_refs=True)
+    assert interior not in calls
+
+
+def test_push_register_tracks_new_stack_indirect_call_target():
+    interior = BASE + 11
+    body = (b"\xbb" + interior.to_bytes(4, "little")
+            + bytes.fromhex("53ff1424eb00c3"))
+    subject = translator(body, [interior])
+    with pytest.raises(ValueError, match="called from"):
+        subject.coalesce_function(BASE, BASE + len(body), [interior])
+
+
+def test_push_invalidates_other_symbolic_stack_slots():
+    interior = BASE + 13
+    body = (bytes.fromhex("c745fc") + interior.to_bytes(4, "little")
+            + bytes.fromhex("50ff55fceb00c3"))
+    subject = translator(body, [])
+    instructions = subject.disasm.disassemble_function(
+        body, BASE, BASE + len(body))
+    _, calls = subject._indirect_code_refs(
+        instructions, BASE, BASE + len(body), proof_mode=True,
+        return_call_refs=True)
+    assert interior not in calls
+
+
 @pytest.mark.parametrize("padding", ["6690", "8d1b", "8da4240000000090"])
 def test_only_proven_alignment_padding_closes_a_decode_gap(padding):
     pad = bytes.fromhex(padding)
@@ -318,6 +366,23 @@ def test_explicit_coalesced_owner_stays_strong_during_ownership():
     assert owner not in subject.owned_function_starts
 
 
+def test_explicit_coalesced_owner_is_not_reexpanded_by_ownership():
+    subject = ownership_subject()
+    subject.func_db[BASE]["detection_method"] = "external_coalescence"
+    subject.coalesced_function_starts.add(BASE)
+    preserved = {
+        "end": BASE + 11,
+        "instructions": ["explicit-repair"],
+        "jump_tables": {},
+    }
+    subject._recovered_cfg[BASE] = copy.deepcopy(preserved)
+
+    subject.discover_cfg_ownership()
+
+    assert BASE + 0x30 not in subject.owned_function_starts
+    assert subject._recovered_cfg[BASE] == preserved
+
+
 @pytest.mark.parametrize("jump", ["ff2485", "ffa0"])
 @pytest.mark.parametrize("has_next_function", [True, False])
 def test_jump_table_can_follow_owned_code(jump, has_next_function):
@@ -341,6 +406,37 @@ def test_jump_table_can_follow_owned_code(jump, has_next_function):
     assert "switch: 2 entries, 2 targets" in code
     assert f"loc_{first_case:08X}:" in code
     assert f"loc_{first_case + 2:08X}:" in code
+
+
+def test_coalescence_recovers_external_jump_table(monkeypatch):
+    table = BASE + 0x1000
+    first_case = BASE + 7
+    second_case = BASE + 9
+    end = BASE + 11
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", BASE, 0x400, 0, 0x400, True),
+        config.Section(".rdata", table, 0x100, 0x400, 0x100, False),
+    ])
+    image = bytearray(b"\xcc" * 0x500)
+    image[:11] = (bytes.fromhex("ff2485") + table.to_bytes(4, "little")
+                  + bytes.fromhex("40c34bc3"))
+    image[0x400:0x408] = (
+        first_case.to_bytes(4, "little")
+        + second_case.to_bytes(4, "little"))
+    image[0x408:0x40c] = (0).to_bytes(4, "little")
+    subject = FunctionTranslator(bytes(image), {
+        BASE: function(BASE, first_case),
+        first_case: function(first_case, second_case),
+        second_case: function(second_case, end),
+    })
+
+    subject.coalesce_function(BASE, end, [first_case, second_case])
+
+    assert subject._recovered_cfg[BASE]["jump_tables"][table] == [
+        first_case, second_case]
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert f"loc_{first_case:08X}:" in code
+    assert f"loc_{second_case:08X}:" in code
 
 
 def test_jump_table_case_can_recover_register_continuation():
