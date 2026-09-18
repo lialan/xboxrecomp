@@ -272,7 +272,7 @@ def test_noncoalesced_int2d_int3_does_not_tail_fallthrough():
     assert "fallthrough" not in code
 
 
-def test_default_ownership_does_not_follow_base_only_tables():
+def ownership_subject():
     raw = bytearray(b"\xcc" * 0x400)
     # test ecx,ecx; jz bridge; jmp [eax*4 + indexed_table]
     raw[:11] = bytes.fromhex("85c9742cff2485") + (BASE + 0x100).to_bytes(4, "little")
@@ -289,29 +289,20 @@ def test_default_ownership_does_not_follow_base_only_tables():
         subject.func_db[BASE + start] = function(BASE + start, BASE + end)
     subject.func_db[BASE]["called_by"] = [hex(BASE + 0x200)]
     subject.func_db[BASE + 0x200]["has_prologue"] = True
+    return subject
+
+
+def test_default_ownership_does_not_follow_base_only_tables():
+    subject = ownership_subject()
     subject.discover_cfg_ownership()
     assert subject.owned_function_starts == {BASE + 0x30}
 
 
 def test_explicit_coalesced_owner_stays_strong_during_ownership():
-    raw = bytearray(b"\xcc" * 0x400)
-    raw[:11] = bytes.fromhex("85c9742cff2485") + (BASE + 0x100).to_bytes(4, "little")
-    raw[0x20:0x22] = b"\xc3\xc3"
-    raw[0x30:0x36] = b"\xff\xa0" + (BASE + 0x120).to_bytes(4, "little")
-    raw[0x40:0x42] = b"\xc3\xc3"
-    raw[0x200] = 0xc3
-    for offset, target in zip((0x100, 0x104, 0x120, 0x124),
-                              (0x20, 0x21, 0x40, 0x41)):
-        raw[offset:offset + 4] = (BASE + target).to_bytes(4, "little")
-    subject = translator(bytes(raw), [])
-    subject.func_db.clear()
-    for start, end in ((0, 11), (0x30, 0x36), (0x40, 0x42), (0x200, 0x201)):
-        subject.func_db[BASE + start] = function(BASE + start, BASE + end)
-    subject.func_db[BASE]["called_by"] = [hex(BASE + 0x200)]
+    subject = ownership_subject()
     owner = BASE + 0x30
     subject.func_db[owner]["detection_method"] = "external_coalescence"
     subject.coalesced_function_starts.add(owner)
-    subject.func_db[BASE + 0x200]["has_prologue"] = True
 
     subject.discover_cfg_ownership()
 
@@ -363,6 +354,34 @@ def test_jump_table_case_can_recover_register_continuation():
     assert continuation in subject.lifter.imm_code_refs
     code = subject.translate_function(BASE, subject.func_db[BASE])
     assert f"goto loc_{continuation:08X};" in code
+
+
+def test_recovered_cfg_does_not_rediscover_omitted_jump_table():
+    case = BASE + 7
+    table = BASE + 0x100
+    raw = bytearray(b"\xcc" * 0x400)
+    # jmp dword ptr [eax + ecx*4 + table]
+    raw[:7] = bytes.fromhex("ffa488") + table.to_bytes(4, "little")
+    raw[7] = 0xC3
+    raw[0x100:0x104] = case.to_bytes(4, "little")
+    subject = FunctionTranslator(
+        bytes(raw), {BASE: function(BASE, BASE + 8)})
+    instructions = subject.disasm.disassemble_function(
+        bytes(raw[:8]), BASE, BASE + 8)
+    subject.coalesced_function_starts.add(BASE)
+    subject._recovered_cfg[BASE] = {
+        "end": BASE + 8,
+        "instructions": instructions,
+        "jump_tables": {},
+    }
+
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+
+    assert table in subject.lifter.jump_table_targets
+    assert subject.lifter.jump_table_targets[table] == []
+    assert "switch:" not in code
+    assert f"goto loc_{case:08X};" not in code
+    assert "indirect tail jmp" in code
 
 
 def test_resync_recomputes_register_jump_edges():
@@ -463,6 +482,21 @@ def test_register_indirect_continuation_follows_absolute_lea():
     subject.coalesce_function(BASE, BASE + len(body), [continuation])
     code = subject.translate_function(BASE, subject.func_db[BASE])
     assert f"goto loc_{continuation:08X};" in code
+
+
+def test_default_translation_preserves_spilled_continuation_candidate():
+    continuation = BASE + 15
+    body = (b"\xb8" + continuation.to_bytes(4, "little")
+            + bytes.fromhex("89042431c08b1c24ffe340c3"))
+    subject = translator(body, [])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert f"goto loc_{continuation:08X};" in code
+    assert f"loc_{continuation:08X}:" in code
+
+    strict = translator(body, [continuation])
+    with pytest.raises(ValueError, match="not the requested end"):
+        strict.coalesce_function(
+            BASE, BASE + len(body), [continuation])
 
 
 def test_register_indirect_continuation_does_not_cross_cfg_join():

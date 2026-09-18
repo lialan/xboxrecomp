@@ -1049,6 +1049,38 @@ class FunctionTranslator:
         jump_edges = {}
         computed_jump_edges = computed_jump_edges or {}
 
+        # Ordinary translation is non-destructive and historically kept every
+        # local immediate loaded into a GPR when the function contained a
+        # register-indirect jump. Keep that conservative candidate census in
+        # addition to the path-sensitive proof below. It preserves local labels
+        # across spill/reload sequences that this register-only dataflow cannot
+        # prove, while coalescence proof mode remains strict.
+        if not proof_mode:
+            has_register_jump = any(
+                insn.mnemonic == "jmp" and not insn.jump_target
+                and insn.operands and insn.operands[0].type == "reg"
+                for insn in instructions)
+            if has_register_jump:
+                full_gprs = {"eax", "ebx", "ecx", "edx",
+                             "esi", "edi", "ebp", "esp"}
+                for insn in instructions:
+                    operands = insn.operands
+                    candidate = None
+                    if (insn.mnemonic == "mov" and len(operands) >= 2
+                            and operands[0].type == "reg"
+                            and operands[0].reg in full_gprs
+                            and operands[1].type == "imm"):
+                        candidate = operands[1].imm
+                    elif (insn.mnemonic == "lea" and len(operands) >= 2
+                          and operands[0].type == "reg"
+                          and operands[0].reg in full_gprs
+                          and operands[1].type == "mem"
+                          and not operands[1].mem_base
+                          and not operands[1].mem_index):
+                        candidate = operands[1].mem_disp & 0xFFFFFFFF
+                    if candidate is not None and start <= candidate < end:
+                        refs.add(candidate)
+
         def pack_result():
             if return_call_refs and return_jump_edges:
                 return refs, call_refs, jump_edges
@@ -1352,6 +1384,29 @@ class FunctionTranslator:
                 edges[insn.address] = local
         return edges
 
+    @staticmethod
+    def _authoritative_jump_tables(instructions, jump_table_targets):
+        """Keep a recovered jump-table decision authoritative during lifting.
+
+        The lifter normally falls back to reading a table when its address is
+        absent from ``jump_table_targets``. For recovered CFGs, absence means
+        the recovery deliberately did not validate that memory-indirect jump as
+        a local switch. Record an explicit empty entry so later emission cannot
+        silently rediscover targets that the CFG census rejected.
+        """
+        if jump_table_targets is None:
+            return None
+        census = {table: list(targets)
+                  for table, targets in jump_table_targets.items()}
+        for insn in instructions:
+            if (insn.mnemonic != "jmp" or insn.jump_target is not None
+                    or not insn.operands or insn.operands[0].type != "mem"):
+                continue
+            table_va = insn.operands[0].mem_disp
+            if table_va:
+                census.setdefault(table_va, [])
+        return census
+
     def _control_flow_census(self, instructions, start, end, coalesced=False,
                              jump_table_targets=None):
         """Build the shared census of computed CFG edges and entry leaders."""
@@ -1408,18 +1463,22 @@ class FunctionTranslator:
         self.lifter.func_start = start
         self.lifter.func_end = end
         validated_jump_tables = recovered["jump_tables"] if recovered else None
-        self.lifter.jump_table_targets = validated_jump_tables or {}
 
         # Disassemble
         instructions = (recovered["instructions"] if recovered else
                         self.disasm.disassemble_function(raw_bytes, start, end))
         if not instructions:
             return [], []
+        authoritative_jump_tables = self._authoritative_jump_tables(
+            instructions, validated_jump_tables)
+        self.lifter.jump_table_targets = (
+            authoritative_jump_tables
+            if authoritative_jump_tables is not None else {})
         coalesced = start in self.coalesced_function_starts
         (imm_refs, computed_jump_edges, debug_slide_int3s,
          debug_slide_bypasses, switch_leaders) = self._control_flow_census(
              instructions, start, end, coalesced,
-             jump_table_targets=validated_jump_tables)
+             jump_table_targets=authoritative_jump_tables)
 
         # A switch target the decode never produced an instruction for cannot
         # become a block leader, so it gets no label and its `goto` is dropped
@@ -1536,9 +1595,9 @@ class FunctionTranslator:
         (_, _, debug_slide_int3s,
          debug_slide_bypasses, switch_leaders) = self._control_flow_census(
              instructions, start, end, coalesced,
-             jump_table_targets=(
-                 self._recovered_cfg.get(start, {}).get("jump_tables")
-                 if coalesced else None))
+             jump_table_targets=(self.lifter.jump_table_targets
+                                 if coalesced and start in self._recovered_cfg
+                                 else None))
         last_is_debug_slide = (coalesced
                                and last_insn.address in debug_slide_int3s)
         continues_past_end = last_is_debug_slide or not (
