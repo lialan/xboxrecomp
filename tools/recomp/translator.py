@@ -1117,6 +1117,25 @@ class FunctionTranslator:
             "xlat": {"eax"}, "xlatb": {"eax"},
         }
 
+        def memory_key(operand):
+            if operand.type != "mem":
+                return None
+            return ("mem", operand.mem_base, operand.mem_index,
+                    operand.mem_scale, operand.mem_disp)
+
+        def memory_keys(constants):
+            return [key for key in constants
+                    if isinstance(key, tuple) and key[:1] == ("mem",)]
+
+        def clear_memory(constants):
+            for key in memory_keys(constants):
+                constants.pop(key, None)
+
+        def clear_memory_using_register(constants, register):
+            for key in memory_keys(constants):
+                if register in key[1:3]:
+                    constants.pop(key, None)
+
         def transfer(insn, incoming):
             constants = dict(incoming)
             operands = insn.operands
@@ -1137,6 +1156,20 @@ class FunctionTranslator:
                     preserved_writes.add(destination)
                 else:
                     constants.pop(destination, None)
+            elif (insn.mnemonic == "mov" and len(operands) >= 2
+                  and operands[0].type == "mem"):
+                # Exact spill slots are useful independent-entry evidence for
+                # memory-indirect calls. Treat every other memory write as a
+                # possible alias, then remember only the value written by this
+                # instruction when it is itself provable.
+                destination = memory_key(operands[0])
+                source = operands[1]
+                clear_memory(constants)
+                if destination is not None:
+                    if source.type == "imm":
+                        constants[destination] = source.imm
+                    elif source.type == "reg" and source.reg in constants:
+                        constants[destination] = constants[source.reg]
             elif (insn.mnemonic == "lea" and len(operands) >= 2
                   and operands[0].type == "reg"
                   and operands[1].type == "mem"):
@@ -1154,6 +1187,12 @@ class FunctionTranslator:
                 register = aliases.get(written, written)
                 if register in full_registers and register not in preserved_writes:
                     constants.pop(register, None)
+                    clear_memory_using_register(constants, register)
+
+            if (operands and operands[0].type == "mem"
+                    and insn.mnemonic not in non_writers
+                    and insn.mnemonic not in ("mov", "lea", "call")):
+                clear_memory(constants)
 
             mnemonic = insn.mnemonic.removeprefix("lock ")
             if mnemonic in ("cmpxchg", "cmpxchg8b"):
@@ -1162,8 +1201,11 @@ class FunctionTranslator:
                     constants.pop("edx", None)
 
             if insn.is_call:
-                for register in ("eax", "ecx", "edx"):
-                    constants.pop(register, None)
+                # Generated callees execute their actual guest register writes;
+                # the translator does not enforce a host ABI that restores
+                # ebx/esi/edi/ebp. Unless preservation is proven, no tracked
+                # register or spill value is valid across a call.
+                constants.clear()
             elif insn.mnemonic == "xchg":
                 for operand in operands[:2]:
                     if operand.type == "reg":
@@ -1196,9 +1238,14 @@ class FunctionTranslator:
         def call_target_from(insn, constants):
             operands = insn.operands
             if (insn.is_call and not getattr(insn, "call_target", None)
-                    and operands and operands[0].type == "reg"):
-                target = constants.get(aliases.get(
-                    operands[0].reg, operands[0].reg))
+                    and operands):
+                if operands[0].type == "reg":
+                    target = constants.get(aliases.get(
+                        operands[0].reg, operands[0].reg))
+                elif operands[0].type == "mem":
+                    target = constants.get(memory_key(operands[0]))
+                else:
+                    target = None
                 if target is not None and start <= target < end:
                     return target
             return None

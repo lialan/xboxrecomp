@@ -151,6 +151,15 @@ def test_rejects_lea_register_call_to_interior():
         subject.coalesce_function(BASE, BASE + len(body), [interior])
 
 
+def test_rejects_memory_indirect_call_to_interior():
+    interior = BASE + 12
+    body = (bytes.fromhex("c70424") + interior.to_bytes(4, "little")
+            + bytes.fromhex("ff1424eb00c3"))
+    subject = translator(body, [interior])
+    with pytest.raises(ValueError, match="called from"):
+        subject.coalesce_function(BASE, BASE + len(body), [interior])
+
+
 @pytest.mark.parametrize("padding", ["6690", "8d1b", "8da4240000000090"])
 def test_only_proven_alignment_padding_closes_a_decode_gap(padding):
     pad = bytes.fromhex(padding)
@@ -497,6 +506,18 @@ def test_default_translation_preserves_spilled_continuation_candidate():
     with pytest.raises(ValueError, match="not the requested end"):
         strict.coalesce_function(
             BASE, BASE + len(body), [continuation])
+
+
+def test_call_invalidates_all_continuation_register_proof():
+    interior = BASE + 12
+    callee = BASE + 0x100
+    rel = callee - (BASE + 10)
+    body = (b"\xbb" + interior.to_bytes(4, "little")
+            + b"\xe8" + rel.to_bytes(4, "little", signed=True)
+            + bytes.fromhex("ffe3c3"))
+    subject = translator(body, [interior])
+    with pytest.raises(ValueError, match="not the requested end"):
+        subject.coalesce_function(BASE, BASE + len(body), [interior])
 
 
 def test_register_indirect_continuation_does_not_cross_cfg_join():
