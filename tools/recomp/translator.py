@@ -1714,6 +1714,15 @@ class FunctionTranslator:
         instructions, blocks = self.decode_function(start, end)
         if not blocks:
             return None
+        interrupt_return = next((
+            insn for insn in instructions
+            if insn.mnemonic in ("iret", "iretd")
+        ), None)
+        if interrupt_return is not None:
+            raise ValueError(
+                f"Unsupported interrupt return {interrupt_return.mnemonic} at "
+                f"0x{interrupt_return.address:08X}: guest EIP/CS/EFLAGS restore "
+                "is not implemented")
 
         # Get classification and ABI info
         cls_info = self.classification_db.get(start, {})
@@ -2102,10 +2111,7 @@ class FunctionTranslator:
             if bypass is not None:
                 lines.append(
                     f"    goto loc_{bypass:08X}; /* int 0x2d skips slide int3 */")
-            if bb.last_insn.mnemonic in ("iret", "iretd"):
-                lines.append(
-                    "    return; /* interrupt return terminates translated control flow */")
-            elif (start in self.coalesced_function_starts
+            if (start in self.coalesced_function_starts
                     and (bb.last_insn.mnemonic in ("ud2", "hlt")
                          or (bb.last_insn.mnemonic == "int3"
                              and bb.last_insn.address not in debug_slide_int3s))):
