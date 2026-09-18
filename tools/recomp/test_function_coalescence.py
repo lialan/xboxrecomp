@@ -293,6 +293,31 @@ def test_default_ownership_does_not_follow_base_only_tables():
     assert subject.owned_function_starts == {BASE + 0x30}
 
 
+def test_explicit_coalesced_owner_stays_strong_during_ownership():
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:11] = bytes.fromhex("85c9742cff2485") + (BASE + 0x100).to_bytes(4, "little")
+    raw[0x20:0x22] = b"\xc3\xc3"
+    raw[0x30:0x36] = b"\xff\xa0" + (BASE + 0x120).to_bytes(4, "little")
+    raw[0x40:0x42] = b"\xc3\xc3"
+    raw[0x200] = 0xc3
+    for offset, target in zip((0x100, 0x104, 0x120, 0x124),
+                              (0x20, 0x21, 0x40, 0x41)):
+        raw[offset:offset + 4] = (BASE + target).to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    for start, end in ((0, 11), (0x30, 0x36), (0x40, 0x42), (0x200, 0x201)):
+        subject.func_db[BASE + start] = function(BASE + start, BASE + end)
+    subject.func_db[BASE]["called_by"] = [hex(BASE + 0x200)]
+    owner = BASE + 0x30
+    subject.func_db[owner]["detection_method"] = "external_coalescence"
+    subject.coalesced_function_starts.add(owner)
+    subject.func_db[BASE + 0x200]["has_prologue"] = True
+
+    subject.discover_cfg_ownership()
+
+    assert owner not in subject.owned_function_starts
+
+
 @pytest.mark.parametrize("jump", ["ff2485", "ffa0"])
 @pytest.mark.parametrize("has_next_function", [True, False])
 def test_jump_table_can_follow_owned_code(jump, has_next_function):
@@ -318,6 +343,28 @@ def test_jump_table_can_follow_owned_code(jump, has_next_function):
     assert f"loc_{first_case + 2:08X}:" in code
 
 
+def test_jump_table_case_can_recover_register_continuation():
+    case = BASE + 7
+    continuation = case + 7
+    table = BASE + 0x100
+    body = (bytes.fromhex("ff2485") + table.to_bytes(4, "little")
+            + b"\xbb" + continuation.to_bytes(4, "little")
+            + bytes.fromhex("ffe3c3"))
+    subject = translator(body, [])
+    subject.lifter._analyze_switch_table = lambda operands: (
+        [case] if operands and operands[0].type == "mem" else [])
+
+    _, blocks = subject.decode_function(BASE, BASE + len(body))
+
+    switch_block = next(block for block in blocks if block.start == BASE)
+    case_block = next(block for block in blocks if block.start == case)
+    assert case in switch_block.successors
+    assert continuation in case_block.successors
+    assert continuation in subject.lifter.imm_code_refs
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert f"goto loc_{continuation:08X};" in code
+
+
 def test_resync_recomputes_register_jump_edges():
     leader = BASE + 5
     continuation = BASE + 7
@@ -335,7 +382,7 @@ def test_resync_recomputes_register_jump_edges():
         return full if resync else initial
 
     def indirect_refs(decoded, start, end, proof_mode=False,
-                      return_jump_edges=False):
+                      return_jump_edges=False, computed_jump_edges=None):
         if any(insn.address == leader for insn in decoded):
             refs = {continuation}
             edges = {leader: {continuation}}
@@ -346,7 +393,8 @@ def test_resync_recomputes_register_jump_edges():
 
     subject.disasm.disassemble_function = recording_disasm
     subject._indirect_code_refs = indirect_refs
-    subject.lifter._analyze_switch_table = lambda operands: [leader]
+    subject._computed_jump_edges = lambda decoded, start, end, \
+            jump_table_targets=None: {BASE: {leader}}
 
     _, blocks = subject.decode_function(BASE, BASE + len(raw))
 

@@ -312,6 +312,15 @@ def load_coalescences(path):
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
+    STRONG_ENTRY_METHODS = frozenset({
+        "entry_point", "call_target", "indirect_call_slot",
+        "seed_vtable_thunk", "static_indirect_table",
+        "prologue", "prologue_alt",
+        "tail_jump_target", "tail_jump_alias",
+        "imm_ref_target", "data_ptr_target",
+        "external_coalescence",
+    })
+
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
@@ -468,15 +477,7 @@ class FunctionTranslator:
             reject(
                 f"interior start 0x{protected[0]:08X} is protected by manual code")
         strong = [start for start in actual
-                  if self._is_strong_entry(self.func_db[start])
-                  or self.func_db[start].get("external_entry")
-                  or self.func_db[start].get("detection_method") in (
-                      "entry_point", "call_target", "indirect_call_slot",
-                      "seed_vtable_thunk", "static_indirect_table",
-                      "prologue", "prologue_alt",
-                      "tail_jump_target", "tail_jump_alias",
-                      "imm_ref_target", "data_ptr_target",
-                      "external_coalescence")]
+                  if self._is_strong_entry(self.func_db[start], start)]
         if strong:
             reject(
                 f"interior start 0x{strong[0]:08X} has independent evidence")
@@ -513,9 +514,11 @@ class FunctionTranslator:
         if any(instruction.is_call and instruction.call_target in actual
                for instruction in instructions):
             reject("interior start is called from the requested owner")
+        computed_jump_edges = self._computed_jump_edges(
+            instructions, target, end, jump_table_targets=jump_tables)
         _, indirect_calls = self._indirect_code_refs(
             instructions, target, end, proof_mode=True,
-            return_call_refs=True)
+            return_call_refs=True, computed_jump_edges=computed_jump_edges)
         if indirect_calls.intersection(actual):
             reject("interior start is called from the requested owner")
         if not instructions or instructions[0].address != target:
@@ -727,10 +730,17 @@ class FunctionTranslator:
 
         return targets if targets else None
 
-    @staticmethod
-    def _is_strong_entry(func_info):
+    def _is_strong_entry(self, func_info, addr=None):
         """Return whether an entry has evidence independent of seed recovery."""
-        return bool(func_info.get("has_prologue") or func_info.get("called_by"))
+        if addr is None:
+            addr = func_info.get("_addr")
+        return bool(
+            func_info.get("has_prologue")
+            or func_info.get("called_by")
+            or func_info.get("external_entry")
+            or func_info.get("detection_method") in self.STRONG_ENTRY_METHODS
+            or addr in self.coalesced_function_starts
+        )
 
     def discover_cfg_ownership(self):
         """Reassign weak seeds reached through a split computed-jump CFG."""
@@ -742,7 +752,7 @@ class FunctionTranslator:
         weak_by_section = {}
         for addr, info in self.func_db.items():
             section = info.get("section", "")
-            if self._is_strong_entry(info):
+            if self._is_strong_entry(info, addr):
                 by_section.setdefault(section, []).append(addr)
             else:
                 weak_by_section.setdefault(section, []).append(addr)
@@ -818,8 +828,12 @@ class FunctionTranslator:
                 stop_mnemonics=("int3", "ud2", "hlt") if coalescing else ())
             changed = False
             if coalescing:
+                computed_jump_edges = self._computed_jump_edges(
+                    instructions, start, upper,
+                    jump_table_targets=jump_tables)
                 refs = self._indirect_code_refs(
-                    instructions, start, upper, proof_mode=coalescing)
+                    instructions, start, upper, proof_mode=coalescing,
+                    computed_jump_edges=computed_jump_edges)
                 if refs - entry_points:
                     entry_points.update(refs)
                     changed = True
@@ -1019,9 +1033,9 @@ class FunctionTranslator:
         return any(getattr(insn, "call_target", None) in seh_prologs
                    for insn in instructions)
 
-    @staticmethod
-    def _indirect_code_refs(instructions, start, end, proof_mode=False,
-                            return_call_refs=False, return_jump_edges=False):
+    def _indirect_code_refs(self, instructions, start, end, proof_mode=False,
+                            return_call_refs=False, return_jump_edges=False,
+                            computed_jump_edges=None):
         """Immediate continuations used by register-jump dispatch.
 
         Track constants along reachable CFG paths in both modes. Normal
@@ -1033,6 +1047,7 @@ class FunctionTranslator:
         refs = set()
         call_refs = set()
         jump_edges = {}
+        computed_jump_edges = computed_jump_edges or {}
 
         def pack_result():
             if return_call_refs and return_jump_edges:
@@ -1175,9 +1190,13 @@ class FunctionTranslator:
                         and insn.address not in debug_slides)):
                 return ()
             if insn.is_jump:
+                out = []
                 if insn.jump_target in by_address:
-                    return (insn.jump_target,)
-                return ()
+                    out.append(insn.jump_target)
+                out.extend(
+                    target for target in computed_jump_edges.get(insn.address, ())
+                    if target in by_address)
+                return tuple(dict.fromkeys(out))
 
             out = []
             if insn.is_cond_jump and insn.jump_target in by_address:
@@ -1310,6 +1329,68 @@ class FunctionTranslator:
             previous = instruction
         return bypasses
 
+    def _computed_jump_edges(self, instructions, start, end,
+                             jump_table_targets=None):
+        """Return validated local targets for memory-indirect jumps.
+
+        ``jump_table_targets`` is an optional table census already validated by
+        CFG recovery. When supplied, only those tables are trusted. Otherwise
+        the normal lifter switch-table analysis is used.
+        """
+        edges = {}
+        for insn in instructions:
+            if (insn.mnemonic != "jmp" or insn.jump_target is not None
+                    or not insn.operands or insn.operands[0].type != "mem"):
+                continue
+            operand = insn.operands[0]
+            if jump_table_targets is None:
+                targets = self.lifter._analyze_switch_table(insn.operands)
+            else:
+                targets = jump_table_targets.get(operand.mem_disp, ())
+            local = {target for target in targets if start <= target < end}
+            if local:
+                edges[insn.address] = local
+        return edges
+
+    def _control_flow_census(self, instructions, start, end, coalesced=False,
+                             jump_table_targets=None):
+        """Build the shared census of computed CFG edges and entry leaders."""
+        table_edges = self._computed_jump_edges(
+            instructions, start, end, jump_table_targets=jump_table_targets)
+        imm_refs, register_edges = self._indirect_code_refs(
+            instructions, start, end, return_jump_edges=True,
+            computed_jump_edges=table_edges)
+
+        computed_jump_edges = {
+            address: set(targets) for address, targets in table_edges.items()
+        }
+        for address, targets in register_edges.items():
+            computed_jump_edges.setdefault(address, set()).update(targets)
+
+        computed_entries = set(imm_refs)
+        for targets in computed_jump_edges.values():
+            computed_entries.update(targets)
+
+        extra_entries = computed_entries if coalesced else ()
+        debug_slide_int3s = self._debug_slide_int3s(
+            instructions, extra_entry_targets=extra_entries)
+        debug_slide_bypasses = (
+            self._debug_slide_bypasses(
+                instructions, extra_entry_targets=extra_entries)
+            if coalesced else {})
+
+        switch_leaders = set(computed_entries)
+        switch_leaders.update(debug_slide_bypasses.values())
+        if coalesced:
+            instruction_starts = {insn.address for insn in instructions}
+            switch_leaders.update(
+                insn.end_address for insn in instructions
+                if (insn.mnemonic == "int3"
+                    and insn.end_address in instruction_starts))
+
+        return (imm_refs, computed_jump_edges, debug_slide_int3s,
+                debug_slide_bypasses, switch_leaders)
+
     def decode_function(self, start, end):
         """Recover instructions and blocks, including indirect-entry leaders."""
         recovered = self._recovered_cfg.get(start)
@@ -1326,8 +1407,8 @@ class FunctionTranslator:
         # Set function bounds for the lifter
         self.lifter.func_start = start
         self.lifter.func_end = end
-        self.lifter.jump_table_targets = (
-            recovered["jump_tables"] if recovered else {})
+        validated_jump_tables = recovered["jump_tables"] if recovered else None
+        self.lifter.jump_table_targets = validated_jump_tables or {}
 
         # Disassemble
         instructions = (recovered["instructions"] if recovered else
@@ -1335,43 +1416,10 @@ class FunctionTranslator:
         if not instructions:
             return [], []
         coalesced = start in self.coalesced_function_starts
-
-        def control_flow_census(decoded):
-            # Addresses this function loads into a register and then jumps to.
-            # These are local continuation labels, not separate functions.
-            imm_refs, computed_jump_edges = self._indirect_code_refs(
-                decoded, start, end, return_jump_edges=True)
-            computed_entries = set(imm_refs)
-            for targets in self.lifter.jump_table_targets.values():
-                computed_entries.update(t for t in targets if start <= t < end)
-            for insn in decoded:
-                if (insn.mnemonic == "jmp" and not insn.jump_target
-                        and insn.operands):
-                    targets = self.lifter._analyze_switch_table(insn.operands)
-                    computed_entries.update(
-                        t for t in targets if start <= t < end)
-
-            extra_entries = computed_entries if coalesced else ()
-            debug_slide_int3s = self._debug_slide_int3s(
-                decoded, extra_entry_targets=extra_entries)
-            debug_slide_bypasses = (
-                self._debug_slide_bypasses(
-                    decoded, extra_entry_targets=extra_entries)
-                if coalesced else {})
-
-            switch_leaders = set(computed_entries)
-            switch_leaders.update(debug_slide_bypasses.values())
-            if coalesced:
-                instruction_starts = {insn.address for insn in decoded}
-                switch_leaders.update(
-                    insn.end_address for insn in decoded
-                    if (insn.mnemonic == "int3"
-                        and insn.end_address in instruction_starts))
-            return (imm_refs, computed_jump_edges, debug_slide_int3s,
-                    debug_slide_bypasses, switch_leaders)
-
         (imm_refs, computed_jump_edges, debug_slide_int3s,
-         debug_slide_bypasses, switch_leaders) = control_flow_census(instructions)
+         debug_slide_bypasses, switch_leaders) = self._control_flow_census(
+             instructions, start, end, coalesced,
+             jump_table_targets=validated_jump_tables)
 
         # A switch target the decode never produced an instruction for cannot
         # become a block leader, so it gets no label and its `goto` is dropped
@@ -1392,7 +1440,8 @@ class FunctionTranslator:
                     return [], []
                 (imm_refs, computed_jump_edges, debug_slide_int3s,
                  debug_slide_bypasses,
-                 switch_leaders) = control_flow_census(instructions)
+                 switch_leaders) = self._control_flow_census(
+                     instructions, start, end, coalesced)
 
         self.lifter.imm_code_refs = imm_refs
 
@@ -1484,20 +1533,12 @@ class FunctionTranslator:
         # callable symbol.
         last_insn = instructions[-1]
         coalesced = start in self.coalesced_function_starts
-        computed_entries = set(self.lifter.imm_code_refs)
-        for targets in self.lifter.jump_table_targets.values():
-            computed_entries.update(t for t in targets if start <= t < end)
-        for insn in instructions:
-            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
-                targets = self.lifter._analyze_switch_table(insn.operands)
-                computed_entries.update(t for t in targets if start <= t < end)
-        extra_entries = computed_entries if coalesced else ()
-        debug_slide_int3s = self._debug_slide_int3s(
-            instructions, extra_entry_targets=extra_entries)
-        debug_slide_bypasses = (
-            self._debug_slide_bypasses(
-                instructions, extra_entry_targets=extra_entries)
-            if coalesced else {})
+        (_, _, debug_slide_int3s,
+         debug_slide_bypasses, switch_leaders) = self._control_flow_census(
+             instructions, start, end, coalesced,
+             jump_table_targets=(
+                 self._recovered_cfg.get(start, {}).get("jump_tables")
+                 if coalesced else None))
         last_is_debug_slide = (coalesced
                                and last_insn.address in debug_slide_int3s)
         continues_past_end = last_is_debug_slide or not (
@@ -1734,12 +1775,7 @@ class FunctionTranslator:
                 label_addrs.add(insn.jump_target)
         label_addrs |= self.lifter.imm_code_refs
         label_addrs.update(debug_slide_bypasses.values())
-        # Add switch table targets (indirect jmp with intra-function table)
-        for insn in instructions:
-            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
-                switch_targets = self.lifter._analyze_switch_table(insn.operands)
-                for t in switch_targets:
-                    label_addrs.add(t)
+        label_addrs.update(switch_leaders)
 
         # Which blocks can reach each block. Flag state has to follow control
         # flow, not address order: an optimising compiler routinely lets a jcc
