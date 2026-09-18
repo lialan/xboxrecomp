@@ -160,6 +160,62 @@ def test_rejects_memory_indirect_call_to_interior():
         subject.coalesce_function(BASE, BASE + len(body), [interior])
 
 
+def test_rejects_spilled_reload_register_call_to_interior():
+    interior = BASE + 16
+    body = (bytes.fromhex("c7442404") + interior.to_bytes(4, "little")
+            + bytes.fromhex("8b442404ffd0eb00c3"))
+    subject = translator(body, [interior])
+    with pytest.raises(ValueError, match="called from"):
+        subject.coalesce_function(BASE, BASE + len(body), [interior])
+
+
+def test_rejects_exact_memory_indirect_jump_to_interior():
+    interior = BASE + 12
+    body = (bytes.fromhex("740a")
+            + bytes.fromhex("c70424") + interior.to_bytes(4, "little")
+            + bytes.fromhex("ff2424c3"))
+    subject = translator(body, [interior])
+    with pytest.raises(ValueError, match="called from"):
+        subject.coalesce_function(BASE, BASE + len(body), [interior])
+
+
+def test_observed_dynamic_path_retains_indirect_call_evidence():
+    block = BASE + 16
+    interior = BASE + 20
+    body = (bytes.fromhex("85d27410")
+            + b"\xb9" + interior.to_bytes(4, "little")
+            + b"\xb8" + block.to_bytes(4, "little")
+            + bytes.fromhex("ffe0ffd1ebfac3"))
+    subject = translator(body, [interior])
+    with pytest.raises(ValueError, match="called from"):
+        subject.coalesce_function(BASE, BASE + len(body), [interior])
+
+
+def test_segmented_jump_table_is_not_coalescence_evidence(monkeypatch):
+    table = BASE + 0x1000
+    first_case = BASE + 8
+    second_case = BASE + 10
+    end = BASE + 12
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", BASE, 0x400, 0, 0x400, True),
+        config.Section(".rdata", table, 0x100, 0x400, 0x100, False),
+    ])
+    image = bytearray(b"\xcc" * 0x500)
+    image[:12] = (bytes.fromhex("64ff2485") + table.to_bytes(4, "little")
+                  + bytes.fromhex("40c34bc3"))
+    image[0x400:0x408] = (
+        first_case.to_bytes(4, "little")
+        + second_case.to_bytes(4, "little"))
+    subject = FunctionTranslator(bytes(image), {
+        BASE: function(BASE, first_case),
+        first_case: function(first_case, second_case),
+        second_case: function(second_case, end),
+    })
+
+    with pytest.raises(ValueError, match="segmented indirect jump"):
+        subject.coalesce_function(BASE, end, [first_case, second_case])
+
+
 def test_segmented_memory_store_does_not_alias_plain_indirect_call():
     interior = BASE + 13
     body = (bytes.fromhex("64c70424") + interior.to_bytes(4, "little")
@@ -599,9 +655,9 @@ def test_default_translation_preserves_spilled_continuation_candidate():
     assert f"loc_{continuation:08X}:" in code
 
     strict = translator(body, [continuation])
-    with pytest.raises(ValueError, match="not the requested end"):
-        strict.coalesce_function(
-            BASE, BASE + len(body), [continuation])
+    strict.coalesce_function(BASE, BASE + len(body), [continuation])
+    strict_code = strict.translate_function(BASE, strict.func_db[BASE])
+    assert f"goto loc_{continuation:08X};" in strict_code
 
 
 def test_call_invalidates_all_continuation_register_proof():

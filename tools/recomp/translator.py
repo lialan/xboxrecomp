@@ -514,6 +514,12 @@ class FunctionTranslator:
         if any(instruction.is_call and instruction.call_target in actual
                for instruction in instructions):
             reject("interior start is called from the requested owner")
+        if any(instruction.mnemonic == "jmp" and not instruction.jump_target
+               and instruction.operands
+               and instruction.operands[0].type == "mem"
+               and instruction.operands[0].mem_seg
+               for instruction in instructions):
+            reject("segmented indirect jump cannot prove local ownership")
         computed_jump_edges = self._computed_jump_edges(
             instructions, target, end, jump_table_targets=jump_tables)
         _, indirect_calls = self._indirect_code_refs(
@@ -858,6 +864,11 @@ class FunctionTranslator:
                 if not insn.operands or insn.operands[0].type != "mem":
                     continue
                 operand = insn.operands[0]
+                if operand.mem_seg:
+                    # Segment-relative memory does not use mem_disp as a linear
+                    # Xbox VA (notably fs: adds XBOX_FS_BASE at runtime). Never
+                    # use the raw displacement as destructive table evidence.
+                    continue
                 if not (operand.mem_index or operand.mem_base):
                     continue
                 if operand.mem_index and operand.mem_base:
@@ -1187,6 +1198,10 @@ class FunctionTranslator:
                       and source.reg in constants):
                     constants[destination] = constants[source.reg]
                     preserved_writes.add(destination)
+                elif (source.type == "mem" and source.mem_size == 4
+                      and memory_key(source) in constants):
+                    constants[destination] = constants[memory_key(source)]
+                    preserved_writes.add(destination)
                 else:
                     constants.pop(destination, None)
             elif (insn.mnemonic == "mov" and len(operands) >= 2
@@ -1295,6 +1310,15 @@ class FunctionTranslator:
                     return target
             return None
 
+        def retained_memory_jump_target_from(insn, constants):
+            operands = insn.operands
+            if (insn.mnemonic == "jmp" and not insn.jump_target and operands
+                    and operands[0].type == "mem"):
+                target = constants.get(memory_key(operands[0]))
+                if target is not None and start <= target < end:
+                    return target
+            return None
+
         # Track constants along actual CFG edges. Destructive coalescence keeps
         # a jump target only when every incoming path agrees; ordinary
         # translation may keep the union of per-edge targets for dispatch labels.
@@ -1344,6 +1368,7 @@ class FunctionTranslator:
         incoming_states = {start: {None: {}}}
         entry_states = {start: {}}
         dynamic_edges = {}
+        observed_entry_refs = set()
         worklist = [start]
         while worklist:
             address = worklist.pop()
@@ -1351,6 +1376,17 @@ class FunctionTranslator:
                 continue
             insn = by_address[address]
             incoming = entry_states[address]
+            if return_call_refs:
+                # Entry-retention evidence is monotonic. A later loop join can
+                # weaken a contribution, but it must not erase a call/jump path
+                # that was proven on an earlier iteration.
+                for contribution in incoming_states.get(address, {}).values():
+                    target = call_target_from(insn, contribution)
+                    if target is None:
+                        target = retained_memory_jump_target_from(
+                            insn, contribution)
+                    if target is not None:
+                        observed_entry_refs.add(target)
             outgoing = transfer(insn, incoming)
             static = set(static_successors(insn))
             dynamic_target = jump_target_from(insn, incoming)
@@ -1400,12 +1436,19 @@ class FunctionTranslator:
                         jump_edges.setdefault(address, set()).add(target)
 
             if return_call_refs:
-                # A single proven path to an indirect call is independent entry
-                # evidence, even when other predecessors weaken the merged state.
+                # A single proven path to an indirect call, or an exact
+                # memory-held indirect jump that the current lifter would emit
+                # as RECOMP_ITAIL, requires retaining a standalone entry.
                 for contribution in incoming_states.get(address, {}).values():
                     target = call_target_from(insn, contribution)
+                    if target is None:
+                        target = retained_memory_jump_target_from(
+                            insn, contribution)
                     if target is not None:
                         call_refs.add(target)
+
+        if return_call_refs:
+            call_refs.update(observed_entry_refs)
 
         return pack_result()
 
