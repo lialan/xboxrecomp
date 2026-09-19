@@ -2405,6 +2405,31 @@ static void bridge_RtlNtStatusToDosError(void)
     case 0xC0000008: g_eax = 6; break;          /* STATUS_INVALID_HANDLE → ERROR_INVALID_HANDLE */
     case 0xC0000017: g_eax = 8; break;          /* STATUS_NO_MEMORY → ERROR_NOT_ENOUGH_MEMORY */
     case 0xC000000D: g_eax = 87; break;         /* STATUS_INVALID_PARAMETER → ERROR_INVALID_PARAMETER */
+    /* The informational and warning codes, which are not failures and must
+     * not fall through to the generic answer.
+     *
+     * 317 is ERROR_MR_MID_NOT_FOUND -- "there is no message text for this
+     * number" -- and as a default for a status nobody has mapped yet it is
+     * honest. As an answer to "is this request still in flight?" it is not:
+     * a caller comparing against ERROR_IO_PENDING gets "no" and takes the
+     * branch for a request that never started.
+     *
+     * Shin Megami Tensei: Nine does exactly that. Its resource loader issues
+     * a read, sees the call fail, asks for the error, and marks the object as
+     * loading only when the answer is ERROR_IO_PENDING. With 317 the object
+     * stayed idle, the poll that finishes the load returned "not started" on
+     * every frame, and the title sat in its first boot state forever with
+     * everything else working. */
+    case 0x00000103: g_eax = 997; break;        /* STATUS_PENDING → ERROR_IO_PENDING */
+    case 0x00000102: g_eax = 1460; break;       /* STATUS_TIMEOUT → ERROR_TIMEOUT */
+    case 0x00000104: g_eax = 0; break;          /* STATUS_REPARSE → ERROR_SUCCESS */
+    case 0x80000005: g_eax = 234; break;        /* STATUS_BUFFER_OVERFLOW → ERROR_MORE_DATA */
+    case 0x80000006: g_eax = 18; break;         /* STATUS_NO_MORE_FILES → ERROR_NO_MORE_FILES */
+    case 0xC0000011: g_eax = 38; break;         /* STATUS_END_OF_FILE → ERROR_HANDLE_EOF */
+    case 0xC0000023: g_eax = 122; break;        /* STATUS_BUFFER_TOO_SMALL → ERROR_INSUFFICIENT_BUFFER */
+    case 0xC0000035: g_eax = 183; break;        /* STATUS_OBJECT_NAME_COLLISION → ERROR_ALREADY_EXISTS */
+    case 0xC00000BB: g_eax = 50; break;         /* STATUS_NOT_SUPPORTED → ERROR_NOT_SUPPORTED */
+
     default:         g_eax = 317; break;         /* ERROR_MR_MID_NOT_FOUND (generic) */
     }
 }
