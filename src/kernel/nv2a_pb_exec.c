@@ -165,6 +165,10 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
 #define NV097_ARRAY_ELEMENT16             0x1800
+/* Draw a run of vertices straight out of the arrays, with no index list:
+ * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
+ * appear several times inside one BEGIN_END to draw a longer run. */
+#define NV097_DRAW_ARRAYS                 0x1810
 #define NV097_INLINE_ARRAY                0x1818
 /* Immediate-mode vertices. SET_VERTEX3F/4F carry the position, and writing
  * its last component completes a vertex using whatever the SET_VERTEX_DATA*
@@ -1619,6 +1623,26 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
             s_gpu.inline_buf[s_gpu.inline_count++] = param;
         break;
+
+    case NV097_DRAW_ARRAYS: {
+        /* The method this title actually draws with, and the reason the
+         * executor reported zero draws while geometry was being submitted the
+         * whole time: BEGIN_END arrived, END arrived, and in between came a
+         * run description rather than the index list the draw path wanted, so
+         * every batch ended with idx_count == 0 and was dropped in silence.
+         *
+         * Expanded into indices because that is what the rasteriser consumes,
+         * and an implicit run is just the indices start..start+count-1. */
+        uint32_t start = param & 0x00FFFFFFu;
+        uint32_t count = ((param >> 24) & 0xFFu) + 1u;
+        uint32_t i;
+
+        if (!s_gpu.prim)
+            break;
+        for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
+        break;
+    }
 
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */
