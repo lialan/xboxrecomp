@@ -36,6 +36,10 @@ _VALUES = (0x00000000, 0x00000001, 0x80000000, 0xFFFFFFFF,
 _PRELUDE = '''#include <stdint.h>
 #include <stdio.h>
 static uint32_t eax, edx, ecx;
+/* The lifted statement publishes its result into the flag snapshot the
+ * translator declares per function; declare it here too. */
+static uint32_t _fa;
+static int32_t _fas;
 #define LO8(v) ((uint8_t)(v))
 '''
 
