@@ -1150,6 +1150,7 @@ static void bridge_HalReturnToFirmware(void)
         fflush(stderr);
     }
 
+    xbox_PeekSample("exit peek");
     fprintf(stderr, "  [KERNEL] HalReturnToFirmware: routine=%u - title is exiting\n",
             routine);
     fflush(stderr);
