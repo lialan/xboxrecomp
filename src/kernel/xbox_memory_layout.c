@@ -1438,7 +1438,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * the diagnostic silently did nothing. It stays as a floor for a host
          * with pages wider than the TIB offset, where skipping really is
          * better than breaking the run. */
+#if defined(_WIN32)
+        SYSTEM_INFO si;
+        long host_page;
+        GetSystemInfo(&si);
+        host_page = (long)si.dwPageSize;
+#else
         long host_page = sysconf(_SC_PAGESIZE);
+#endif
         if (host_page > 0 && (uint32_t)host_page > XBOX_TIB_MAIN) {
             fprintf(stderr, "  RECOMP_TRAP_NULL: not available -- the host page "
                     "is %ld bytes, so trapping guest page zero would also trap "
