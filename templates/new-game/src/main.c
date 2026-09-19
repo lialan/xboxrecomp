@@ -155,6 +155,35 @@ static void print_guest_context(void *rip)
                 shown++;
             }
         }
+        /* When the frame is gone, say so, and fall back on what is left.
+         *
+         * A fault inside a block copy leaves no return address in range: the
+         * copy is a host memmove and its caller's frame is further up than
+         * this reaches. Worse, a copy that ran past its buffer overwrites the
+         * stack itself, so the list comes out empty exactly when it is most
+         * needed -- and an empty list under a promising heading reads like
+         * "nothing to see" rather than "the evidence is destroyed". */
+        if (!shown)
+            fprintf(stderr, "    (no return addresses in range)\n");
+
+        /* The indirect-call history, which the stack cannot overwrite. On the
+         * crash this was added for it was the only thing that named a
+         * function, and it named the right one. */
+        {
+            extern volatile uint32_t g_icall_trace[16];
+            extern volatile uint32_t g_icall_trace_idx;
+            uint32_t k;
+            fprintf(stderr, "  recent ICALL targets:");
+            for (k = 0; k < 16; k++)
+                fprintf(stderr, " %08X",
+                        g_icall_trace[(g_icall_trace_idx + k) & 15]);
+            fprintf(stderr, "\n");
+        }
+
+        /* The frame unfiltered. The pointers and lengths handed to whatever
+         * faulted live here, and they look nothing like code. */
+        for (i = 0; i < 20; i++)
+            fprintf(stderr, "    raw[esp+%-4d] 0x%08X\n", i * 4, sp[i]);
     }
 }
 
