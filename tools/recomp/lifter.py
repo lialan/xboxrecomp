@@ -375,6 +375,15 @@ CF_TRACKED = frozenset({
 # separately and _function_needs_cf treats them as CF producers.
 BT_MODIFY = frozenset({"bts", "btr", "btc"})
 
+# Arithmetic that writes its destination and leaves ZF as (destination == 0).
+# A join can unify two different setters from this set when they share a
+# destination register, because a je or jne then means the same thing on both
+# edges. cmp and test are deliberately absent: they write no destination.
+ZF_FROM_DEST = frozenset({
+    "sub", "add", "and", "or", "xor", "inc", "dec", "neg",
+    "adc", "sbb", "shl", "shr", "sar",
+})
+
 # Additional instructions that modify EFLAGS (tracked but handled as generic)
 _EFLAGS_SETTERS = frozenset({
     "shld", "shrd", "rol", "ror", "rcl", "rcr",  # Shifts/rotates set CF
@@ -487,6 +496,25 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if not cond_info:
         return None
     cmp_macro, test_macro, desc = cond_info
+
+    # A join whose predecessors disagree on which instruction set the flags,
+    # but agree that the zero flag came from the same destination register.
+    #
+    # "sub eax, ecx" on one edge and "dec eax" on the other are different
+    # setters, so the state cannot be inherited as itself -- yet both leave
+    # ZF as (eax == 0), which is all a je or jne needs. The translator
+    # recognises that case and passes this marker.
+    #
+    # Only ZF is answerable from it. dec does not write CF, so a jb after the
+    # same join would be reading a flag one predecessor never set; returning
+    # None there leaves the existing fallback in place.
+    if flag_setter == "__zf_from_dest" and flag_ops:
+        dest = _fmt_operand_read(flag_ops[0])
+        if jcc in ("je", "jz"):
+            return f"({dest} == 0)", desc
+        if jcc in ("jne", "jnz"):
+            return f"({dest} != 0)", desc
+        return None
 
     # A cmp/test that is not fused with its jcc snapshots its operands into
     # _fa/_fb (zero-extended) and _fas/_fbs (sign-extended) at the point the
