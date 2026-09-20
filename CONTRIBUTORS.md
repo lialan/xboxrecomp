@@ -611,6 +611,26 @@ nothing about it.
   `WINBOOL 0;`; enum constants coexist with them. And the `__debugbreak` guard
   tested `_MSC_VER` where it needed `_WIN32`, since MinGW is neither and
   declares a real one.
+- **A loop head lost its exit test because the back edge had no state yet
+  (#86)** — blocks are lifted in address order, so the predecessor on a back
+  edge sits *after* the block it reaches and has no out-state on a single pass.
+  The join correctly refuses to guess, the `jcc` at the top falls back to
+  `_flags` — a variable nothing ever assigns — and the branch compiles as never
+  taken. In the middle of a function that costs a little accuracy; at the top
+  of a counted loop it removes the loop's only exit. In DDS9's XMV row padding
+  the loop stored eight bytes and advanced `edi` by sixteen forever, walked off
+  the framebuffer, and took the process with it. Settling the state to a fixed
+  point before emitting fixes it; `sub eax, ecx` and `dec eax` are different
+  setters that agree on the one thing a `jz` is asking.
+- **`__SEH_prolog` detection required the four-push form (#87)** — the second
+  byte marker is `lea ebp, [esp+0x10]`, and that offset counts the slots the
+  helper pushed before it: the three-push form lands on `0x0C` and was
+  undetectable. Silent, because "not found" is indistinguishable from a CRT
+  that has no `__SEH_prolog`, so every SEH function kept its caller's stale
+  `ebp` — the first frame-relative store landed in the caller's frame and the
+  epilogue cut the stack back to it. A title can also link more than one:
+  DDS9 carries both forms, and returning the first match meant which one won
+  depended on nothing but the lower address.
 
 ---
 
