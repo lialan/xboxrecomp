@@ -24,7 +24,7 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
-                     _RESULT_SNAPSHOT_SETTERS,
+                     _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
 
@@ -1562,14 +1562,21 @@ class BatchTranslator:
                 self.func_db, self.xbe_data, verbose=True)
             seh_prolog = seh_prolog if seh_prolog is not None else found_prologs
             seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
-        self.seh_prolog = seh_prolog
+        seh_prologs = tuple(sorted(_as_addr_set(seh_prolog)))
+        self.seh_prolog = (None if not seh_prologs else
+                           seh_prologs[0] if len(seh_prologs) == 1 else
+                           seh_prologs)
         self.seh_epilog = seh_epilog
 
         setjmp_fn, longjmp_fn = detect_setjmp_helpers(
             self.func_db, self.xbe_data, verbose=True)
 
-        self.translator.lifter.SEH_PROLOG = seh_prolog
+        seh_prologs = frozenset(seh_prologs)
+        self.translator.lifter.SEH_PROLOGS = seh_prologs
+        self.translator.lifter.SEH_PROLOG = min(seh_prologs) if seh_prologs else None
         self.translator.lifter.SEH_EPILOG = seh_epilog
+        self.translator.lifter.SEH_HELPERS = seh_prologs | (
+            {seh_epilog} if seh_epilog is not None else set())
         self.translator.lifter.SETJMP_FN = setjmp_fn
         self.translator.lifter.LONGJMP_FN = longjmp_fn
         if not coalesce_json_paths:
