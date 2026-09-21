@@ -73,6 +73,21 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_SYSKEYDOWN:
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
+        /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
+         *
+         * The obvious diagnostic -- sampling which keys are held, once a
+         * second, from the input path -- cannot tell a key that was never
+         * pressed from one that was tapped: a 100 ms press is caught about
+         * one time in ten. That ambiguity is expensive when the only way
+         * to test is to ask someone to press a key and describe what
+         * happened. This answers "did it arrive" on its own. */
+        if (getenv("RECOMP_KEY_TRACE")) {
+            static unsigned n;
+            if (n++ < 40) {
+                fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)w);
+                fflush(stderr);
+            }
+        }
         return 0;
 
     case WM_KEYUP:
