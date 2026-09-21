@@ -41,10 +41,49 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
         s_fb_pitch = pitch;
 }
 
+/* Which keys are down, for the pad stand-in in src/input.
+ *
+ * GetAsyncKeyState looked like the cheaper way to ask and does not work
+ * here: it reads a state Wine keeps for the X server, and a guest process
+ * drawing through GDI never sees it change. The window that has the focus
+ * is the thing that receives the keys, so that is what has to remember
+ * them.
+ *
+ * Reading this needs no lock. Each entry is written only by the window
+ * thread and read only by the USB thread, one byte at a time, and a press
+ * seen a frame late is indistinguishable from one made a frame later. */
+static volatile unsigned char s_key_down[256];
+
+int xbox_FramebufferKeyDown(int vk)
+{
+    if ((unsigned)vk > 255)
+        return 0;
+    return s_key_down[vk] != 0;
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
-    if (m == WM_CLOSE || m == WM_DESTROY) {
+    switch (m) {
+    case WM_CLOSE:
+    case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
+        return 0;
+
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        if ((unsigned)w < 256)
+            s_key_down[w] = 1;
+        return 0;
+
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        if ((unsigned)w < 256)
+            s_key_down[w] = 0;
+        return 0;
+
+    /* Alt-tabbing away with a key held would leave it held for ever. */
+    case WM_KILLFOCUS:
+        memset((void *)s_key_down, 0, sizeof s_key_down);
         return 0;
     }
     return DefWindowProcA(h, m, w, l);

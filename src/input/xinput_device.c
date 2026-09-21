@@ -58,19 +58,21 @@ static BOOL keyboard_enabled(void)
     return on ? TRUE : FALSE;
 }
 
-static BOOL keyboard_has_focus(void)
-{
-    HWND fg = GetForegroundWindow();
-    DWORD pid = 0;
-    if (!fg)
-        return FALSE;
-    GetWindowThreadProcessId(fg, &pid);
-    return pid == GetCurrentProcessId();
-}
+/* The framebuffer window records what is held; see src/video/fb_present.c.
+ *
+ * GetAsyncKeyState was the first attempt and reads nothing here -- under
+ * Wine it answers about a state a GDI-drawing guest never touches. Going
+ * through the window is also the better gate: a window only receives keys
+ * while it has the focus, so there is no separate focus check to get wrong
+ * and no way for typing in another application to drive the game.
+ *
+ * Declared rather than included so src/input does not depend on the video
+ * module's include path. */
+extern int xbox_FramebufferKeyDown(int vk);
 
 static BOOL key_down(int vk)
 {
-    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+    return xbox_FramebufferKeyDown(vk) ? TRUE : FALSE;
 }
 
 /* A thumb axis from two keys, at the full deflection a digital key implies. */
@@ -142,9 +144,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     result = XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
-        /* Port 0 only, and only with no pad on it: the keyboard stands in
-         * for a controller nobody has, never in front of one they do. */
-        if (dwPort == 0 && keyboard_enabled() && keyboard_has_focus()) {
+        if (dwPort == 0 && keyboard_enabled()) {
             keyboard_state(pState);
             return ERROR_SUCCESS;
         }
@@ -177,6 +177,35 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
     pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
     pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
+
+    /* Merge the keyboard on top rather than only standing in for a missing
+     * pad.
+     *
+     * The first version put the keyboard behind XInput's failure, on the
+     * assumption that with nothing plugged in the call would fail. It does
+     * not: under Wine XInputGetState returns ERROR_SUCCESS and a gamepad
+     * with every button at rest, so the fallback was unreachable and
+     * pressing a key did nothing at all.
+     *
+     * Merging is also the better rule. A real pad keeps working -- its
+     * buttons are already in pState and the keyboard only adds to them --
+     * and there is no special case left to get wrong. */
+    if (dwPort == 0 && keyboard_enabled()) {
+        XBOX_INPUT_STATE kb;
+        int i;
+        keyboard_state(&kb);
+        pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
+        for (i = 0; i < 8; i++)
+            if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
+                pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
+        if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
+        if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
+        if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
+        if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
+        /* The input layer records edges, so an unchanged packet number is
+         * read as the same state and the press never happens. */
+        pState->dwPacketNumber = kb.dwPacketNumber;
+    }
 
     return ERROR_SUCCESS;
 }
