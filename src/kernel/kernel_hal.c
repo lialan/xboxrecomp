@@ -120,8 +120,42 @@ LARGE_INTEGER __stdcall xbox_KeQueryPerformanceFrequency(void)
 
 VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
 {
-    if (CurrentTime)
-        GetSystemTimeAsFileTime((LPFILETIME)CurrentTime);
+    /* Anchored once to the wall clock, advanced by the performance counter.
+     *
+     * GetSystemTimeAsFileTime alone moves in steps of about 15.6 ms, the
+     * host's scheduler tick. The console's clock is far finer, and a title
+     * that busy-waits on this -- reading it until enough time has passed --
+     * spins for the whole of each step instead of a few iterations.
+     *
+     * Measured on Shin Megami Tensei: Nine: one such wait called this
+     * **11.8 million times in two seconds**, which is most of what the
+     * title was doing at that moment, and it came out of the spin in a
+     * state where it no longer polled the gamepad.
+     *
+     * The anchor keeps the absolute value right; the counter supplies the
+     * resolution between ticks. */
+    static LONGLONG anchor_100ns;
+    static LONGLONG anchor_counts;
+    static LONGLONG freq_counts;
+    LARGE_INTEGER now;
+
+    if (!CurrentTime)
+        return;
+
+    if (!freq_counts) {
+        FILETIME ft;
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        GetSystemTimeAsFileTime(&ft);
+        QueryPerformanceCounter(&now);
+        freq_counts = f.QuadPart ? f.QuadPart : 1;
+        anchor_100ns = ((LONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        anchor_counts = now.QuadPart;
+    }
+
+    QueryPerformanceCounter(&now);
+    CurrentTime->QuadPart = anchor_100ns
+        + ((now.QuadPart - anchor_counts) * 10000000LL) / freq_counts;
 }
 
 /* ============================================================================
