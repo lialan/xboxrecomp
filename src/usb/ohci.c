@@ -468,6 +468,16 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
                 g_ctrl_len = usb_gamepad_control(&g_setup, g_ctrl_buf,
                                                  (int)sizeof g_ctrl_buf);
                 if (g_ctrl_len < 0) {
+                    /* Worth saying out loud. A stall here halts the
+                     * endpoint until the driver clears it, and a driver
+                     * that sees one usually stops using the device -- so
+                     * an unhandled request is not a gap that degrades
+                     * gracefully, it is one that ends input. */
+                    fprintf(stderr, "  [OHCI%d] STALL: unhandled control "
+                            "request %02X %02X value %04X index %04X len %u\n",
+                            hc->index, g_setup.bmRequestType, g_setup.bRequest,
+                            g_setup.wValue, g_setup.wIndex, g_setup.wLength);
+                    fflush(stderr);
                     g_setup_pending = 0;
                     return TD_CC_STALL;
                 }
