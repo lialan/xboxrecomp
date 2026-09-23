@@ -270,4 +270,5 @@ void xbox_FramebufferWindowStart(void)
 #else
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
+int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 #endif

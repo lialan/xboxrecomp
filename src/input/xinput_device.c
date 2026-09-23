@@ -11,6 +11,7 @@
  */
 
 #include "xinput_xbox.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* ======================================================================== */
@@ -33,8 +34,8 @@ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
  *
  * Off by default, because a keyboard silently acting as player 1 is
  * surprising when a real pad is what you meant to use. RECOMP_KEYBOARD=1
- * turns it on; it only ever answers for port 0, and only when no pad is
- * connected there, so it can never take a real controller's place.
+ * turns it on. It only ever answers for port 0, and is merged on top of a
+ * pad connected there, so a real controller keeps working.
  *
  * The keys are the ones a Dreamcast or Saturn emulator would pick, which is
  * the closest thing to a convention here:
@@ -42,11 +43,10 @@ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
  *   arrows        d-pad             Enter      START
  *   Z X A S       A B X Y           Backspace  BACK
  *   Q E           white black       1 3        triggers
- *   W/S/A/D       left thumb        I/K/J/L    right thumb
+ *   numpad 8/2/4/6 left thumb       I/K/J/L    right thumb
  *
- * GetAsyncKeyState reads the key state whether or not this process is
- * focused, so the foreground window is checked first -- otherwise typing in
- * another window drives the game.
+ * Keys come from the framebuffer window, which only receives them while it
+ * has the focus, so typing in another window does not drive the game.
  */
 static BOOL keyboard_enabled(void)
 {
