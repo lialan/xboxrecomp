@@ -18,7 +18,8 @@
 #define RECOMP_GENERATED_CODE 1
 #include "../../templates/runtime/recomp_types.h"
 
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+/* MSVC has no __m64 intrinsics on x64, so _M_X64 is left out. */
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86)
 
 #include <mmintrin.h>
 #include <xmmintrin.h>
@@ -168,9 +169,11 @@ int main(void)
                 PSHUFW_CASE(0xB1); PSHUFW_CASE(0xE4); PSHUFW_CASE(0x27);
                 PSHUFW_CASE(0x93); PSHUFW_CASE(0xFF);
 #undef PSHUFW_CASE
+/* pextrw zero-extends, but GCC 10's _mm_extract_pi16 returns the lane
+ * sign-extended, so the reference is cut back to 16 bits first. */
 #define LANE_CASE(IMM)                                                    \
                 check("MMX_PEXTRW", MMX_PEXTRW(ra, (IMM)),                \
-                      (uint32_t)_mm_extract_pi16(to_m64(a), (IMM)),       \
+                      (uint32_t)(uint16_t)_mm_extract_pi16(to_m64(a), (IMM)), \
                       a, (IMM));                                          \
                 check("MMX_PINSRW",                                       \
                       MMX_PINSRW(ra, (uint32_t)(b & 0xFFFF), (IMM)).q,    \
@@ -194,7 +197,7 @@ int main(void)
 
 int main(void)
 {
-    printf("not an x86 host: no instruction to compare against, skipped\n");
+    printf("no MMX intrinsics on this host: nothing to compare against, skipped\n");
     return 0;
 }
 
