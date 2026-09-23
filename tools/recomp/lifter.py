@@ -882,6 +882,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
     if flag_setter in ("rol", "ror", "rcl", "rcr"):
+        # rcl/rcr leave their carry-out in _cf (RC_ROT writes it back), and
+        # _function_needs_cf declares _cf for any function containing them.
+        if flag_setter in ("rcl", "rcr"):
+            if jcc in ("jb", "jnae", "jc"):
+                return "_cf", desc
+            if jcc in ("jae", "jnb", "jnc"):
+                return "!_cf", desc
         # ZF/SF not modified by rotations - can't resolve most conditions
         return None
 
