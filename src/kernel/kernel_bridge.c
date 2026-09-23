@@ -3153,10 +3153,11 @@ static void bridge_NtReadFile(void)
      *
      * The read itself stays synchronous here: the status block is already
      * written and the event already signalled, so a caller that waits is
-     * satisfied immediately. Only the answer changes. */
-    if (STACK_ARG(1) || STACK_ARG(2)
-            || (bridge_async_io_enabled()
-                && bridge_handle_is_async(STACK_ARG(0))))
+     * satisfied immediately. Only the answer changes.
+     *
+     * An event or APC alone does not make a read asynchronous: on a
+     * synchronous handle the kernel waits and returns the final status. */
+    if (bridge_async_io_enabled() && bridge_handle_is_async(STACK_ARG(0)))
         g_eax = STATUS_PENDING;
 }
 
