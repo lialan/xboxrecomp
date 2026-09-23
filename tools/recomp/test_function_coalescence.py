@@ -108,7 +108,7 @@ def test_rejects_call_to_interior_even_with_incomplete_metadata():
         subject.coalesce_function(BASE, BASE + 8, [BASE + 7])
 
 
-@pytest.mark.parametrize("padding", ["6690", "8d1b", "8da4240000000090"])
+@pytest.mark.parametrize("padding", ["6690", "8bff", "8d1b", "8da4240000000090"])
 def test_only_proven_alignment_padding_closes_a_decode_gap(padding):
     pad = bytes.fromhex(padding)
     body = bytes([0xeb, len(pad)]) + pad + b"\xc3"
@@ -118,8 +118,9 @@ def test_only_proven_alignment_padding_closes_a_decode_gap(padding):
     assert subject._recovered_cfg[BASE]["end"] == BASE + len(body)
 
 
-def test_unreached_live_instructions_are_not_alignment_padding():
-    subject = translator(bytes.fromhex("eb0231c0c3"), [BASE + 4])
+@pytest.mark.parametrize("live", ["31c0", "8bfe"])
+def test_unreached_live_instructions_are_not_alignment_padding(live):
+    subject = translator(bytes.fromhex("eb02" + live + "c3"), [BASE + 4])
     with pytest.raises(ValueError, match="CFG gap"):
         subject.coalesce_function(BASE, BASE + 5, [BASE + 4])
 
