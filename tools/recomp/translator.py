@@ -586,14 +586,19 @@ class FunctionTranslator:
         """Return whether one instruction is wide alignment padding.
 
         An assembler aligns the next branch target with a single wide
-        instruction that has no effect: either an explicit multi-byte ``nop``
-        or the classic ``lea reg, [reg]`` form, which reloads a register with
-        its own address.
+        instruction that has no effect: an explicit multi-byte ``nop``, the
+        classic ``lea reg, [reg]`` form, which reloads a register with its
+        own address, or a register self-move such as MSVC's two-byte
+        ``mov edi, edi``.
         """
         if instruction.size < 2:
             return False
         if instruction.mnemonic == "nop":
             return True
+        if instruction.mnemonic == "mov" and len(instruction.operands) == 2:
+            destination, source = instruction.operands
+            return (destination.type == "reg" and source.type == "reg"
+                    and destination.reg == source.reg)
         if instruction.mnemonic != "lea" or len(instruction.operands) != 2:
             return False
         destination, source = instruction.operands
