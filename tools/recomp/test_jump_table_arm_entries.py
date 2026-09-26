@@ -12,9 +12,9 @@ Collection screen reached 0xDE030, the shared exit of a split 4-way switch.
 
 The pass gives such an arm its own entry, recovered from the code reachable
 from it up to its table. It must not read into an adjacent table (whose arms
-belong to another switch), and it must leave an arm alone when the arm jumps
-back to an address that is not an entry: that jump would become a call to an
-empty stub, and a loud unresolved dispatch is better than a silent skip.
+belong to another switch), and it must leave an arm alone when the arm cannot
+run as a function of its own: a partial entry misbehaves silently, and a loud
+unresolved dispatch is better.
 """
 
 import os
@@ -81,14 +81,19 @@ def test_switch_inside_its_function_adds_nothing():
     print("ok  switch_inside_its_function_adds_nothing")
 
 
-def test_arm_branching_back_to_a_non_entry_is_left_unresolved():
-    translator = _translator(_split_db(), b"\xEB\xF6")    # jmp ARM - 8
-    assert translator.discover_jump_table_entries() == set()
-    print("ok  arm_branching_back_to_a_non_entry_is_left_unresolved")
+def test_arm_that_cannot_run_alone_is_left_unresolved():
+    for name, code in (
+            ("branches back to a non-entry", "ebf6"),     # jmp ARM - 8
+            ("runs off its range", "eb07"),               # jmp to int3s
+            ("reads the dispatcher's flags", "83d000c3"),  # adc eax, 0
+            ("calls a missing body", "e84b000000c3")):    # call BASE+0x80
+        translator = _translator(_split_db(), bytes.fromhex(code))
+        assert translator.discover_jump_table_entries() == set(), name
+    print("ok  arm_that_cannot_run_alone_is_left_unresolved")
 
 
 if __name__ == "__main__":
     test_arm_gets_an_entry_covering_its_reachable_code()
     test_switch_inside_its_function_adds_nothing()
-    test_arm_branching_back_to_a_non_entry_is_left_unresolved()
+    test_arm_that_cannot_run_alone_is_left_unresolved()
     print("jump_table_arm_entries: ALL PASS")

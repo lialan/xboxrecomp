@@ -280,6 +280,19 @@ def _seh_prologs_of(lifter):
     one = getattr(lifter, "SEH_PROLOG", None)
     return {one} if one is not None else set()
 
+# Instructions that read or define EFLAGS, for checking what a recovered
+# entry expects from its caller. Anything unlisted is treated as neither.
+_FLAG_READERS = frozenset({
+    "adc", "sbb", "rcl", "rcr", "pushf", "pushfd", "lahf", "into", "salc",
+})
+_FLAG_WRITERS = frozenset({
+    "add", "sub", "cmp", "test", "and", "or", "xor", "inc", "dec", "neg",
+    "shl", "sal", "shr", "sar", "mul", "imul", "bsf", "bsr", "bt", "bts",
+    "btr", "btc", "cmpxchg", "xadd", "popf", "popfd", "sahf", "comiss",
+    "ucomiss", "comisd", "ucomisd", "fcomi", "fcomip", "fucomi", "fucomip",
+})
+
+
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
@@ -569,15 +582,9 @@ class FunctionTranslator:
                 continue
             instructions, jump_tables, _ = recovered
             end = max(insn.end_address for insn in instructions)
-            if not any(insn.is_terminator for insn in instructions):
-                continue  # runs off its range; not a whole arm
-            if any(insn.is_branch and insn.jump_target is not None
-                   and not target <= insn.jump_target < end
-                   and (insn.jump_target not in self.func_db
-                        or insn.jump_target in self.owned_function_starts)
-                   for insn in instructions):
-                # A branch to code with no generated body would become a call
-                # to an empty stub; an unresolved dispatch at least stops.
+            if not self._arm_is_whole(target, instructions):
+                # A partial arm would misbehave silently; an unresolved
+                # dispatch at least stops.
                 continue
             enclosing = self.func_db[max(
                 start for start in callers)]
@@ -603,6 +610,45 @@ class FunctionTranslator:
             self.jump_table_entry_starts.add(target)
 
         return self.jump_table_entry_starts
+
+    def _arm_is_whole(self, target, instructions):
+        """Return whether a recovered arm can run as a function of its own.
+
+        Every path must end in a return or jump, reach only decoded code or
+        generated bodies, and the entry must not read flags the dispatcher
+        set: a new C function starts with its flags cleared.
+        """
+        by_address = {insn.address: insn for insn in instructions}
+
+        def has_body(address):
+            info = self.func_db.get(address)
+            return (info is not None
+                    and address not in self.owned_function_starts
+                    and info.get("end", address) > address)
+
+        for insn in instructions:
+            destination = (insn.call_target if insn.is_call
+                           else insn.jump_target)
+            if destination is not None and not (
+                    (insn.is_branch and destination in by_address)
+                    or has_body(destination)):
+                return False
+            if not insn.is_terminator and insn.end_address not in by_address:
+                return False
+
+        insn = by_address.get(target)
+        while insn is not None:
+            reads = (insn.mnemonic in _FLAG_READERS
+                     or insn.mnemonic.startswith(("set", "cmov", "fcmov"))
+                     or (insn.is_cond_jump and insn.mnemonic not in (
+                         "loop", "jecxz", "jcxz")))
+            if reads:
+                return False
+            if (insn.mnemonic in _FLAG_WRITERS or insn.is_call
+                    or insn.is_branch or insn.is_ret):
+                break
+            insn = by_address.get(insn.end_address)
+        return True
 
     def _read_bounded_jump_table(self, table_va, lower, limit):
         """Read table entries in [table_va, limit) that point into
