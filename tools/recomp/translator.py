@@ -1153,6 +1153,13 @@ class FunctionTranslator:
 
         backward = scan(-1, 1)
         forward = scan(1, 0)
+        if not forward and len(backward) < 2:
+            # Slot 0 is not an arm when the index can never be 0: MSVC's CRT
+            # memcpy does `and eax, 3` on a path where eax is 1..3 and jumps
+            # through [eax*4 + LeadUpVec - 4], so the displacement points at
+            # the jmp's own bytes. See lifter._analyze_switch_table.
+            forward = scan(1, 1)
+            backward = []
         if len(backward) + len(forward) < 2:
             return []
         backward.reverse()
