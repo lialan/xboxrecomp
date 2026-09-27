@@ -295,6 +295,14 @@ static uint8_t synthetic_buttons(void)
  * a b x y black white lt rt (the analog bytes, reported fully pressed).
  * Every entry is printed as it fires, so a run log says what was pressed when.
  *
+ * RECOMP_PAD_LIVE=<file> is the same thing driven while the title runs: each
+ * line appended to the file -- <button>[+<button>...][:<hold ms>], no time --
+ * is pressed as soon as it is read. With RECOMP_FB_DUMP and a short
+ * RECOMP_PB_REPORT_MS that makes a loop: look at the frame, append a press,
+ * look again. A fixed timeline cannot do that on a rasterised run, where
+ * how long a screen takes to appear depends on how much the software
+ * rasteriser has to draw.
+ *
  * Like RECOMP_PAD_PRESS this is a bring-up tool, off unless set. */
 #define PAD_SCRIPT_MAX 256
 
@@ -400,6 +408,68 @@ static void pad_script_load(void)
     fflush(stderr);
 }
 
+/* Drop steps that have finished, so a long live session never fills up. */
+static void pad_script_compact(unsigned long t)
+{
+    int i, n = 0;
+    for (i = 0; i < s_script_len; i++)
+        if (t < s_script[i].at_ms + s_script[i].hold_ms)
+            s_script[n++] = s_script[i];
+    s_script_len = n;
+}
+
+/* Read whatever has been appended to RECOMP_PAD_LIVE since last time, and
+ * schedule each complete line at t. Polled at most every 50 ms. */
+static void pad_live_poll(unsigned long t)
+{
+    static const char *path;
+    static int checked;
+    static long consumed;
+    static unsigned long last_poll;
+    static char pending[512];
+    static size_t npending;
+    FILE *f;
+    int c;
+
+    if (!checked) {
+        checked = 1;
+        path = getenv("RECOMP_PAD_LIVE");
+        if (path && *path) {
+            fprintf(stderr, "  PAD: live input from %s\n", path);
+            fflush(stderr);
+        }
+    }
+    if (!path || !*path || (t - last_poll < 50 && last_poll))
+        return;
+    last_poll = t;
+    f = fopen(path, "rb");
+    if (!f)
+        return;
+    if (fseek(f, consumed, SEEK_SET) != 0) {
+        fclose(f);
+        return;
+    }
+    while ((c = fgetc(f)) != EOF) {
+        consumed++;
+        if (c == '\n' || c == '\r') {
+            if (npending) {
+                char line[560];
+                pending[npending] = 0;
+                snprintf(line, sizeof line, "%lu:%s", t, pending);
+                if (s_script_len >= PAD_SCRIPT_MAX - 1)
+                    pad_script_compact(t);
+                pad_script_parse(line);
+                fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, t);
+                fflush(stderr);
+                npending = 0;
+            }
+        } else if (npending < sizeof pending - 1) {
+            pending[npending++] = (char)c;
+        }
+    }
+    fclose(f);
+}
+
 static void pad_script_apply(uint8_t *out)
 {
     static unsigned long t0;
@@ -408,12 +478,13 @@ static void pad_script_apply(uint8_t *out)
 
     if (s_script_len < 0)
         pad_script_load();
-    if (s_script_len == 0)
-        return;
     now = (unsigned long)GetTickCount();
     if (!t0)
         t0 = now;
     t = now - t0;
+    pad_live_poll(t);
+    if (s_script_len == 0)
+        return;
     for (i = 0; i < s_script_len; i++) {
         PadStep *st = &s_script[i];
         if (t < st->at_ms || t >= st->at_ms + st->hold_ms)
