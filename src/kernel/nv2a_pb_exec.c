@@ -156,6 +156,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_BEGIN_END               0x17FC
 #define NV097_SET_TEXTURE_OFFSET          0x1B00   /* +i*0x40 */
 #define NV097_SET_TEXTURE_FORMAT          0x1B04
+#define NV097_SET_TEXTURE_PALETTE         0x1B20   /* offset | size<<2 | dma */
 #define NV097_SET_TEXTURE_ADDRESS         0x1B08
 #define NV097_SET_TEXTURE_CONTROL1        0x1B10
 #define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
@@ -225,6 +226,7 @@ typedef struct {
     uint32_t pitch;                     /* bytes per row, from CONTROL1  */
     uint32_t color;                     /* NV097 colour-format code      */
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
+    uint32_t palette;                   /* guest address of the CLUT, P8 */
     int      valid;
 } Texture;
 
@@ -779,6 +781,15 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
         return 1;
     case 0x1E:                                      /* LIN_X8R8G8B8 */
         *argb = ((const uint32_t *)p)[u] | 0xFF000000u;
+        return 1;
+
+    /* 8-bit palette index, swizzled. Burnout 3 draws its logo and frontend
+     * header art this way; without a case every such quad came out as the
+     * unsupported-format fill, a white box where the logo should be. */
+    case 0x0B:                                      /* SZ_I8_A8R8G8B8 */
+        if (!s_gpu.tex.palette)
+            return 0;
+        *argb = ((const uint32_t *)(mem + s_gpu.tex.palette))[p[u]];
         return 1;
 
     /* 32-bit, other channel orders. The name gives the byte order from the
@@ -1884,6 +1895,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.tex.width  = 1u << ((param >> 20) & 0xF);
             s_gpu.tex.height = 1u << ((param >> 24) & 0xF);
         }
+        record_tex_reg(method, param);
+        break;
+
+    case NV097_SET_TEXTURE_PALETTE:
+        /* Where a P8 texture's 256 A8R8G8B8 entries live. The low six bits
+         * carry the DMA context and the entry count, so the offset is what is
+         * left -- and it is physical, like every other DMA offset. */
+        s_gpu.tex.palette = dma_resolve(param & ~0x3Fu);
         record_tex_reg(method, param);
         break;
 
