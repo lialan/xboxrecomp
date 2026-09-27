@@ -428,6 +428,7 @@ static void pad_live_poll(unsigned long t)
     static unsigned long last_poll;
     static char pending[512];
     static size_t npending;
+    static unsigned long next_free;
     FILE *f;
     int c;
 
@@ -454,12 +455,19 @@ static void pad_live_poll(unsigned long t)
         if (c == '\n' || c == '\r') {
             if (npending) {
                 char line[560];
+                /* Several lines in one read go one after another, with a
+                 * 200 ms release between: a title polling its pad a few times
+                 * a second would otherwise see "down" and "a" in the same
+                 * report, which is a different input from "down, then a". */
+                unsigned long at = t > next_free ? t : next_free;
                 pending[npending] = 0;
-                snprintf(line, sizeof line, "%lu:%s", t, pending);
+                snprintf(line, sizeof line, "%lu:%s", at, pending);
                 if (s_script_len >= PAD_SCRIPT_MAX - 1)
                     pad_script_compact(t);
                 pad_script_parse(line);
-                fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, t);
+                if (s_script_len > 0)
+                    next_free = at + s_script[s_script_len - 1].hold_ms + 200;
+                fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
                 fflush(stderr);
                 npending = 0;
             }
