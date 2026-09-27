@@ -1766,7 +1766,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * them sit inside the 4 GB __PAGEZERO segment and none can. */
         /* Reserve base + mirrors as one range, and map the base at its head.
          * VirtualFree releases just the slice about to be used, so each view
-         * replaces our own reservation rather than racing for free space. */
+         * replaces our own reservation rather than racing for free space.
+         *
+         * POSIX only. Win32 VirtualFree cannot release part of a reservation:
+         * MEM_RELEASE with a nonzero size is ERROR_INVALID_PARAMETER, so both
+         * frees below fail, the base view never maps, and the whole span stays
+         * reserved. At a 64 MB map that is 1.8 GB the OS tends to place at
+         * 0x80000000 -- exactly the host range the contiguous window (guest
+         * 0x80000000) needs, which then fails with error 487 and the first
+         * touch of the kernel page faults. Larger map sizes push the span
+         * above 4 GB, which is why Half-Life 2 (768 MB) never saw it. Doing
+         * this on Windows needs placeholder reservations (VirtualAlloc2). */
+#ifndef _WIN32
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
@@ -1780,6 +1791,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 g_span_size = 0;
             }
         }
+#endif
 
         const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
         for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
