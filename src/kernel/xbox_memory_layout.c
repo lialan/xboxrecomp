@@ -2960,7 +2960,16 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * the GPU-instance bridge, so the two do not meet until the window is full.
  * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
  * title allocates once. */
-static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+/* Starts one page in. Physical page 0 is never handed out by the real
+ * kernel, and the XDK's USB stack relies on that: XPP carves its host
+ * controller structures from a private 0xFE0-byte arena ending at
+ * 0x80001000 (sub_00365454 in Burnout 3), with no allocation call at all.
+ * Starting at the base gave that same page to the title's first
+ * MmAllocateContiguousMemory -- XAPI's launch data page -- and whichever
+ * wrote last won. The symptom was timing-dependent: enumeration worked
+ * when logging slowed the title down and otherwise stopped in the root
+ * port reset, walking a device whose parent pointer had been overwritten. */
+static uint32_t g_contig_next = XBOX_CONTIG_BASE + 0x1000u;
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
