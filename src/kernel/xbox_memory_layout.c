@@ -987,7 +987,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
-                    if (s_nv2a_trace && now_ms - last_report > 10000) {
+                    /* RECOMP_PB_REPORT_MS shortens it: the report is also
+                     * when RECOMP_FB_DUMP writes a frame, and stepping a
+                     * scripted pad through a menu needs a picture per
+                     * press rather than one every ten seconds. */
+                    static long report_ms = -1;
+                    if (report_ms < 0) {
+                        const char *e = getenv("RECOMP_PB_REPORT_MS");
+                        report_ms = e ? atol(e) : 10000;
+                        if (report_ms < 100) report_ms = 100;
+                    }
+                    if (s_nv2a_trace && now_ms - last_report > (uint64_t)report_ms) {
                         last_report = now_ms;
                         nv2a_pb_scan_report();
                     }
