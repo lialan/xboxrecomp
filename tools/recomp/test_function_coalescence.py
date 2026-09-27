@@ -7,6 +7,8 @@ import pytest
 from . import __main__ as recomp_main
 from . import config
 from . import manual_scan
+from .disasm import Instruction
+from .lifter import Lifter
 from .translator import BatchTranslator, FunctionTranslator, load_coalescences
 
 
@@ -398,9 +400,13 @@ def test_interrupt_return_is_terminal_for_recovery_and_emission(iret):
     with pytest.raises(ValueError, match="not the requested end"):
         subject.coalesce_function(BASE, BASE + len(body), [interior])
 
+    # Emission must not abort the build: a linear sweep reads iretd out of
+    # data (Wreckless has one at 0x001345A6), so the site becomes a runtime
+    # RECOMP_UNIMPL marker like any other untranslatable instruction.
     whole = translator(body, [])
-    with pytest.raises(ValueError, match="Unsupported interrupt return"):
-        whole.translate_function(BASE, whole.func_db[BASE])
+    whole.translate_function(BASE, whole.func_db[BASE])
+    insn = Instruction(BASE, len(iret), "iretd", "", iret.hex(), operands=[])
+    assert "RECOMP_UNIMPL" in " ".join(Lifter().lift_instruction(insn))
 
 
 def test_xbox_int2d_int3_slide_preserves_fallthrough():

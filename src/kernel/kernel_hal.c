@@ -17,6 +17,12 @@
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma intrinsic(_ReturnAddress)
+#define IRQL_CALLER() _ReturnAddress()
+#else
+#define IRQL_CALLER() __builtin_return_address(0)
+#endif
 
 /* ============================================================================
  * IRQL Simulation
@@ -174,7 +180,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
             old, NewIrql);
     }
 
-    irql_track(old, NewIrql, __builtin_return_address(0));
+    irql_track(old, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
     return old;
 }
@@ -210,7 +216,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
             g_current_irql, NewIrql);
     }
 
-    irql_track(g_current_irql, NewIrql, __builtin_return_address(0));
+    irql_track(g_current_irql, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
 }
 
@@ -221,7 +227,7 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
 
-    irql_track(old, DISPATCH_LEVEL, __builtin_return_address(0));
+    irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
     g_current_irql = DISPATCH_LEVEL;
     return old;
 }

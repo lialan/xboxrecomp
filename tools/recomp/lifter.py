@@ -3737,12 +3737,14 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # for any later jcc, and that one reads the snapshot. Emit the
             # snapshot here too or those temps are stale - which silently sends
             # every reusing branch the wrong way.
-            if flag_insn.mnemonic in ("cmp", "test") and len(flag_insn.operands) >= 2:
-                stmts.extend(lifter._snapshot_flags(
-                    flag_insn, flag_insn.operands, flag_insn.mnemonic))
-            stmts.append(stmt)
+            # Snapshot and record the same normalised form, or a later jcc
+            # reads `cmp X, 0` state out of `test X, X` temps.
             last_flag_setter, last_flag_ops = normalise_zero_test(
                 flag_insn.mnemonic, list(flag_insn.operands))
+            if flag_insn.mnemonic in ("cmp", "test") and len(flag_insn.operands) >= 2:
+                stmts.extend(lifter._snapshot_flags(
+                    flag_insn, last_flag_ops, last_flag_setter))
+            stmts.append(stmt)
             i += consumed
             continue
 

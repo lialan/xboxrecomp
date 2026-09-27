@@ -1890,15 +1890,6 @@ class FunctionTranslator:
         instructions, blocks = self.decode_function(start, end)
         if not blocks:
             return None
-        interrupt_return = next((
-            insn for insn in instructions
-            if insn.mnemonic in ("iret", "iretd")
-        ), None)
-        if interrupt_return is not None:
-            raise ValueError(
-                f"Unsupported interrupt return {interrupt_return.mnemonic} at "
-                f"0x{interrupt_return.address:08X}: guest EIP/CS/EFLAGS restore "
-                "is not implemented")
 
         # Get classification and ABI info
         cls_info = self.classification_db.get(start, {})

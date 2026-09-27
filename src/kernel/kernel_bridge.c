@@ -87,7 +87,7 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes)
     uint64_t end = (uint64_t)va + bytes;
     uint64_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
 
-    if (va < XBOX_FS_BASE)      /* page zero is deliberately unmapped */
+    if (va < 0x1000)            /* page zero is deliberately unmapped */
         return 0;
     if (end <= mapped)
         return 1;

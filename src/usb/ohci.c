@@ -120,8 +120,8 @@ static void wr32(uint32_t va, uint32_t v);
 #define OHCI_PORTS              2
 
 /* Passes this thread will keep an interrupt back while the guest is at
- * DISPATCH_LEVEL or above. One pass is the 20 ms loop tick, so this is two
- * seconds.
+ * DISPATCH_LEVEL or above. One pass is the OHCI_TICK_MS (4 ms) loop tick, so
+ * this is two seconds.
  *
  * It was 80 ms, on the reasoning that no real critical section lasts longer.
  * True of the hardware and false here: recompiled code under an emulated

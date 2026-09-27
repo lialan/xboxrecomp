@@ -19,8 +19,8 @@ with its vertical structure intact.
 
 import unittest
 
-from .disasm import Instruction, Operand
-from .lifter import Lifter, normalise_zero_test
+from .disasm import BasicBlock, Instruction, Operand
+from .lifter import Lifter, lift_basic_block, normalise_zero_test
 from .translator import _merge_flag_states
 
 
@@ -72,6 +72,20 @@ class ZeroTestNormalisationTest(unittest.TestCase):
         from_cmp = ("cmp", [mem, Operand(type="imm", imm=0, mem_size=4)])
         from_test = ("test", [_reg("eax"), _reg("ebx")])
         self.assertIsNone(_merge_flag_states([from_cmp, from_test]))
+
+    def test_fused_test_jcc_snapshots_the_form_it_records(self):
+        """`test eax, eax; je` records `cmp eax, 0`, so its snapshot must be
+        that compare too: a later `jl` reads CMP_L(_fas, _fbs), and with the
+        test's `_fb = eax` it compared eax with itself and was never taken."""
+        test = Instruction(0x10, 2, "test", "eax, eax", "85c0",
+                           operands=[_reg("eax"), _reg("eax")])
+        je = Instruction(0x12, 2, "je", "0x20", "7400",
+                         operands=[Operand(type="imm", imm=0x20)])
+        je.jump_target = 0x20
+        stmts, state = lift_basic_block(
+            Lifter(), BasicBlock(start=0x10, instructions=[test, je]))
+        self.assertEqual(state[0], "cmp")
+        self.assertIn("_fb = (uint32_t)(0)", " ".join(stmts))
 
 
 if __name__ == "__main__":

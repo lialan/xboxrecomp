@@ -1323,11 +1323,11 @@ static uint32_t g_watch_last;
 static void    *g_watch_veh;
 static RECOMP_TLS int s_watch_stepping;
 
-/* A plausible guest code address: inside the image, above the headers. The
- * bound is the end of XPP, which is the last section holding code here. */
+/* A plausible guest code address: inside the image's executable sections,
+ * as recorded from the section headers at load. */
 static int watch_is_code(uint32_t va)
 {
-    return va >= 0x00011000u && va < 0x00317460u;
+    return va >= g_xbox_code_lo && va < g_xbox_code_hi;
 }
 
 static void watch_report(void)

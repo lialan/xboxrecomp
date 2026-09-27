@@ -66,7 +66,7 @@ def _parse_force_returns(items):
         if "=" not in item:
             raise SystemExit(f"--force-return wants ADDR=VALUE, got {item!r}")
         addr, _, value = item.partition("=")
-        out[int(addr, 0)] = int(value, 0)
+        out[int(addr, 0)] = int(value, 0) & 0xFFFFFFFF  # -1 is 0xFFFFFFFF
     return out
 
 

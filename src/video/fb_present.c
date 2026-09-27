@@ -145,13 +145,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 fflush(stderr);
             }
         }
-        return 0;
+        /* System keys still go to Windows, or Alt+F4 stops closing us. */
+        return m == WM_SYSKEYDOWN ? DefWindowProcA(h, m, w, l) : 0;
 
     case WM_KEYUP:
     case WM_SYSKEYUP:
         if ((unsigned)w < 256)
             s_key_down[w] = 0;
-        return 0;
+        return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
