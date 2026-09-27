@@ -17,6 +17,7 @@
 #include <stdlib.h>
 
 #include <string.h>
+#include <ctype.h>
 
 /* ---- descriptors ------------------------------------------------------- */
 
@@ -277,6 +278,159 @@ static uint8_t synthetic_buttons(void)
     return (uint8_t)((phase < hold_ms) ? mask : 0u);
 }
 
+/* A scripted pad, for driving a title through its menus with nobody at it.
+ *
+ * RECOMP_PAD_PRESS pulses one digital mask forever, which gets past a
+ * "press Start" screen and no further: a menu wants A, which is an analog
+ * button on this pad, and it wants presses in order. This takes a timeline:
+ *
+ *   RECOMP_PAD_SCRIPT=40000:start,44000:a,46000:down,47000:a:400
+ *
+ * Each entry is <ms>:<button>[+<button>...][:<hold ms>], with times measured
+ * from the first report the title asks for (so from enumeration, not from
+ * process start) and a default hold of 150 ms. RECOMP_PAD_SCRIPT=@file reads
+ * the same syntax from a file, one entry per line or comma separated.
+ *
+ * Buttons: up down left right start back lthumb rthumb (the digital byte) and
+ * a b x y black white lt rt (the analog bytes, reported fully pressed).
+ * Every entry is printed as it fires, so a run log says what was pressed when.
+ *
+ * Like RECOMP_PAD_PRESS this is a bring-up tool, off unless set. */
+#define PAD_SCRIPT_MAX 256
+
+typedef struct {
+    unsigned long at_ms, hold_ms;
+    uint8_t digital;         /* report byte 2 */
+    uint8_t analog;          /* bit n = report byte 4 + n */
+    int announced;
+} PadStep;
+
+static PadStep s_script[PAD_SCRIPT_MAX];
+static int     s_script_len = -1;
+
+static int same_word(const char *a, const char *b, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++)
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i]))
+            return 0;
+    return 1;
+}
+
+static int pad_button_bits(const char *name, size_t n, uint8_t *dig, uint8_t *ana)
+{
+    static const struct { const char *name; uint8_t dig, ana; } k[] = {
+        {"up", 0x01, 0}, {"down", 0x02, 0}, {"left", 0x04, 0},
+        {"right", 0x08, 0}, {"start", 0x10, 0}, {"back", 0x20, 0},
+        {"lthumb", 0x40, 0}, {"rthumb", 0x80, 0},
+        {"a", 0, 0x01}, {"b", 0, 0x02}, {"x", 0, 0x04}, {"y", 0, 0x08},
+        {"black", 0, 0x10}, {"white", 0, 0x20}, {"lt", 0, 0x40}, {"rt", 0, 0x80},
+    };
+    size_t i;
+    for (i = 0; i < sizeof k / sizeof k[0]; i++) {
+        if (strlen(k[i].name) == n && same_word(k[i].name, name, n)) {
+            *dig |= k[i].dig;
+            *ana |= k[i].ana;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void pad_script_parse(const char *text)
+{
+    const char *p = text;
+
+    while (*p && s_script_len < PAD_SCRIPT_MAX) {
+        PadStep st;
+        char *end;
+        const char *b;
+
+        while (*p == ',' || *p == ' ' || *p == '\r' || *p == '\n' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
+        memset(&st, 0, sizeof st);
+        st.hold_ms = 150;
+        st.at_ms = strtoul(p, &end, 0);
+        if (end == p || *end != ':') {
+            fprintf(stderr, "  PAD: script entry without <ms>: at \"%.20s\"\n", p);
+            break;
+        }
+        b = end + 1;
+        for (;;) {
+            size_t n = strcspn(b, "+:,\r\n ");
+            if (!pad_button_bits(b, n, &st.digital, &st.analog))
+                fprintf(stderr, "  PAD: unknown button \"%.*s\"\n", (int)n, b);
+            b += n;
+            if (*b != '+')
+                break;
+            b++;
+        }
+        if (*b == ':')
+            st.hold_ms = strtoul(b + 1, (char **)&b, 0);
+        s_script[s_script_len++] = st;
+        p = b;
+    }
+}
+
+static void pad_script_load(void)
+{
+    const char *spec = getenv("RECOMP_PAD_SCRIPT");
+
+    s_script_len = 0;
+    if (!spec || !*spec)
+        return;
+    if (spec[0] == '@') {
+        FILE *f = fopen(spec + 1, "rb");
+        static char buf[16384];
+        size_t n;
+        if (!f) {
+            fprintf(stderr, "  PAD: cannot open script %s\n", spec + 1);
+            return;
+        }
+        n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        pad_script_parse(buf);
+    } else {
+        pad_script_parse(spec);
+    }
+    fprintf(stderr, "  PAD: script of %d step(s)\n", s_script_len);
+    fflush(stderr);
+}
+
+static void pad_script_apply(uint8_t *out)
+{
+    static unsigned long t0;
+    unsigned long now, t;
+    int i, j;
+
+    if (s_script_len < 0)
+        pad_script_load();
+    if (s_script_len == 0)
+        return;
+    now = (unsigned long)GetTickCount();
+    if (!t0)
+        t0 = now;
+    t = now - t0;
+    for (i = 0; i < s_script_len; i++) {
+        PadStep *st = &s_script[i];
+        if (t < st->at_ms || t >= st->at_ms + st->hold_ms)
+            continue;
+        if (!st->announced) {
+            st->announced = 1;
+            fprintf(stderr, "  PAD: t=%lu ms step %d (digital 0x%02X analog 0x%02X)\n",
+                    t, i, st->digital, st->analog);
+            fflush(stderr);
+        }
+        out[2] |= st->digital;
+        for (j = 0; j < 8; j++)
+            if (st->analog & (1u << j))
+                out[4 + j] = 0xFF;
+    }
+}
+
 int usb_gamepad_report(uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -328,6 +482,7 @@ int usb_gamepad_report(uint8_t *out, int max)
 
     if (xbox_InputGetState(0, &state) != 0) {
         out[2] = synth;
+        pad_script_apply(out);
         return 20;
     }
 
@@ -344,5 +499,6 @@ int usb_gamepad_report(uint8_t *out, int max)
     out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+    pad_script_apply(out);
     return 20;
 }
