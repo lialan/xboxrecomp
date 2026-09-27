@@ -2394,13 +2394,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  *
                  * Enabled by the same variable, because neither half is any
                  * use without the other. */
+                /* Registers and the VP only (0x00000-0x2FFFF). The GP and EP
+                 * windows above them (0x30000-0x7FFFF) are the DSPs' own
+                 * X/Y/P memories, which behave as RAM on hardware and which
+                 * the APU model does not implement -- it drops writes there
+                 * and reads back 0. Trapping them bought nothing, and cost a
+                 * fault on any access the MMIO decoder cannot emulate:
+                 * Burnout 3's DirectSound bulk-copies DSP memory with
+                 * rep movsd, which the lifter lowers to a host memcpy, and
+                 * that faulted at 0xFE830B78 with no way to resume. Plain
+                 * memory keeps what the title writes. */
+                enum { APU_TRAP_BYTES = 0x00030000 };
                 DWORD old_protect;
-                if (VirtualProtect((char *)g_mcpx_memory, 0x00080000u,
+                if (VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
                 if (g_apu_mmio_trapped)
-                    fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",
-                            XBOX_MCPX_BASE, XBOX_MCPX_BASE + 0x00080000u);
+                    fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO"
+                                    " (GP/EP DSP memory left as RAM)\n",
+                            XBOX_MCPX_BASE, XBOX_MCPX_BASE + APU_TRAP_BYTES);
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
                     |= MCPX_AC97_CODEC_READY;
