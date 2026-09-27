@@ -444,20 +444,57 @@ static int guest_ok(uint32_t va, uint32_t bytes)
     return (uint64_t)va + bytes <= (uint64_t)mapped;
 }
 
+/* A host controller is a bus master: every pointer the driver hands it --
+ * HcHCCA, HcControlHeadED, ED and TD links, buffer pointers -- is a PHYSICAL
+ * address. On hardware physical P and the contiguous window's 0x80000000 + P
+ * are the same bytes. Here the window is separate storage, so a physical
+ * address a driver took from MmGetPhysicalAddress names nothing it wrote.
+ *
+ * Burnout 3's XPP does exactly that: it builds its descriptors in
+ * MmAllocateContiguousMemory at 0x825B50C0, converts, and writes 0x025B50C0.
+ * Read as RAM, every ED came back all zeroes, the controller saw an empty
+ * list, and enumeration waited forever for a transfer that never moved.
+ * (DDS9's driver writes window addresses directly, which guest_ok already
+ * accepts, so it never needed this.)
+ *
+ * Resolved the way the pushbuffer executor resolves surface offsets
+ * (dma_resolve in nv2a_pb_exec.c): below the contiguous allocator's
+ * high-water mark an address is memory some MmAllocateContiguousMemory call
+ * returned, and its bytes live in the window.
+ *
+ * Except inside the loaded image. A driver also points transfers at its own
+ * statics -- Burnout 3's first GET_DESCRIPTOR reads into 0x0041A904, in .data
+ * -- and MmGetPhysicalAddress passes those through unchanged. A real kernel
+ * never hands out contiguous memory that overlaps the image, so an address
+ * inside it is the image. Sending that one to the window delivered the
+ * descriptor where the driver never looked, and it reset the port and asked
+ * again, forever. */
+static uint32_t bus_resolve(uint32_t addr)
+{
+    if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
+        return addr;
+    if (addr && addr < xbox_ContiguousAllocatedBytes())
+        return OHCI_CONTIG_BASE + addr;
+    return addr;
+}
+
 static uint32_t rd32(uint32_t va)
 {
+    va = bus_resolve(va);
     if (!guest_ok(va, 4))
         return 0;
     return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
 }
 static void wr32(uint32_t va, uint32_t v)
 {
+    va = bus_resolve(va);
     if (!guest_ok(va, 4))
         return;
     *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
 }
 static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 {
+    va = bus_resolve(va);
     return guest_ok(va, bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
 }
