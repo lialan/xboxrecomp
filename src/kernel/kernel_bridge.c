@@ -467,6 +467,9 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
     g_esp += 12;
 }
 
+void guest_cpu_join(void);
+void guest_cpu_part(void);
+
 static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
@@ -492,7 +495,9 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     }
     free(s);
 
+    guest_cpu_join();
     bridge_run_thread_inline(fn, ctx1, ctx2);
+    guest_cpu_part();
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
@@ -9124,7 +9129,87 @@ static void kernel_watch_arm_once(void)
 /* Current dispatching slot */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
+static void kernel_thunk_dispatch_body(void);
+
+/* The guest CPU lock (RECOMP_GUEST_LOCK=1).
+ *
+ * The Xbox has one CPU: two guest threads never run guest code at the same
+ * instant, and titles lean on that without knowing it -- a worker fills a
+ * buffer and sets a flag with plain stores, and the reader trusts the order.
+ * Here every guest thread runs on its own host core, and the lifted C gives
+ * no ordering either. T()NY crashes somewhere different on every run
+ * once its loader workers start.
+ *
+ * With the lock on, a guest thread holds it while it runs guest code and
+ * lets go for the length of every kernel call -- the waits, sleeps and I/O
+ * where the console's scheduler would switch threads anyway. Host threads
+ * that only run a guest callback (vblank, interrupts) never take it.
+ *
+ * ponytail: a guest thread that spins in guest code on a flag another guest
+ * thread sets, with no kernel call in the loop, deadlocks here. The console
+ * would preempt it on its quantum; the upgrade is a periodic yield point in
+ * the lifted code's backward branches. */
+static CRITICAL_SECTION g_guest_cpu;
+static int g_guest_cpu_on = -1;
+static RECOMP_TLS int t_guest_thread;     /* this host thread runs a guest thread */
+static RECOMP_TLS int t_guest_held;       /* and holds the guest CPU */
+static RECOMP_TLS int t_dispatch_depth;
+
+static int guest_cpu_enabled(void)
+{
+    if (g_guest_cpu_on < 0) {
+        const char *e = getenv("RECOMP_GUEST_LOCK");
+        InitializeCriticalSection(&g_guest_cpu);
+        g_guest_cpu_on = e && *e == '1';
+        if (g_guest_cpu_on)
+            fprintf(stderr, "  [KERNEL] guest CPU lock on: one guest thread runs at a time\n");
+    }
+    return g_guest_cpu_on;
+}
+
+/* Called once on each host thread that runs a guest thread, before its first
+ * guest instruction. */
+void guest_cpu_join(void)
+{
+    t_guest_thread = 1;
+    if (guest_cpu_enabled() && !t_guest_held) {
+        EnterCriticalSection(&g_guest_cpu);
+        t_guest_held = 1;
+    }
+}
+
+void guest_cpu_part(void)
+{
+    if (t_guest_held) {
+        t_guest_held = 0;
+        LeaveCriticalSection(&g_guest_cpu);
+    }
+    t_guest_thread = 0;
+}
+
+/* A guest thread lets go of the guest CPU for the length of every kernel
+ * call. */
 static void kernel_thunk_dispatch(void)
+{
+    int held = t_guest_held;
+    if (held) {                        /* let other guest threads run meanwhile */
+        t_guest_held = 0;
+        LeaveCriticalSection(&g_guest_cpu);
+    }
+    t_dispatch_depth++;
+    kernel_thunk_dispatch_body();
+    t_dispatch_depth--;
+    /* Back to guest code: take the CPU again. Only at the outermost call --
+     * a guest callback a bridge runs (an APC) returns into the bridge, not to
+     * the thread's own code -- and only if the thread still exists as one. */
+    if (t_guest_thread && t_dispatch_depth == 0 && guest_cpu_enabled()) {
+        EnterCriticalSection(&g_guest_cpu);
+        t_guest_held = 1;
+    }
+    (void)held;
+}
+
+static void kernel_thunk_dispatch_body(void)
 {
     int slot = g_kernel_dispatch_slot;
     bridge_func_t bridge;
@@ -9375,6 +9460,7 @@ void xbox_kernel_bridge_init(void)
     int unbridged = 0;
     DWORD old_protect;
 
+    guest_cpu_join();          /* the caller goes on to run the title's entry point */
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
             g_thunk_table_count, g_thunk_table_base);
 
