@@ -11,6 +11,7 @@ The emitted text is checked here, and the helper is compiled and run: a text
 check cannot tell a correct nearest-even from one that rounds halves up.
 """
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -34,7 +35,7 @@ class FrndintLiftTest(unittest.TestCase):
 
 class FrndintRuntimeTest(unittest.TestCase):
     def test_each_rounding_control_rounds_its_own_way(self):
-        cc = shutil.which("cc")
+        cc = next(filter(None, map(shutil.which, ("cc", "gcc", "clang"))), None)
         if not cc:
             self.skipTest("no C compiler available")
         source = r'''
@@ -87,7 +88,8 @@ int main(void) {
             built = subprocess.run(
                 [cc, "-std=c11", "-Wall", "-Wextra", "-Werror",
                  "-I", str(_ROOT / "templates" / "runtime"),
-                 str(src), "-o", str(exe), "-lm"],
+                 str(src), "-o", str(exe)]
+                    + ([] if os.name == "nt" else ["-lm"]),
                 capture_output=True, text=True)
             self.assertEqual(0, built.returncode, built.stdout + built.stderr)
             ran = subprocess.run([str(exe)], capture_output=True, text=True)
