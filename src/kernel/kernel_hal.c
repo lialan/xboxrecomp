@@ -67,7 +67,69 @@ int xbox_IrqlRaisedCount(void)
 static int  s_trace = -1;
 static volatile LONG s_traced = 0;
 
-static void irql_track(KIRQL old_level, KIRQL new_level)
+/* Every crossing of the DISPATCH boundary, ever.
+ *
+ * The depth on its own cannot tell a leaked raise from a guest that is
+ * genuinely sitting there: both read non-zero for as long as you look. A
+ * count that stops moving says the first; one that races says the second.
+ * That distinction is the whole difference between "the title is busy" and
+ * "no device will ever get an interrupt again". */
+static volatile LONG s_transitions = 0;
+
+int xbox_IrqlTransitions(void)
+{
+    return (int)InterlockedCompareExchange(&s_transitions, 0, 0);
+}
+
+/* Which threads are holding the boundary up, and where they raised.
+ *
+ * A depth that stops changing has to be attributed to code, and the raise
+ * that did it happened seconds earlier on a thread that has since gone
+ * quiet -- there is nothing left to look at by the time anyone notices.
+ * Keeping the caller's address per raised thread turns the number into a
+ * name: these are host addresses inside the recompiled image, so nm resolves
+ * them to the generated function, which is the guest function. */
+#define IRQL_HOLDERS 8
+static struct { volatile LONG tid; void *ra; } s_holders[IRQL_HOLDERS];
+
+static void irql_holder_add(void *ra)
+{
+    LONG me = (LONG)GetCurrentThreadId();
+    int i;
+
+    for (i = 0; i < IRQL_HOLDERS; i++)
+        if (InterlockedCompareExchange(&s_holders[i].tid, me, 0) == 0) {
+            s_holders[i].ra = ra;
+            return;
+        }
+}
+
+static void irql_holder_drop(void)
+{
+    LONG me = (LONG)GetCurrentThreadId();
+    int i;
+
+    for (i = 0; i < IRQL_HOLDERS; i++)
+        if (InterlockedCompareExchange(&s_holders[i].tid, 0, me) == me)
+            return;
+}
+
+void xbox_IrqlDumpHolders(void)
+{
+    int i;
+
+    fprintf(stderr, "  [IRQLHOLD] depth=%d transitions=%d, raised threads:\n",
+            xbox_IrqlRaisedCount(), xbox_IrqlTransitions());
+    for (i = 0; i < IRQL_HOLDERS; i++) {
+        LONG t = InterlockedCompareExchange(&s_holders[i].tid, 0, 0);
+        if (t)
+            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p\n",
+                    (unsigned long)t, s_holders[i].ra);
+    }
+    fflush(stderr);
+}
+
+static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 {
     int was = (old_level >= DISPATCH_LEVEL);
     int now = (new_level >= DISPATCH_LEVEL);
@@ -78,6 +140,11 @@ static void irql_track(KIRQL old_level, KIRQL new_level)
 
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
+    InterlockedIncrement(&s_transitions);
+    if (now)
+        irql_holder_add(ra);
+    else
+        irql_holder_drop();
 
     /* RECOMP_IRQL_TRACE prints the first few transitions. The pairing is what
      * matters: a raise to 2 followed by a lower from 2 nets out, and a lower
@@ -107,7 +174,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
             old, NewIrql);
     }
 
-    irql_track(old, NewIrql);
+    irql_track(old, NewIrql, __builtin_return_address(0));
     g_current_irql = NewIrql;
     return old;
 }
@@ -119,12 +186,31 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
     if (NewIrql > g_current_irql) {
+        /* A lower that raises the count.
+         *
+         * irql_track works on the edge, so this call crosses the boundary
+         * upwards and increments. The pair that would bring it back down has
+         * already happened, so the depth is now permanently one too high --
+         * and the count is what every device model reads before delivering.
+         * One of these ends interrupts for the rest of the run.
+         *
+         * Loud rather than a filtered warning because of that consequence:
+         * the symptom is a device going silent minutes later, with nothing
+         * connecting it back to here. */
+        static volatile LONG n;
+        if (InterlockedIncrement(&n) <= 20) {
+            fprintf(stderr, "  [IRQLBUG] tid %lu KfLowerIrql(%d) while at %d"
+                    " -- counted as a raise, depth is now stuck\n",
+                    (unsigned long)GetCurrentThreadId(),
+                    (int)NewIrql, (int)g_current_irql);
+            fflush(stderr);
+        }
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
             g_current_irql, NewIrql);
     }
 
-    irql_track(g_current_irql, NewIrql);
+    irql_track(g_current_irql, NewIrql, __builtin_return_address(0));
     g_current_irql = NewIrql;
 }
 
@@ -135,7 +221,7 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
 
-    irql_track(old, DISPATCH_LEVEL);
+    irql_track(old, DISPATCH_LEVEL, __builtin_return_address(0));
     g_current_irql = DISPATCH_LEVEL;
     return old;
 }
