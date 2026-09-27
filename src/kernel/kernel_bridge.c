@@ -368,7 +368,11 @@ static ULONG g_slot_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE];
 /* Calls per ordinal, for the ranking in the periodic summary. 378 counters
  * is smaller than one of the strings this file prints. */
 static unsigned long long g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
-static int g_kernel_call_count = 0;
+/* 64-bit: a title that polls the clock through the kernel passes 2^31 calls
+ * within minutes (X-Men Legends does). As a 32-bit int it wrapped negative,
+ * "count <= log budget" turned true, and every kernel call then wrote two log
+ * lines through the shared stderr lock -- the frame rate fell to ~1 FPS. */
+static long long g_kernel_call_count = 0;
 
 /* How many kernel calls get logged before the log goes quiet.
  *
@@ -9039,7 +9043,7 @@ static void kernel_thunk_dispatch(void)
          * function is calling this" into "this call site is", which is the
          * difference between guessing and knowing when a title recurses. */
         fprintf(stderr,
-                "  [KERNEL] #%d: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
+                "  [KERNEL] #%lld: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
                 g_kernel_call_count, ordinal, slot, g_esp,
                 g_esp ? BRIDGE_MEM32(g_esp) : 0);
         fflush(stderr);
@@ -9050,7 +9054,7 @@ static void kernel_thunk_dispatch(void)
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
-            fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
+            fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             /* And which ones, ranked. "Latest" names whatever the sample
              * happened to land on; the question behind this line is what a
@@ -9111,7 +9115,7 @@ static void kernel_thunk_dispatch(void)
             if (_watch_before != seen) {
                 seen = _watch_before;
                 fprintf(stderr, "  [KWATCH] 0x%08X = %08X before ordinal %u"
-                                " (call #%d)\n",
+                                " (call #%lld)\n",
                         g_kernel_watch_va, _watch_before, ordinal,
                         g_kernel_call_count);
                 fflush(stderr);
