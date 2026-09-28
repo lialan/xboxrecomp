@@ -34,6 +34,7 @@
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
+#include "nv2a_vsh_interp.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -269,6 +270,12 @@ static struct {
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
     Texture  tex;
+    /* Vertex programs (nv2a_vsh_interp.c) and the depth buffer, which
+     * together are what a 3D scene needs and a 2D one never used. */
+    uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
+    uint32_t batches_program, verts_program, tris_behind;
+    uint32_t depth_test, depth_func, depth_mask;
+    uint32_t zeta_offset, zstencil_clear;
 } s_gpu;
 
 /* Unhandled methods, ranked. The interesting output is not that something was
@@ -449,6 +456,22 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         for (i = 0; i < a->size && i < 4; i++)
             out[i] = (float)p[i] / 255.0f;
         return 1;
+    /* The formats 3D geometry uses and screen-space quads never did. */
+    case 1:                                  /* signed short, normalised */
+        for (i = 0; i < a->size && i < 4; i++)
+            out[i] = (float)((const int16_t *)p)[i] / 32767.0f;
+        return 1;
+    case 5:                                  /* signed short, as is */
+        for (i = 0; i < a->size && i < 4; i++)
+            out[i] = (float)((const int16_t *)p)[i];
+        return 1;
+    case 6: {                                /* packed 11:11:10 normal */
+        uint32_t v = *(const uint32_t *)p;
+        out[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f;
+        out[1] = (float)((int32_t)(v << 10) >> 21) / 1023.0f;
+        out[2] = (float)((int32_t)v >> 22) / 511.0f;
+        return 1;
+    }
     default:
         return 0;
     }
@@ -1315,6 +1338,249 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
                     textured ? (const float (*)[2])uv : NULL);
 }
 
+/* ---- 3D: vertex programs and depth -------------------------------------
+ *
+ * A batch drawn while TRANSFORM_EXECUTION_MODE says "program" carries
+ * model-space positions. Each vertex is run through the title's own vertex
+ * program (nv2a_vsh_interp.c), whose oPos output on Xbox D3D is already
+ * screen space -- the runtime appends the viewport transform and the divide
+ * by w -- with the clip-space w left in oPos.w. So the rasteriser gets pixel
+ * coordinates and a depth, and w for perspective-correct texturing.
+ *
+ * ponytail: no clipping. A triangle with any vertex behind the eye (w <= 0)
+ * is dropped rather than clipped, which loses the slivers that cross the near
+ * plane; road right under the camera is where that shows. Clip in
+ * homogeneous space if it matters. */
+
+/* Depth buffers, host-side, one per zeta surface the title uses. The real one
+ * lives in guest memory in a tiled format nothing here decodes, and nothing
+ * the title does reads it back, so a float buffer per zeta offset is enough. */
+#define NV_ZBUF_W 1024
+#define NV_ZBUF_H 1024
+static struct { uint32_t offset; float *z; } s_zbufs[4];
+static int s_zbuf_next;
+
+static float zclear_value(void)
+{
+    /* Zeta format in SURFACE_FORMAT bits 4-7: 1 is Z16, 2 is Z24S8. */
+    uint32_t zf = (s_gpu.format >> 4) & 0xF;
+    return zf == 1 ? (float)(s_gpu.zstencil_clear & 0xFFFF)
+                   : (float)(s_gpu.zstencil_clear >> 8);
+}
+
+static float *zbuf_current(int create)
+{
+    int i;
+    size_t k;
+
+    for (i = 0; i < 4; i++)
+        if (s_zbufs[i].z && s_zbufs[i].offset == s_gpu.zeta_offset)
+            return s_zbufs[i].z;
+    if (!create)
+        return NULL;
+    i = s_zbuf_next++ & 3;
+    if (!s_zbufs[i].z)
+        s_zbufs[i].z = (float *)malloc(sizeof(float) * NV_ZBUF_W * NV_ZBUF_H);
+    if (!s_zbufs[i].z)
+        return NULL;
+    s_zbufs[i].offset = s_gpu.zeta_offset;
+    for (k = 0; k < (size_t)NV_ZBUF_W * NV_ZBUF_H; k++)
+        s_zbufs[i].z[k] = 3.4e38f;
+    return s_zbufs[i].z;
+}
+
+static void zbuf_clear(void)
+{
+    float *z = zbuf_current(1), v = zclear_value();
+    size_t k;
+    if (z)
+        for (k = 0; k < (size_t)NV_ZBUF_W * NV_ZBUF_H; k++)
+            z[k] = v;
+}
+
+static int depth_pass(float z, float stored)
+{
+    switch (s_gpu.depth_func) {                   /* GL enums, as the NV2A */
+    case 0x200: return 0;
+    case 0x201: return z <  stored;
+    case 0x202: return z == stored;
+    case 0x203: return z <= stored;
+    case 0x204: return z >  stored;
+    case 0x205: return z != stored;
+    case 0x206: return z >= stored;
+    default:    return 1;
+    }
+}
+
+static uint32_t pack_color(const float c[4])
+{
+    int i;
+    uint32_t b[4];
+    for (i = 0; i < 4; i++) {
+        float f = c[i] < 0.0f ? 0.0f : (c[i] > 1.0f ? 1.0f : c[i]);
+        b[i] = (uint32_t)(f * 255.0f + 0.5f);
+    }
+    return (b[3] << 24) | (b[0] << 16) | (b[1] << 8) | b[2];
+}
+
+static uint32_t modulate(uint32_t t, const float c[4])
+{
+    float f[4];
+    f[0] = (float)((t >> 16) & 0xFF) / 255.0f * c[0];
+    f[1] = (float)((t >> 8) & 0xFF) / 255.0f * c[1];
+    f[2] = (float)(t & 0xFF) / 255.0f * c[2];
+    f[3] = (float)(t >> 24) / 255.0f * c[3];
+    return pack_color(f);
+}
+
+static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+                               const Nv2aVshOutput *vc)
+{
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bpp = surface_bpp();
+    const Nv2aVshOutput *v[3];
+    const float *a, *b, *c;
+    float area, iw[3], uv[3][2], su = 1.0f, sv = 1.0f;
+    float *zb = NULL;
+    int minx, maxx, miny, maxy, x, y, k;
+    int textured = s_gpu.tex.valid;
+
+    v[0] = va; v[1] = vb; v[2] = vc;
+    a = va->pos; b = vb->pos; c = vc->pos;
+    if (bpp != 4 && bpp != 2)
+        return;
+    if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
+        s_gpu.tris_behind++;
+        return;
+    }
+    area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    if (area == 0.0f || area != area)
+        return;
+    if (!surface_begin_batch(mem))
+        return;
+    if (s_gpu.depth_test || s_gpu.depth_mask)
+        zb = zbuf_current(1);
+    if (tex_size_from_format(s_gpu.tex.color)) {
+        su = (float)s_gpu.tex.width;
+        sv = (float)s_gpu.tex.height;
+    }
+    for (k = 0; k < 3; k++) {
+        iw[k] = 1.0f / v[k]->pos[3];
+        uv[k][0] = v[k]->tex[0][0] * su * iw[k];
+        uv[k][1] = v[k]->tex[0][1] * sv * iw[k];
+    }
+
+    minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
+    maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
+    miny = (int)floorf(fminf(a[1], fminf(b[1], c[1])));
+    maxy = (int)ceilf (fmaxf(a[1], fmaxf(b[1], c[1])));
+    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
+    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
+    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
+    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (maxx > NV_ZBUF_W) maxx = NV_ZBUF_W;
+    if (maxy > NV_ZBUF_H) maxy = NV_ZBUF_H;
+    if (minx >= maxx || miny >= maxy) {
+        s_gpu.tris_skipped_offscreen++;
+        return;
+    }
+
+    for (y = miny; y < maxy; y++) {
+        for (x = minx; x < maxx; x++) {
+            float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
+            float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
+            float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
+            float l0, l1, l2, z, col[4], pw;
+            uint32_t argb;
+            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
+               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                continue;
+            /* w1 is opposite a, w2 opposite b, w0 opposite c. */
+            l0 = w1 / area; l1 = w2 / area; l2 = w0 / area;
+            z = l0 * a[2] + l1 * b[2] + l2 * c[2];
+            if (zb) {
+                float *zp = &zb[(size_t)y * NV_ZBUF_W + x];
+                if (s_gpu.depth_test && !depth_pass(z, *zp))
+                    continue;
+                if (s_gpu.depth_mask)
+                    *zp = z;
+            }
+            for (k = 0; k < 4; k++)
+                col[k] = l0 * va->d0[k] + l1 * vb->d0[k] + l2 * vc->d0[k];
+            argb = pack_color(col);
+            if (textured) {
+                uint32_t texel;
+                float tu, tv;
+                pw = l0 * iw[0] + l1 * iw[1] + l2 * iw[2];
+                tu = (l0 * uv[0][0] + l1 * uv[1][0] + l2 * uv[2][0]) / pw;
+                tv = (l0 * uv[0][1] + l1 * uv[1][1] + l2 * uv[2][1]) / pw;
+                if (sample_texture((uint32_t)(int32_t)floorf(tu),
+                                   (uint32_t)(int32_t)floorf(tv), &texel))
+                    argb = modulate(texel, col);
+            }
+            put_pixel(mem, bpp, x, y, argb);
+        }
+    }
+    s_gpu.tris_drawn++;
+    s_gpu.drawn_offset = s_gpu.color_offset;
+}
+
+static Nv2aVshOutput s_xf[NV_MAX_INDICES];
+
+static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
+{
+    float in[NV2A_VSH_INPUTS][4];
+    uint32_t a;
+
+    for (a = 0; a < NV2A_VSH_INPUTS; a++)
+        fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
+    return nv2a_vsh_run((const float (*)[4])in, out);
+}
+
+static void raster_batch_program(void)
+{
+    uint32_t i, n = s_gpu.idx_count;
+
+    for (i = 0; i < n; i++)
+        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+            return;                                    /* no program loaded */
+    s_gpu.batches_program++;
+    s_gpu.verts_program += n;
+    if (s_gpu.tex.valid)
+        note_texture_use();
+
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3)
+            raster_xf_triangle(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++)
+            raster_xf_triangle(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++)
+            raster_xf_triangle(&s_xf[0], &s_xf[i], &s_xf[i+1]);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            raster_xf_triangle(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+            raster_xf_triangle(&s_xf[i], &s_xf[i+2], &s_xf[i+3]);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            raster_xf_triangle(&s_xf[i], &s_xf[i+1], &s_xf[i+3]);
+            raster_xf_triangle(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 static void raster_batch(void)
 {
     uint32_t i;
@@ -1322,6 +1588,13 @@ static void raster_batch(void)
 
     if (s_gpu.idx_count < 3)
         return;
+    static int no_vsh = -1;
+    if (no_vsh < 0)
+        no_vsh = getenv("RECOMP_NO_VSH") != NULL;
+    if ((s_gpu.xf_mode & 3) == 2 && !no_vsh) {
+        raster_batch_program();
+        return;
+    }
     if (!batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         return;
@@ -1764,6 +2037,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_CLEAR_SURFACE:
         clear_surface(param);
+        if (param & 0x01)                         /* Z */
+            zbuf_clear();
         break;
 
     case NV097_SET_BEGIN_END:
@@ -1928,7 +2203,39 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         record_tex_reg(method, param);
         break;
 
+    /* Vertex programs and their constants: forwarded as they arrive. */
+    case 0x1E94:                                  /* TRANSFORM_EXECUTION_MODE */
+        s_gpu.xf_mode = param;
+        break;
+    case 0x1E98:                                  /* _PROGRAM_CXT_WRITE_EN */
+        nv2a_vsh_set_cxt_write(param);
+        break;
+    case 0x1E9C:                                  /* _PROGRAM_LOAD */
+        nv2a_vsh_set_load_slot(param);
+        break;
+    case 0x1EA0:                                  /* _PROGRAM_START */
+        nv2a_vsh_set_start_slot(param);
+        break;
+    case 0x1EA4:                                  /* _CONSTANT_LOAD */
+        nv2a_vsh_set_constant_load(param);
+        break;
+
+    /* Depth. */
+    case 0x030C: s_gpu.depth_test = param; break; /* DEPTH_TEST_ENABLE */
+    case 0x0354: s_gpu.depth_func = param; break; /* DEPTH_FUNC */
+    case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
+    case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
+    case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
+
     default:
+        if (method >= 0x0B00 && method < 0x0B80) {    /* TRANSFORM_PROGRAM(i) */
+            nv2a_vsh_program_word(param);
+            break;
+        }
+        if (method >= 0x0B80 && method < 0x0C00) {    /* TRANSFORM_CONSTANT(i) */
+            nv2a_vsh_constant_word(param);
+            break;
+        }
         if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST)
             record_tex_reg(method, param);
         if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
@@ -2147,6 +2454,9 @@ void nv2a_pb_exec_report(void)
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
+    fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
+                    " %u triangles dropped behind the eye\n",
+            s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
 
     /* And of the batches that did rasterise, how many sampled anything. A menu
      * that draws its background from one texture and its text from another
