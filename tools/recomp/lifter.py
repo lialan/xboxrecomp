@@ -596,23 +596,27 @@ def _make_condition(jcc, flag_setter, flag_ops):
         )
         desc = f"{desc} ({void_a} vs {void_b})" if desc else desc
         a, b = "_fca", "_fcb"
-        # comiss uses unsigned condition codes (CF, ZF)
+        # comiss uses unsigned condition codes (CF, ZF), and an unordered
+        # compare -- either side NaN -- sets ZF, PF and CF all three. The C
+        # relational operators are all false on NaN, which is right for
+        # ja/jae and wrong for everything that reads a set flag.
+        u = f"({a} != {a} || {b} != {b})"
         if jcc in ("ja", "jnbe"):
             return f"({a} > {b})", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({a} >= {b})", desc
         if jcc in ("jb", "jnae", "jc"):
-            return f"({a} < {b})", desc
+            return f"({a} < {b} || {u})", desc
         if jcc in ("jbe", "jna"):
-            return f"({a} <= {b})", desc
+            return f"({a} <= {b} || {u})", desc
         if jcc in ("je", "jz"):
-            return f"({a} == {b})", desc
+            return f"({a} == {b} || {u})", desc
         if jcc in ("jne", "jnz"):
-            return f"({a} != {b})", desc
-        if jcc == "jp":
-            return f"0 /* {jcc}: unordered/NaN */", desc
-        if jcc == "jnp":
-            return f"1 /* {jcc}: ordered */", desc
+            return f"({a} != {b} && !{u})", desc
+        if jcc in ("jp", "jpe"):
+            return u, desc
+        if jcc in ("jnp", "jpo"):
+            return f"!{u}", desc
         return None
 
     # SF is the sign bit of the result at the OPERAND's width, not at 32 bits.
@@ -3806,6 +3810,27 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 if probe:
                     zf_expr = probe[0]
             stmts.extend(lifter._lift_loop(curr, zf_expr))
+            i += 1
+            continue
+
+        # LAHF copies SF ZF AF PF CF into AH. It used to lift to a comment,
+        # leaving AH as whatever EAX held, so every `ucomiss; lahf; test ah,
+        # 0x44; jnp` -- MSVC's "is this float zero" -- answered at random.
+        # Burnout 3 guards a divide with exactly that; the guard fell
+        # through on 0, the 0/0 became the player's position, and the race
+        # camera, every matrix and the stunt-distance readout went NaN.
+        # The flags come from the tracked setter, through the same
+        # conditions the jcc forms use. AF is not modelled and reads 0.
+        if curr.mnemonic == "lahf" and last_flag_setter:
+            bits = []
+            for jcc, bit in (("js", 0x80), ("je", 0x40), ("jp", 0x04),
+                             ("jb", 0x01)):
+                probe = _make_condition(jcc, last_flag_setter, last_flag_ops)
+                if probe:
+                    bits.append(f"(({probe[0]}) ? 0x{bit:02X}u : 0u)")
+            stmts.append("eax = (eax & 0xFFFF00FFu) | ((uint32_t)("
+                         + " | ".join(bits + ["0x02u"])
+                         + f") << 8); /* lahf ({last_flag_setter}) */")
             i += 1
             continue
 
