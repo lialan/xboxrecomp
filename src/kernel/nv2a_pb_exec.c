@@ -257,6 +257,13 @@ static struct {
      * that has not been drawn yet -- which is how a correctly rendered
      * sequence came out as 12 black BMPs. */
     uint32_t drawn_offset;
+    /* ...and the shape of that surface. A title also draws into small
+     * render targets (Burnout 3: 128x128 shadow/reflection maps, pitch 512),
+     * often after the main scene, so "last surface drawn" alone picked one of
+     * those and read it with the framebuffer's pitch: horizontal noise. The
+     * biggest surface drawn since the last flip is the one being presented. */
+    uint32_t drawn_pitch, drawn_x, drawn_y, drawn_w, drawn_h;
+    int drawn_stale;      /* set at a flip: the next draw starts a new frame */
     uint64_t pixels;
     uint32_t pixel_max;   /* brightest value any pixel write carried */
     uint32_t clip_x, clip_w, clip_y, clip_h;
@@ -477,6 +484,18 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     }
 }
 
+static void note_drawn(void)
+{
+    if (!s_gpu.drawn_stale && s_gpu.drawn_offset
+        && s_gpu.clip_w * s_gpu.clip_h < s_gpu.drawn_w * s_gpu.drawn_h)
+        return;
+    s_gpu.drawn_stale = 0;
+    s_gpu.drawn_offset = s_gpu.color_offset;
+    s_gpu.drawn_pitch = s_gpu.pitch;
+    s_gpu.drawn_x = s_gpu.clip_x; s_gpu.drawn_y = s_gpu.clip_y;
+    s_gpu.drawn_w = s_gpu.clip_w; s_gpu.drawn_h = s_gpu.clip_h;
+}
+
 static uint32_t surface_bpp(void)
 {
     /* The pitch and the clip width together give the pixel size, which is more
@@ -502,15 +521,21 @@ static void dump_surface_bmp(void)
 {
     const char *prefix = getenv("RECOMP_FB_DUMP");
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = surface_bpp();
+    int drawn = s_gpu.drawn_offset != 0;
+    uint32_t offset = drawn ? s_gpu.drawn_offset : s_gpu.color_offset;
+    uint32_t pitch = drawn ? s_gpu.drawn_pitch : s_gpu.pitch;
+    uint32_t cx = drawn ? s_gpu.drawn_x : s_gpu.clip_x;
+    uint32_t cy = drawn ? s_gpu.drawn_y : s_gpu.clip_y;
     static int seq;
     char path[512];
-    uint32_t w = s_gpu.clip_w, h = s_gpu.clip_h, y, x;
+    uint32_t w = drawn ? s_gpu.drawn_w : s_gpu.clip_w;
+    uint32_t h = drawn ? s_gpu.drawn_h : s_gpu.clip_h, y, x;
+    uint32_t bpp = w ? pitch / w : 0;
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
     FILE *f;
 
-    if (!prefix || !w || !h || (bpp != 2 && bpp != 4) || !s_gpu.color_offset)
+    if (!prefix || !w || !h || (bpp != 2 && bpp != 4) || !offset)
         return;
 
     row_bytes = w * 3;
@@ -535,19 +560,17 @@ static void dump_surface_bmp(void)
 
     /* BMP rows run bottom-up. */
     for (y = h; y-- > 0; ) {
-        const uint8_t *row = mem + dma_resolve(s_gpu.drawn_offset
-                                                ? s_gpu.drawn_offset
-                                                : s_gpu.color_offset)
-                           + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+        const uint8_t *row = mem + dma_resolve(offset)
+                           + (size_t)(cy + y) * pitch;
         for (x = 0; x < w; x++) {
             uint8_t bgr[3];
             if (bpp == 4) {
-                uint32_t v = ((const uint32_t *)row)[s_gpu.clip_x + x];
+                uint32_t v = ((const uint32_t *)row)[cx + x];
                 bgr[0] = (uint8_t)(v);
                 bgr[1] = (uint8_t)(v >> 8);
                 bgr[2] = (uint8_t)(v >> 16);
             } else {
-                uint16_t v = ((const uint16_t *)row)[s_gpu.clip_x + x];
+                uint16_t v = ((const uint16_t *)row)[cx + x];
                 bgr[0] = (uint8_t)(( v        & 0x1F) << 3);
                 bgr[1] = (uint8_t)(((v >>  5) & 0x3F) << 2);
                 bgr[2] = (uint8_t)(((v >> 11) & 0x1F) << 3);
@@ -1135,7 +1158,7 @@ static void raster_triangle(const float a[2], const float b[2],
         }
     }
     s_gpu.tris_drawn++;
-    s_gpu.drawn_offset = s_gpu.color_offset;
+    note_drawn();
 }
 
 /* Attribute 3 is diffuse colour in every NV2A layout that sets one. Absent it,
@@ -1523,7 +1546,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         }
     }
     s_gpu.tris_drawn++;
-    s_gpu.drawn_offset = s_gpu.color_offset;
+    note_drawn();
 }
 
 static Nv2aVshOutput s_xf[NV_MAX_INDICES];
@@ -2143,11 +2166,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                : s_gpu.color_offset;
+            uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
+                                                : s_gpu.pitch;
             if (done) {
-                xbox_FramebufferWindowSet(dma_resolve(done), s_gpu.pitch);
-                xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
+                xbox_FramebufferWindowSet(dma_resolve(done), pitch);
+                xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
             }
         }
+        s_gpu.drawn_stale = 1;
+
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
             if (n++ < 8) {
