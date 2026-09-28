@@ -18,9 +18,9 @@
  *   out from ILU  3  2 1      a0.x relative 3  1 1   final 3 0 1
  *
  * Masks are x=8 y=4 z=2 w=1. A source mux of 1 reads a temp, 2 an input,
- * 3 a constant. Temp 12 is oPos. When the MAC and the ILU both write a temp
- * in the same instruction the ILU's goes to R1, and both units read their
- * sources before either writes.
+ * 3 a constant. Temp 12 is oPos. When an instruction carries both a MAC and
+ * an ILU op, the ILU's temp write goes to R1 whatever the temp field says,
+ * and both units read their sources before either writes.
  *
  * The layout is checked against real programs rather than taken on trust:
  * RECOMP_VSH_DUMP disassembles each program the title uploads, and an Xbox
@@ -157,6 +157,17 @@ static void dump_program(uint32_t start)
             break;
     }
     fflush(stderr);
+}
+
+const float *nv2a_vsh_constant(uint32_t index)
+{
+    return s_const[index < NV2A_VSH_CONSTANTS ? index : 0];
+}
+
+void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
+{
+    if (index < NV2A_VSH_CONSTANTS && comp < 4)
+        memcpy(&s_const[index][comp], &word, 4);
 }
 
 /* ---- execution ----------------------------------------------------------- */
@@ -350,7 +361,12 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             if (d) write_masked(d, &mres, mac_mask);
         }
         if (ilu && ilu_mask) {
-            uint32_t it = (mac && mac_mask) ? 1u : tdst;   /* paired: R1 */
+            /* Paired with any MAC op, the ILU can only write R1 -- even when
+             * the MAC half writes no temp at all. The D3D epilogue is exactly
+             * that: `mul o[0].xyz` beside `rcc R1.x`, then `mad` with R1.x.
+             * Sending the rcc to the temp field (R7 there) left R1.x at 0 and
+             * put every vertex of every 3D batch at c[59]. */
+            uint32_t it = mac ? 1u : tdst;
             float *d = it == 12 ? opos.v : (it < 12 ? temp[it].v : NULL);
             if (d) write_masked(d, &ires, ilu_mask);
         }

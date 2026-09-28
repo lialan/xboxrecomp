@@ -52,6 +52,10 @@ int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
 
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
+const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
+/* One component of a constant, raw bits: the viewport methods write c[58]
+ * (scale) and c[59] (offset) a word at a time rather than via _CONSTANT. */
+void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
 
 #endif
