@@ -26,6 +26,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef XBOX_CONTIG_BASE
+#define XBOX_CONTIG_BASE 0x80000000u   /* physical P is at this + P */
+#endif
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 #define PB_MAX_METHODS 4096
@@ -38,6 +42,7 @@ static int s_seen_count;
  * looking method numbers out of parameter data, and the counts then describe
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
+static uint32_t s_tot_calls;
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
@@ -129,14 +134,17 @@ void nv2a_pb_scan_report(void)
 {
     int i;
 
-    if (s_exec_enabled > 0)
+    if (s_exec_enabled > 0) {
         nv2a_pb_exec_report();
+        fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
+    }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
-    fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised"
-                    " -- %d distinct (subchannel, method) pairs\n",
-            s_tot_segments, s_tot_words, s_tot_jumps, s_tot_unknown,
-            s_seen_count);
+    fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u calls,"
+                    " %u unrecognised -- %d distinct (subchannel, method)"
+                    " pairs\n",
+            s_tot_segments, s_tot_words, s_tot_jumps, s_tot_calls,
+            s_tot_unknown, s_seen_count);
     for (i = 0; i < s_seen_count; i++)
         fprintf(stderr, "  [PB]   subch %u  method 0x%04X  x%-6u %s\n",
                 s_seen[i].subch, s_seen[i].method, s_seen[i].count,
@@ -144,18 +152,22 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
-void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+/* Walk commands from va to end_va. Returns the words consumed.
+ *
+ * A CALL runs a subroutine -- a pushbuffer somewhere else in memory -- up to
+ * its RETURN, then carries on after the CALL. This used to skip CALLs, which
+ * was invisible until a title used them for real: RenderWare on the Xbox
+ * compiles static geometry into pushbuffers and draws it with a CALL, so the
+ * whole race track went missing from Burnout 3's main view while the
+ * geometry it submits inline (environment maps, the HUD) drew fine.
+ * The NV2A has one level of subroutine, so a CALL inside a call is not
+ * followed. Addresses are physical, like PUT's, and reach guest memory the
+ * same way: through the contiguous window. */
+static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+                        uint32_t *jumps, uint32_t *unknown)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t va = start_va;
-    uint32_t words = 0, jumps = 0, unknown = 0;
-
-    if (s_exec_enabled < 0)
-        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va <= start_va)
-        return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
-        end_va = start_va + 0x400000u;
+    uint32_t words = 0;
 
     while (va < end_va && words < 0x100000u) {
         uint32_t w = *(const uint32_t *)(mem + va);
@@ -163,11 +175,28 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         words++;
 
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
-            jumps++;
-            break;                            /* a jump ends this segment */
-        }
-        if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u)
+            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                             : (w & 0x1FFFFFFCu);
+            (*jumps)++;
+            if (!in_call)
+                break;                        /* the ring: a jump ends it */
+            va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+            end_va = va + 0x400000u;
             continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u) {  /* RETURN */
+            if (in_call)
+                break;
+            continue;
+        }
+        if ((w & 3u) == 2u) {                    /* CALL */
+            if (!in_call) {
+                uint32_t sub = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+                s_tot_calls++;
+                words += pb_walk(sub, sub + 0x400000u, 1, jumps, unknown);
+            }
+            continue;
+        }
         if ((w & 0x00030003u) == 0u) {
             uint32_t count  = (w >> 18) & 0x7FFu;
             uint32_t subch  = (w >> 13) & 7u;
@@ -188,8 +217,23 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             }
             continue;
         }
-        unknown++;
+        (*unknown)++;
     }
+    return words;
+}
+
+void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+{
+    uint32_t words, jumps = 0, unknown = 0;
+
+    if (s_exec_enabled < 0)
+        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va <= start_va)
+        return;
+    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
+        end_va = start_va + 0x400000u;
+
+    words = pb_walk(start_va, end_va, 0, &jumps, &unknown);
 
     s_tot_words += words;
     s_tot_unknown += unknown;
