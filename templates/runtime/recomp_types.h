@@ -264,8 +264,22 @@ extern RECOMP_TLS uint16_t g_fp_cc;
  * relies on that: Burnout 3's sorted draw list re-inserts a node by walking
  * while `v > next` / `v < prev`, and with v left at double precision it sits
  * between its own stored copy and a neighbour and walks back and forth
- * forever, which froze every race at the start line. */
-#define RECOMP_FP_PC(x) ((g_fp_control_word & 0x300u) ? (double)(x) : (double)(float)(x))
+ * forever, which froze every race at the start line.
+ *
+ * PC narrows the significand only; the exponent keeps the register's range.
+ * So a plain (float) cast is right only inside float's range -- outside it,
+ * it would turn a large intermediate into inf (and inf*0 into NaN) or flush a
+ * tiny one to 0, where the x87 carries on. Those go the long way. */
+static inline double recomp_fp_round24(double x) {
+    double ax = fabs(x);
+    int e;
+    if ((ax <= 3.4028234663852886e38 && ax >= 1.1754943508222875e-38) || ax == 0.0
+        || x != x || ax == INFINITY)
+        return (double)(float)x;
+    x = frexp(x, &e);                      /* |x| in [0.5, 1): float-exact range */
+    return ldexp((double)(float)x, e);
+}
+#define RECOMP_FP_PC(x) ((g_fp_control_word & 0x300u) ? (double)(x) : recomp_fp_round24(x))
 #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
 /* Values in the existing double-backed stack are all representable as normal
  * x87 extended values, including binary64 subnormals. Empty stack tags and
