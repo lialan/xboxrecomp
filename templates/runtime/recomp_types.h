@@ -257,6 +257,15 @@ extern RECOMP_TLS int g_df;
 extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS uint16_t g_fp_cc;
+/* x87 precision control (control word bits 8-9). The stack is double-backed,
+ * which matches PC=53 and is close enough for PC=64, but PC=24 -- what the
+ * Xbox runs with -- rounds every arithmetic result to float. A title that
+ * compares a freshly computed value against the same value stored as a float
+ * relies on that: Burnout 3's sorted draw list re-inserts a node by walking
+ * while `v > next` / `v < prev`, and with v left at double precision it sits
+ * between its own stored copy and a neighbour and walks back and forth
+ * forever, which froze every race at the start line. */
+#define RECOMP_FP_PC(x) ((g_fp_control_word & 0x300u) ? (double)(x) : (double)(float)(x))
 #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
 /* Values in the existing double-backed stack are all representable as normal
  * x87 extended values, including binary64 subnormals. Empty stack tags and
