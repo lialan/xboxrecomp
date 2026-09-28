@@ -1950,6 +1950,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         DWORD sect_headers_va = *(const DWORD *)(xbe + XBE_SECTION_HEADERS_OFFSET);
         DWORD sect_headers_off = sect_headers_va - base_addr;
         int sections_loaded = 0;
+        /* The certificate's title name (UTF-16, 40 chars at +0x0C), for
+         * the framebuffer window's title bar. */
+        DWORD cert_off = *(const DWORD *)(xbe + 0x118) - base_addr;
+        if (cert_off + 0x0C + 80 <= xbe_size) {
+            extern void xbox_FramebufferWindowSetTitle(const uint16_t *, int);
+            xbox_FramebufferWindowSetTitle(
+                (const uint16_t *)(xbe + cert_off + 0x0C), 40);
+        }
         int sections_short = 0;
         size_t total_bytes = 0;
 
