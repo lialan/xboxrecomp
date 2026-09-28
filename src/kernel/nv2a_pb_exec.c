@@ -144,6 +144,8 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_BLEND_FUNC_DFACTOR      0x0348
 #define NV_BLEND_SRC_ALPHA                0x0302
 #define NV_BLEND_ONE_MINUS_SRC_ALPHA      0x0303
+#define NV097_SET_BLEND_COLOR             0x034C
+#define NV097_SET_BLEND_EQUATION          0x0350
 
 #define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
 #define NV097_SET_SURFACE_CLIP_VERTICAL   0x0204
@@ -276,11 +278,20 @@ static struct {
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
+    uint32_t blend_equation, blend_color;
+    uint32_t blend_pairs[16];   /* sfactor<<16 | dfactor seen, for the report */
+    int blend_npairs;
     Texture  tex;
     /* Vertex programs (nv2a_vsh_interp.c) and the depth buffer, which
      * together are what a 3D scene needs and a 2D one never used. */
     uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
     uint32_t batches_program, verts_program, tris_behind;
+    /* Where program-path triangles go, so "nothing drew" has a reason. */
+    uint32_t xf_degenerate, xf_offscreen, xf_drawn;
+    uint64_t xf_depth_fail, xf_pixels;
+    float xf_min[3], xf_max[3];
+    uint32_t xf_fmt[16];  /* attribute formats seen: type | size<<4 | slot<<8 */
+    int xf_nfmt, xf_seeded;
     uint32_t depth_test, depth_func, depth_mask;
     uint32_t zeta_offset, zstencil_clear;
 } s_gpu;
@@ -1028,6 +1039,37 @@ static int surface_begin_batch(const uint8_t *mem)
     return 1;
 }
 
+static uint32_t pack_color(const float c[4]);
+
+/* One GL blend factor, per channel (r g b a). */
+static void blend_factor(uint32_t f, const float s[4], const float d[4],
+                         float out[4])
+{
+    int k;
+    for (k = 0; k < 4; k++) {
+        float c = (float)((s_gpu.blend_color >> (k == 3 ? 24 : 16 - 8 * k))
+                          & 0xFF) / 255.0f;
+        switch (f) {
+        case 0x0000: out[k] = 0.0f;            break;   /* ZERO                */
+        case 0x0001: out[k] = 1.0f;            break;   /* ONE                 */
+        case 0x0300: out[k] = s[k];            break;   /* SRC_COLOR           */
+        case 0x0301: out[k] = 1.0f - s[k];     break;
+        case 0x0302: out[k] = s[3];            break;   /* SRC_ALPHA           */
+        case 0x0303: out[k] = 1.0f - s[3];     break;
+        case 0x0304: out[k] = d[3];            break;   /* DST_ALPHA           */
+        case 0x0305: out[k] = 1.0f - d[3];     break;
+        case 0x0306: out[k] = d[k];            break;   /* DST_COLOR           */
+        case 0x0307: out[k] = 1.0f - d[k];     break;
+        case 0x0308: out[k] = k == 3 ? 1.0f : fminf(s[3], 1.0f - d[3]); break;
+        case 0x8001: out[k] = c;               break;   /* CONSTANT_COLOR      */
+        case 0x8002: out[k] = 1.0f - c;        break;
+        case 0x8003: out[k] = (float)(s_gpu.blend_color >> 24) / 255.0f; break;
+        case 0x8004: out[k] = 1.0f - (float)(s_gpu.blend_color >> 24) / 255.0f; break;
+        default:     out[k] = f ? 1.0f : 0.0f; break;
+        }
+    }
+}
+
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
     uint8_t *row;
@@ -1042,40 +1084,42 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         s_gpu.pixel_max = argb;
     row = s_surface + (size_t)y * s_gpu.pitch;
 
-    /* src*srcAlpha + dst*(1-srcAlpha), and only that pair.
+    /* Blending, with the GL factor set and equations the NV2A takes.
      *
-     * Any other factor combination falls through to an opaque write rather
-     * than being approximated: a wrong blend is harder to recognise on
-     * screen than no blend, and this is the only pair this title sets.
-     *
-     * Fully opaque is left alone deliberately. It is the same arithmetic,
-     * but skipping it keeps the full-screen quads -- which are drawn with
-     * blending enabled and alpha 255 -- on exactly the path they were on
-     * before, so this cannot change what they produce. */
+     * Only SRC_ALPHA / ONE_MINUS_SRC_ALPHA used to be honoured and every other
+     * pair was written opaque. Menus never noticed; a race does: Burnout 3
+     * finishes its 3D frame with screen-space passes that modulate or add
+     * over the scene, and written opaque they paint the whole view over. */
     if (s_gpu.blend_enable
-        && s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
-        && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA
-        && (argb >> 24) != 0xFF) {
-        uint32_t sa = argb >> 24;
-        uint32_t dst = 0;
-        if (sa == 0)
-            return;                        /* nothing of the source survives */
+        && !(s_gpu.blend_sfactor == 1 && s_gpu.blend_dfactor == 0)) {
+        uint32_t dst = 0xFF000000u;
+        float sc[4], dc[4], sf[4], df[4], out[4];
+        int k;
         if (bpp == 4) {
             dst = ((const uint32_t *)row)[x];
         } else if (bpp == 2) {
             uint32_t t = ((const uint16_t *)row)[x];
-            dst = (((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
-                 | ((t & 0x001Fu) << 3));
+            dst = 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
+                | ((t & 0x001Fu) << 3);
         }
-        {
-            uint32_t r = (((argb >> 16) & 0xFF) * sa
-                        + ((dst >> 16) & 0xFF) * (255u - sa) + 127u) / 255u;
-            uint32_t g = (((argb >>  8) & 0xFF) * sa
-                        + ((dst >>  8) & 0xFF) * (255u - sa) + 127u) / 255u;
-            uint32_t b = (((argb      ) & 0xFF) * sa
-                        + ((dst      ) & 0xFF) * (255u - sa) + 127u) / 255u;
-            argb = 0xFF000000u | (r << 16) | (g << 8) | b;
+        for (k = 0; k < 4; k++) {           /* r g b a, 0..1 */
+            int sh = k == 3 ? 24 : 16 - 8 * k;
+            sc[k] = (float)((argb >> sh) & 0xFF) / 255.0f;
+            dc[k] = (float)((dst  >> sh) & 0xFF) / 255.0f;
         }
+        blend_factor(s_gpu.blend_sfactor, sc, dc, sf);
+        blend_factor(s_gpu.blend_dfactor, sc, dc, df);
+        for (k = 0; k < 4; k++) {
+            float a = sc[k] * sf[k], b = dc[k] * df[k];
+            switch (s_gpu.blend_equation) {
+            case 0x800A: out[k] = a - b; break;               /* SUBTRACT     */
+            case 0x800B: out[k] = b - a; break;               /* REV_SUBTRACT */
+            case 0x8007: out[k] = fminf(sc[k], dc[k]); break; /* MIN          */
+            case 0x8008: out[k] = fmaxf(sc[k], dc[k]); break; /* MAX          */
+            default:     out[k] = a + b; break;               /* ADD          */
+            }
+        }
+        argb = pack_color(out);
     }
 
     if (bpp == 4) {
@@ -1381,6 +1425,7 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 #define NV_ZBUF_W 1024
 #define NV_ZBUF_H 1024
 static struct { uint32_t offset; float *z; } s_zbufs[4];
+static int s_ftrace;            /* frame trace: 0 idle, 2 tracing, 3 done */
 static int s_zbuf_next;
 
 static float zclear_value(void)
@@ -1477,8 +1522,17 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         return;
     }
     area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
-    if (area == 0.0f || area != area)
+    if (area == 0.0f || area != area) {
+        s_gpu.xf_degenerate++;
         return;
+    }
+    for (k = 0; k < 3; k++) {
+        if (!s_gpu.xf_seeded)
+            s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
+        if (a[k] < s_gpu.xf_min[k]) s_gpu.xf_min[k] = a[k];
+        if (a[k] > s_gpu.xf_max[k]) s_gpu.xf_max[k] = a[k];
+    }
+    s_gpu.xf_seeded = 1;
     if (!surface_begin_batch(mem))
         return;
     if (s_gpu.depth_test || s_gpu.depth_mask)
@@ -1505,8 +1559,10 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     if (maxy > NV_ZBUF_H) maxy = NV_ZBUF_H;
     if (minx >= maxx || miny >= maxy) {
         s_gpu.tris_skipped_offscreen++;
+        s_gpu.xf_offscreen++;
         return;
     }
+    s_gpu.xf_drawn++;
 
     for (y = miny; y < maxy; y++) {
         for (x = minx; x < maxx; x++) {
@@ -1524,11 +1580,14 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
             if (zb) {
                 float *zp = &zb[(size_t)y * NV_ZBUF_W + x];
-                if (s_gpu.depth_test && !depth_pass(z, *zp))
+                if (s_gpu.depth_test && !depth_pass(z, *zp)) {
+                    s_gpu.xf_depth_fail++;
                     continue;
+                }
                 if (s_gpu.depth_mask)
                     *zp = z;
             }
+            s_gpu.xf_pixels++;
             for (k = 0; k < 4; k++)
                 col[k] = l0 * va->d0[k] + l1 * vb->d0[k] + l2 * vc->d0[k];
             argb = pack_color(col);
@@ -1570,6 +1629,62 @@ static void raster_batch_program(void)
             return;                                    /* no program loaded */
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
+    if (s_gpu.blend_enable) {
+        uint32_t pair = s_gpu.blend_sfactor << 16 | (s_gpu.blend_dfactor & 0xFFFF);
+        int j;
+        for (j = 0; j < s_gpu.blend_npairs && s_gpu.blend_pairs[j] != pair; j++)
+            ;
+        if (j == s_gpu.blend_npairs && j < 16)
+            s_gpu.blend_pairs[s_gpu.blend_npairs++] = pair;
+    }
+    {
+        /* RECOMP_VSH_TRACE=<n>: print n program batches -- attribute setup,
+         * raw inputs, key constants, and what came out. */
+        static int left = -1;
+        if (left < 0) {
+            const char *t = getenv("RECOMP_VSH_TRACE");
+            left = t ? atoi(t) : 0;
+        }
+        /* Spread out: one every 20000 program batches, so a run that spends
+         * its first half in menus still traces the 3D scene. */
+        if (left > 0 && n >= 3 && s_gpu.batches_program % 20000 == 0) {
+            float in[4];
+            left--;
+            fprintf(stderr, "[VTRACE] prim %u n %u idx %u %u %u\n", s_gpu.prim,
+                    n, s_gpu.idx[0], s_gpu.idx[1], s_gpu.idx[2]);
+            for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+                const VertexAttr *at = &s_gpu.attr[i];
+                if (!at->size)
+                    continue;
+                fetch_attr(at, s_gpu.idx[0], in);
+                fprintf(stderr, "[VTRACE]   v%u off %08X type %u size %u"
+                        " stride %u = %g %g %g %g\n", i, at->offset, at->type,
+                        at->size, at->stride, in[0], in[1], in[2], in[3]);
+            }
+            {
+                static const uint32_t cs[] = {58, 59, 96, 97, 112, 113, 114, 115};
+                for (i = 0; i < 8; i++) {
+                    const float *c = nv2a_vsh_constant(cs[i]);
+                    fprintf(stderr, "[VTRACE]   c[%u] %g %g %g %g%c", cs[i],
+                            c[0], c[1], c[2], c[3], 10);
+                }
+            }
+            for (i = 0; i < 3; i++)
+                fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g\n", i,
+                        s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
+                        s_xf[i].pos[3]);
+        }
+    }
+    for (i = 0; i < NV2A_VSH_INPUTS; i++) {
+        const VertexAttr *at = &s_gpu.attr[i];
+        uint32_t f = at->type | (at->size << 4) | (i << 8), j;
+        if (!at->size || !at->stride)
+            continue;
+        for (j = 0; j < (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_fmt[j] != f; j++)
+            ;
+        if (j == (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_nfmt < 16)
+            s_gpu.xf_fmt[s_gpu.xf_nfmt++] = f;
+    }
     if (s_gpu.tex.valid)
         note_texture_use();
 
@@ -1700,6 +1815,33 @@ static void raster_batch(void)
  * question is what space attribute 0 arrives in: a title running a vertex
  * program hands over object-space positions that mean nothing without running
  * it, while pre-transformed screen-space coordinates can be drawn directly. */
+/* RECOMP_FRAME_TRACE=<flag file>: once the file exists, log every batch of
+ * the next whole frame (flip to flip) -- where it drew, with what texture,
+ * blend and depth state, and how many pixels it actually wrote. "The frame
+ * is black" has many causes and this is what tells them apart. */
+
+static void frame_trace_flip(void)
+{
+    static const char *flag = (const char *)-1;
+    if (flag == (const char *)-1)
+        flag = getenv("RECOMP_FRAME_TRACE");
+    if (!flag || s_ftrace == 3)
+        return;
+    if (s_ftrace == 2) {
+        s_ftrace = 3;
+        fprintf(stderr, "[FTRACE] end of frame\n");
+        return;
+    }
+    if (s_ftrace == 0) {
+        FILE *f = fopen(flag, "rb");
+        if (!f)
+            return;
+        fclose(f);
+        s_ftrace = 2;
+        fprintf(stderr, "[FTRACE] frame begins (flip %u)\n", s_gpu.flips);
+    }
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -1728,7 +1870,26 @@ static void draw_primitive(void)
         }
     }
 
-    raster_batch();
+    {
+        uint32_t t0 = s_gpu.tris_drawn;
+        uint64_t p0 = s_gpu.pixels;
+        raster_batch();
+        if (s_ftrace == 2) {
+            fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
+                    " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
+                    " eq %X | z test %u func %X mask %u | tris %u px %llu\n",
+                    (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
+                    s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
+                    s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
+                    s_gpu.tex.valid ? "on" : "off", s_gpu.tex.offset,
+                    s_gpu.tex.width, s_gpu.tex.height, s_gpu.tex.color,
+                    s_gpu.blend_enable, s_gpu.blend_sfactor,
+                    s_gpu.blend_dfactor, s_gpu.blend_equation,
+                    s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
+                    s_gpu.tris_drawn - t0,
+                    (unsigned long long)(s_gpu.pixels - p0));
+        }
+    }
 
     if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
         static int shown;
@@ -2052,6 +2213,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_BLEND_ENABLE:
         s_gpu.blend_enable = param;
         break;
+    case NV097_SET_BLEND_EQUATION:
+        s_gpu.blend_equation = param;
+        break;
+    case NV097_SET_BLEND_COLOR:
+        s_gpu.blend_color = param;
+        break;
     case NV097_SET_BLEND_FUNC_SFACTOR:
         s_gpu.blend_sfactor = param;
         break;
@@ -2059,6 +2226,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.blend_dfactor = param;
         break;
     case NV097_CLEAR_SURFACE:
+        if (s_ftrace == 2)
+            fprintf(stderr, "[FTRACE] clear %X surf %08X %ux%u colour %08X%c",
+                    param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
+                    s_gpu.clear_color, 10);
         clear_surface(param);
         if (param & 0x01)                         /* Z */
             zbuf_clear();
@@ -2145,6 +2316,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
+        frame_trace_flip();
         return;
 
     case NV097_FLIP_STALL:
@@ -2162,6 +2334,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * here, rather than letting the window read guest memory on its own
          * clock, is what stops it showing a surface the rasteriser is still
          * writing. */
+        {
+            extern void xbox_FramebufferWindowFrameStats(uint32_t);
+            static uint32_t draws_at_flip;
+            xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
+            draws_at_flip = s_gpu.draws;
+        }
         if (s_gpu.pitch) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
@@ -2255,6 +2433,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
 
     default:
+        /* SET_VIEWPORT_OFFSET / _SCALE. The GPU keeps these in the constant
+         * file, at c[59] and c[58] -- exactly where the D3D epilogue reads
+         * them -- so they are constants that happen to arrive by method.
+         * Dropped, every vertex program put its whole batch at the origin:
+         * no 3D anywhere, and a black car on the garage screen. */
+        if (method >= 0x0A20 && method < 0x0A30) {
+            nv2a_vsh_constant_component(59, (method - 0x0A20) / 4, param);
+            break;
+        }
+        if (method >= 0x0AF0 && method < 0x0B00) {
+            nv2a_vsh_constant_component(58, (method - 0x0AF0) / 4, param);
+            break;
+        }
         if (method >= 0x0B00 && method < 0x0B80) {    /* TRANSFORM_PROGRAM(i) */
             nv2a_vsh_program_word(param);
             break;
@@ -2484,6 +2675,26 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                     " %u triangles dropped behind the eye\n",
             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+    fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
+                    " %u drawn; pixels %llu written, %llu depth-failed;"
+                    " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",
+            s_gpu.xf_degenerate, s_gpu.xf_offscreen, s_gpu.xf_drawn,
+            (unsigned long long)s_gpu.xf_pixels,
+            (unsigned long long)s_gpu.xf_depth_fail,
+            s_gpu.xf_min[0], s_gpu.xf_max[0], s_gpu.xf_min[1], s_gpu.xf_max[1],
+            s_gpu.xf_min[2], s_gpu.xf_max[2]);
+    {
+        fprintf(stderr, "[GPU]   blend pairs (src/dst):");
+        for (j = 0; j < s_gpu.blend_npairs; j++)
+            fprintf(stderr, " %X/%X", s_gpu.blend_pairs[j] >> 16,
+                    s_gpu.blend_pairs[j] & 0xFFFF);
+        fputc(10, stderr);
+        fprintf(stderr, "[GPU]   program attribute formats (slot:type/size):");
+        for (j = 0; j < s_gpu.xf_nfmt; j++)
+            fprintf(stderr, " v%u:%u/%u", s_gpu.xf_fmt[j] >> 8,
+                    s_gpu.xf_fmt[j] & 15, (s_gpu.xf_fmt[j] >> 4) & 15);
+        fprintf(stderr, "\n");
+    }
 
     /* And of the batches that did rasterise, how many sampled anything. A menu
      * that draws its background from one texture and its text from another
