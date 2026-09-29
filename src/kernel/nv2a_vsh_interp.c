@@ -339,6 +339,10 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
     memset(&opos, 0, sizeof opos);
     memset(outregs, 0, sizeof outregs);
     outregs[3][3] = outregs[4][3] = 1.0f;      /* colours default opaque */
+    /* Unwritten texture coordinates are (0,0,0,1), as xemu initialises them:
+     * a projective stage divides by q, and q = 0 would put every texel of an
+     * unwritten stage at infinity. */
+    outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
 
     for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
         const uint32_t *ins = s_program[s];

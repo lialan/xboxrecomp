@@ -35,6 +35,7 @@
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_interp.h"
+#include "nv2a_combiner.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -230,6 +231,8 @@ typedef struct {
     uint32_t color;                     /* NV097 colour-format code      */
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
     uint32_t palette;                   /* guest address of the CLUT, P8 */
+    uint32_t levels;                    /* mip levels, from FORMAT       */
+    int      cube;                      /* FORMAT: six faces, not one    */
     int      valid;
 } Texture;
 
@@ -285,7 +288,16 @@ static struct {
     uint32_t zpass_enable, zpass_count, reports;
     uint32_t blend_pairs[16];   /* sfactor<<16 | dfactor seen, for the report */
     int blend_npairs;
-    Texture  tex;
+    Texture  texs[4];                   /* one per texture stage */
+    /* Register combiners and the per-pixel state around them. rc_seen: the
+     * title has programmed the combiners, so they decide every pixel's
+     * colour; until then the old "stage 0 texel * diffuse" stands in. */
+    Nv2aCombiner rc;
+    int      rc_seen;
+    uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE */
+    uint32_t alpha_test, alpha_func, alpha_ref;
+    uint32_t fog_enable, fog_mode, fog_color;
+    float    fog_param[2];
     /* Vertex programs (nv2a_vsh_interp.c) and the depth buffer, which
      * together are what a 3D scene needs and a 2D one never used. */
     uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
@@ -325,6 +337,12 @@ static int tex_size_from_format(uint32_t fmt)
     return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
 }
 
+static void tex_update_valid(Texture *t)
+{
+    t->valid = t->offset && t->width && t->height
+            && (tex_size_from_format(t->color) || t->pitch);
+}
+
 static void record_tex_reg(uint32_t method, uint32_t param)
 {
     s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
@@ -334,9 +352,7 @@ static void record_tex_reg(uint32_t method, uint32_t param)
      * which is nearly all of them, since swizzled is the Xbox default. That
      * left the title's own textures unsampled and every textured quad drawn in
      * flat vertex colour. */
-    s_gpu.tex.valid = s_gpu.tex.offset && s_gpu.tex.width && s_gpu.tex.height
-                   && (tex_size_from_format(s_gpu.tex.color)
-                       || s_gpu.tex.pitch);
+    tex_update_valid(&s_gpu.texs[0]);
 }
 
 /* Every distinct texture a batch was drawn with, and how many batches used it.
@@ -365,11 +381,11 @@ static void note_texture_use(void)
 {
     int i;
 
-    if (!s_gpu.tex.valid)
+    if (!s_gpu.texs[0].valid)
         return;
     for (i = 0; i < s_tex_use_count; i++) {
-        if (s_tex_use[i].offset == s_gpu.tex.offset
-         && s_tex_use[i].color  == s_gpu.tex.color) {
+        if (s_tex_use[i].offset == s_gpu.texs[0].offset
+         && s_tex_use[i].color  == s_gpu.texs[0].color) {
             s_tex_use[i].batches++;
             /* Dump a surface that is redrawn, every Nth time it is bound.
              *
@@ -402,10 +418,10 @@ static void note_texture_use(void)
         }
     }
     if (s_tex_use_count < PB_EXEC_MAX_TEXTURES) {
-        s_tex_use[s_tex_use_count].offset  = s_gpu.tex.offset;
-        s_tex_use[s_tex_use_count].color   = s_gpu.tex.color;
-        s_tex_use[s_tex_use_count].width   = s_gpu.tex.width;
-        s_tex_use[s_tex_use_count].height  = s_gpu.tex.height;
+        s_tex_use[s_tex_use_count].offset  = s_gpu.texs[0].offset;
+        s_tex_use[s_tex_use_count].color   = s_gpu.texs[0].color;
+        s_tex_use[s_tex_use_count].width   = s_gpu.texs[0].width;
+        s_tex_use[s_tex_use_count].height  = s_gpu.texs[0].height;
         s_tex_use[s_tex_use_count].batches = 1;
         s_tex_use_count++;
         dump_texture_bmp((uint32_t)s_tex_use_count - 1);
@@ -807,31 +823,32 @@ static uint32_t linear_twin(uint32_t fmt)
     }
 }
 
-static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+/* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
+static int sample_tex(const Texture *t, uint32_t face_offset,
+                      uint32_t u, uint32_t v, uint32_t *argb)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint8_t *p;
-    uint32_t fmt;
+    uint32_t fmt, base = t->offset + face_offset;
 
-    if (!s_gpu.tex.valid)
+    if (!t->valid)
         return 0;
-    u = wrap_coord(u, s_gpu.tex.width,  s_gpu.tex.addr_u);
-    v = wrap_coord(v, s_gpu.tex.height, s_gpu.tex.addr_v);
+    u = wrap_coord(u, t->width,  t->addr_u);
+    v = wrap_coord(v, t->height, t->addr_v);
 
-    fmt = s_gpu.tex.color;
+    fmt = t->color;
     if (d3d8_format_dxt_block_bytes(fmt))
-        return d3d8_dxt_decode_texel(mem + s_gpu.tex.offset, fmt, u, v,
-                                     s_gpu.tex.width, argb);
+        return d3d8_dxt_decode_texel(mem + base, fmt, u, v, t->width, argb);
     if (d3d8_format_is_swizzled(fmt)) {
         /* Morton order: a texel's index is interleaved from x and y instead of
          * v*pitch + u, so index from the base of the image. The switch below
          * casts to each format's own width, which makes that index a texel
          * index for every one of them. */
         fmt = linear_twin(fmt);
-        p = mem + s_gpu.tex.offset;
-        u = swizzle_offset(u, v, s_gpu.tex.width, s_gpu.tex.height);
+        p = mem + base;
+        u = swizzle_offset(u, v, t->width, t->height);
     } else {
-        p = mem + s_gpu.tex.offset + (size_t)v * s_gpu.tex.pitch;
+        p = mem + base + (size_t)v * t->pitch;
     }
 
     switch (fmt) {
@@ -848,9 +865,9 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
      * header art this way; without a case every such quad came out as the
      * unsupported-format fill, a white box where the logo should be. */
     case 0x0B:                                      /* SZ_I8_A8R8G8B8 */
-        if (!s_gpu.tex.palette)
+        if (!t->palette)
             return 0;
-        *argb = ((const uint32_t *)(mem + s_gpu.tex.palette))[p[u]];
+        *argb = ((const uint32_t *)(mem + t->palette))[p[u]];
         return 1;
 
     /* 32-bit, other channel orders. The name gives the byte order from the
@@ -954,6 +971,11 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
     }
 }
 
+static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+{
+    return sample_tex(&s_gpu.texs[0], 0, u, v, argb);
+}
+
 /* Write a bound texture out as a BMP, through the sampler rather than around it.
  *
  * "Which texture is this" is not answerable from an address and a format, and
@@ -970,7 +992,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
 static void dump_texture_bmp(uint32_t seq)
 {
     const char *prefix = getenv("RECOMP_TEX_DUMP");
-    uint32_t w = s_gpu.tex.width, h = s_gpu.tex.height, x, y;
+    uint32_t w = s_gpu.texs[0].width, h = s_gpu.texs[0].height, x, y;
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
     char path[512];
@@ -983,7 +1005,7 @@ static void dump_texture_bmp(uint32_t seq)
     filesz = 54 + (row_bytes + pad) * h;
 
     snprintf(path, sizeof path, "%s%02u_%08X_fmt%02X.bmp",
-             prefix, seq, s_gpu.tex.offset, s_gpu.tex.color);
+             prefix, seq, s_gpu.texs[0].offset, s_gpu.texs[0].color);
     f = fopen(path, "wb");
     if (!f)
         return;
@@ -1016,7 +1038,7 @@ static void dump_texture_bmp(uint32_t seq)
     }
     fclose(f);
     fprintf(stderr, "  [TEXDUMP] %s (%ux%u fmt 0x%02X)\n",
-            path, w, h, s_gpu.tex.color);
+            path, w, h, s_gpu.texs[0].color);
     fflush(stderr);
 }
 
@@ -1162,7 +1184,7 @@ static void raster_triangle(const float a[2], const float b[2],
     uint32_t bpp = surface_bpp();
     float area;
     int minx, maxx, miny, maxy, x, y;
-    int textured = uv && s_gpu.tex.valid;
+    int textured = uv && s_gpu.texs[0].valid;
 
     if (bpp != 4 && bpp != 2)
         return;
@@ -1299,9 +1321,9 @@ static int fetch_texcoord(uint32_t index, float out[2])
         return 0;
     out[0] = t[0];
     out[1] = t[1];
-    if (tex_size_from_format(s_gpu.tex.color)) {
-        out[0] *= (float)s_gpu.tex.width;
-        out[1] *= (float)s_gpu.tex.height;
+    if (tex_size_from_format(s_gpu.texs[0].color)) {
+        out[0] *= (float)s_gpu.texs[0].width;
+        out[1] *= (float)s_gpu.texs[0].height;
     }
     return 1;
 }
@@ -1521,6 +1543,153 @@ static uint32_t modulate(uint32_t t, const float c[4])
     return pack_color(f);
 }
 
+/* Bytes one texel of a (non-DXT) format takes, for cube-face strides. */
+static uint32_t tex_texel_bytes(uint32_t fmt)
+{
+    switch (fmt) {
+    case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
+        return 1;
+    case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
+    case 0x1C: case 0x1D:
+        return 2;
+    default:
+        return 4;
+    }
+}
+
+/* Bytes between cube faces: one face with all its mip levels, rounded up to
+ * the NV2A's 128-byte face alignment (xemu texture.c). */
+static uint32_t tex_face_stride(const Texture *t)
+{
+    uint32_t w = t->width, h = t->height, lv, total = 0;
+    uint32_t block = d3d8_format_dxt_block_bytes(t->color);
+    uint32_t levels = t->levels ? t->levels : 1;
+
+    if (!tex_size_from_format(t->color))
+        return (t->pitch * t->height + 127u) & ~127u;
+    for (lv = 0; lv < levels; lv++) {
+        uint32_t lw = (w >> lv) ? (w >> lv) : 1, lh = (h >> lv) ? (h >> lv) : 1;
+        total += block ? ((lw + 3) / 4) * ((lh + 3) / 4) * block
+                       : lw * lh * tex_texel_bytes(t->color);
+    }
+    return (total + 127u) & ~127u;
+}
+
+/* One texel at normalised (swizzled/DXT) or texel (linear) coordinates, as
+ * floats. An unusable stage reads white, so a missing texture multiplies
+ * through instead of blacking the pixel out. */
+static void rc_texel(const Texture *t, uint32_t face, float u, float v,
+                     float out[4])
+{
+    uint32_t texel;
+    if (tex_size_from_format(t->color)) {
+        u *= (float)t->width;
+        v *= (float)t->height;
+    }
+    if (sample_tex(t, face, (uint32_t)(int32_t)floorf(u),
+                   (uint32_t)(int32_t)floorf(v), &texel))
+        nv2a_rc_unpack(texel, out);
+    else
+        out[0] = out[1] = out[2] = out[3] = 1.0f;
+}
+
+/* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
+ * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
+static int rc_stage_fetch(int st, const float c[4], float out[4])
+{
+    const Texture *t = &s_gpu.texs[st];
+    uint32_t mode = (s_gpu.rc.stage_program >> (st * 5)) & 0x1F, j;
+    float q = c[3] != 0.0f ? c[3] : 1.0f;
+
+    switch (mode) {
+    case 0:                                       /* NONE */
+        out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f;
+        return 1;
+    case 1: case 2:                               /* PROJECT2D / 3D */
+        rc_texel(t, 0, c[0] / q, c[1] / q, out);
+        return 1;
+    case 3: {                                     /* CUBEMAP */
+        float x = c[0], y = c[1], z = c[2];
+        float ax = fabsf(x), ay = fabsf(y), az = fabsf(z), ma, sc, tc;
+        uint32_t face;
+        if (!t->cube) {
+            rc_texel(t, 0, c[0], c[1], out);
+            return 1;
+        }
+        if (ax >= ay && ax >= az) {
+            face = x > 0 ? 0 : 1; ma = ax; sc = x > 0 ? -z : z; tc = -y;
+        } else if (ay >= az) {
+            face = y > 0 ? 2 : 3; ma = ay; sc = x; tc = y > 0 ? z : -z;
+        } else {
+            face = z > 0 ? 4 : 5; ma = az; sc = z > 0 ? x : -x; tc = -y;
+        }
+        if (ma == 0.0f)
+            ma = 1.0f;
+        rc_texel(t, face * tex_face_stride(t), (sc / ma + 1.0f) * 0.5f,
+                 (tc / ma + 1.0f) * 0.5f, out);
+        return 1;
+    }
+    case 4:                                       /* PASSTHRU */
+        for (j = 0; j < 4; j++)
+            out[j] = c[j] < 0.0f ? 0.0f : (c[j] > 1.0f ? 1.0f : c[j]);
+        return 1;
+    case 5:                                       /* CLIPPLANE */
+        out[0] = out[1] = out[2] = out[3] = 0.0f;
+        for (j = 0; j < 4; j++) {
+            int ge = (s_gpu.clip_plane_mode >> (st * 4 + j)) & 1;
+            if (ge ? c[j] >= 0.0f : c[j] < 0.0f)
+                return 0;
+        }
+        return 1;
+    default:
+        /* ponytail: bump-env and dot-product modes read zero; they are water
+         * and bump effects -- add them when a title's look depends on one. */
+        out[0] = out[1] = out[2] = out[3] = 0.0f;
+        return 1;
+    }
+}
+
+/* The fixed-function fog unit, per vertex, from the program's oFog.x
+ * (xemu vsh.c). Fog disabled reads as factor 1: no fog. */
+static float fog_factor(float d)
+{
+    float f, px = s_gpu.fog_param[0], py = s_gpu.fog_param[1];
+    if (!s_gpu.fog_enable)
+        return 1.0f;
+    switch (s_gpu.fog_mode) {
+    case 0x800: case 0x802:                       /* EXP, EXP_ABS */
+        f = px + exp2f(d * py * 16.0f) - 1.5f;
+        break;
+    case 0x801: case 0x803:                       /* EXP2, EXP2_ABS */
+        f = px + exp2f(-d * d * py * py * 32.0f) - 1.5f;
+        break;
+    default:                                      /* LINEAR, LINEAR_ABS */
+        f = px + d * py - 1.0f;
+        break;
+    }
+    if (s_gpu.fog_mode == 0x802 || s_gpu.fog_mode == 0x803
+        || s_gpu.fog_mode == 0x804)
+        f = fabsf(f);
+    if (f != f)
+        f = 1.0f;
+    return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+}
+
+static int alpha_test_pass(float a)
+{
+    int v = (int)(a * 255.0f + 0.5f), r = (int)(s_gpu.alpha_ref & 0xFF);
+    switch (s_gpu.alpha_func) {
+    case 0x200: return 0;                         /* NEVER    */
+    case 0x201: return v <  r;                    /* LESS     */
+    case 0x202: return v == r;                    /* EQUAL    */
+    case 0x203: return v <= r;                    /* LEQUAL   */
+    case 0x204: return v >  r;                    /* GREATER  */
+    case 0x205: return v != r;                    /* NOTEQUAL */
+    case 0x206: return v >= r;                    /* GEQUAL   */
+    default:    return 1;                         /* ALWAYS   */
+    }
+}
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
@@ -1531,7 +1700,14 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     float area, iw[3], uv[3][2], su = 1.0f, sv = 1.0f;
     float *zb = NULL;
     int minx, maxx, miny, maxy, x, y, k;
-    int textured = s_gpu.tex.valid;
+    int textured = s_gpu.texs[0].valid;
+    static int no_rc = -1;
+    int use_rc;
+    float stc[3][4][4], vfog[3], fogc[4];
+
+    if (no_rc < 0)
+        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+    use_rc = s_gpu.rc_seen && !no_rc;
 
     v[0] = va; v[1] = vb; v[2] = vc;
     a = va->pos; b = vb->pos; c = vc->pos;
@@ -1557,14 +1733,26 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         return;
     if (s_gpu.depth_test || s_gpu.depth_mask)
         zb = zbuf_current(1);
-    if (tex_size_from_format(s_gpu.tex.color)) {
-        su = (float)s_gpu.tex.width;
-        sv = (float)s_gpu.tex.height;
+    if (tex_size_from_format(s_gpu.texs[0].color)) {
+        su = (float)s_gpu.texs[0].width;
+        sv = (float)s_gpu.texs[0].height;
     }
     for (k = 0; k < 3; k++) {
         iw[k] = 1.0f / v[k]->pos[3];
         uv[k][0] = v[k]->tex[0][0] * su * iw[k];
         uv[k][1] = v[k]->tex[0][1] * sv * iw[k];
+    }
+    if (use_rc) {
+        int st, j;
+        for (k = 0; k < 3; k++) {
+            for (st = 0; st < 4; st++)
+                for (j = 0; j < 4; j++)
+                    stc[k][st][j] = v[k]->tex[st][j] * iw[k];
+            vfog[k] = fog_factor(v[k]->fog[0]);
+        }
+        /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+        nv2a_rc_unpack(s_gpu.fog_color, fogc);
+        { float r = fogc[2]; fogc[2] = fogc[0]; fogc[0] = r; }
     }
 
     minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
@@ -1598,32 +1786,69 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
             /* w1 is opposite a, w2 opposite b, w0 opposite c. */
             l0 = w1 / area; l1 = w2 / area; l2 = w0 / area;
             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
-            if (zb) {
-                float *zp = &zb[(size_t)y * NV_ZBUF_W + x];
-                if (s_gpu.depth_test && !depth_pass(z, *zp)) {
+            {
+                float *zp = zb ? &zb[(size_t)y * NV_ZBUF_W + x] : NULL;
+                int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
+                /* Depth test, then shade, then alpha test, and only then the
+                 * depth write: an alpha-tested texel that is cut away must
+                 * not leave its depth behind (foliage, fences). */
+                if (zp && s_gpu.depth_test && !depth_pass(z, *zp)) {
                     s_gpu.xf_depth_fail++;
                     continue;
                 }
-                if (s_gpu.depth_mask)
+                argb = 0;
+                if (shade) {
+                    for (k = 0; k < 4; k++)
+                        col[k] = l0 * va->d0[k] + l1 * vb->d0[k] + l2 * vc->d0[k];
+                    pw = l0 * iw[0] + l1 * iw[1] + l2 * iw[2];
+                    if (use_rc) {
+                        float d1[4], fog[4], t[4][4], out[4], tc[4];
+                        int st, j, keep = 1;
+                        for (k = 0; k < 4; k++)
+                            d1[k] = l0 * va->d1[k] + l1 * vb->d1[k] + l2 * vc->d1[k];
+                        fog[0] = fogc[0]; fog[1] = fogc[1]; fog[2] = fogc[2];
+                        fog[3] = l0 * vfog[0] + l1 * vfog[1] + l2 * vfog[2];
+                        for (st = 0; st < 4 && keep; st++) {
+                            if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)) {
+                                t[st][0] = t[st][1] = t[st][2] = 0.0f;
+                                t[st][3] = 1.0f;
+                                continue;
+                            }
+                            for (j = 0; j < 4; j++)
+                                tc[j] = (l0 * stc[0][st][j] + l1 * stc[1][st][j]
+                                       + l2 * stc[2][st][j]) / pw;
+                            keep = rc_stage_fetch(st, tc, t[st]);
+                        }
+                        if (!keep)
+                            continue;
+                        nv2a_rc_eval(&s_gpu.rc, col, d1, fog,
+                                     (const float (*)[4])t, out);
+                        if (s_gpu.alpha_test && !alpha_test_pass(out[3]))
+                            continue;
+                        argb = pack_color(out);
+                    } else {
+                        argb = pack_color(col);
+                        if (textured) {
+                            uint32_t texel;
+                            float tu, tv;
+                            tu = (l0 * uv[0][0] + l1 * uv[1][0] + l2 * uv[2][0]) / pw;
+                            tv = (l0 * uv[0][1] + l1 * uv[1][1] + l2 * uv[2][1]) / pw;
+                            if (sample_texture((uint32_t)(int32_t)floorf(tu),
+                                               (uint32_t)(int32_t)floorf(tv), &texel))
+                                argb = modulate(texel, col);
+                        }
+                        if (s_gpu.alpha_test
+                            && !alpha_test_pass((float)(argb >> 24) / 255.0f))
+                            continue;
+                    }
+                }
+                if (zp && s_gpu.depth_mask)
                     *zp = z;
-            }
-            if (s_gpu.zpass_enable)
-                s_gpu.zpass_count++;
-            if (!(s_gpu.color_mask & 0x01010101u))
-                continue;                  /* colour writes off: depth only */
-            s_gpu.xf_pixels++;
-            for (k = 0; k < 4; k++)
-                col[k] = l0 * va->d0[k] + l1 * vb->d0[k] + l2 * vc->d0[k];
-            argb = pack_color(col);
-            if (textured) {
-                uint32_t texel;
-                float tu, tv;
-                pw = l0 * iw[0] + l1 * iw[1] + l2 * iw[2];
-                tu = (l0 * uv[0][0] + l1 * uv[1][0] + l2 * uv[2][0]) / pw;
-                tv = (l0 * uv[0][1] + l1 * uv[1][1] + l2 * uv[2][1]) / pw;
-                if (sample_texture((uint32_t)(int32_t)floorf(tu),
-                                   (uint32_t)(int32_t)floorf(tv), &texel))
-                    argb = modulate(texel, col);
+                if (s_gpu.zpass_enable)
+                    s_gpu.zpass_count++;
+                if (!(s_gpu.color_mask & 0x01010101u))
+                    continue;              /* colour writes off: depth only */
+                s_gpu.xf_pixels++;
             }
             put_pixel(mem, bpp, x, y, argb);
         }
@@ -1709,7 +1934,7 @@ static void raster_batch_program(void)
         if (j == (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_nfmt < 16)
             s_gpu.xf_fmt[s_gpu.xf_nfmt++] = f;
     }
-    if (s_gpu.tex.valid)
+    if (s_gpu.texs[0].valid)
         note_texture_use();
 
     switch (s_gpu.prim) {
@@ -1768,7 +1993,7 @@ static void raster_batch(void)
 
         if (!(tc->offset && tc->stride))
             s_gpu.batches_no_uv++;
-        else if (!s_gpu.tex.valid)
+        else if (!s_gpu.texs[0].valid)
             s_gpu.batches_no_tex++;
         else {
             s_gpu.batches_textured++;
@@ -1905,13 +2130,31 @@ static void draw_primitive(void)
                     (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                     s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                     s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
-                    s_gpu.tex.valid ? "on" : "off", s_gpu.tex.offset,
-                    s_gpu.tex.width, s_gpu.tex.height, s_gpu.tex.color,
+                    s_gpu.texs[0].valid ? "on" : "off", s_gpu.texs[0].offset,
+                    s_gpu.texs[0].width, s_gpu.texs[0].height, s_gpu.texs[0].color,
                     s_gpu.blend_enable, s_gpu.blend_sfactor,
                     s_gpu.blend_dfactor, s_gpu.blend_equation,
                     s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                     s_gpu.tris_drawn - t0,
                     (unsigned long long)(s_gpu.pixels - p0));
+            if (s_gpu.rc_seen) {
+                int st;
+                fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",
+                        s_gpu.rc.control & 0xFF, s_gpu.rc.control,
+                        s_gpu.rc.stage_program, s_gpu.rc.final0, s_gpu.rc.final1);
+                for (st = 0; st < 4; st++)
+                    if ((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)
+                        fprintf(stderr, " | t%d %08X %ux%u fmt %02X%s", st,
+                                s_gpu.texs[st].offset, s_gpu.texs[st].width,
+                                s_gpu.texs[st].height, s_gpu.texs[st].color,
+                                s_gpu.texs[st].valid ? "" : " (invalid)");
+                fputc(10, stderr);
+                for (st = 0; st < (int)(s_gpu.rc.control & 0xFF) && st < 8; st++)
+                    fprintf(stderr, "[FTRACE]       s%d icw %08X %08X ocw %08X %08X c %08X %08X%c",
+                            st, s_gpu.rc.color_icw[st], s_gpu.rc.alpha_icw[st],
+                            s_gpu.rc.color_ocw[st], s_gpu.rc.alpha_ocw[st],
+                            s_gpu.rc.factor0[st], s_gpu.rc.factor1[st], 10);
+            }
             if ((s_gpu.xf_mode & 3) == 2) {
                 uint32_t r;
                 for (r = 112; r < 116; r++) {
@@ -1937,9 +2180,9 @@ static void draw_primitive(void)
              * invisible. */
             fprintf(stderr, "  [GPU]   tex: off 0x%08X %ux%u pitch %u"
                             " colour 0x%02X swizzled %d valid %d\n",
-                    s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
-                    s_gpu.tex.pitch, s_gpu.tex.color,
-                    d3d8_format_is_swizzled(s_gpu.tex.color), s_gpu.tex.valid);
+                    s_gpu.texs[0].offset, s_gpu.texs[0].width, s_gpu.texs[0].height,
+                    s_gpu.texs[0].pitch, s_gpu.texs[0].color,
+                    d3d8_format_is_swizzled(s_gpu.texs[0].color), s_gpu.texs[0].valid);
             {
                 uint32_t k;
                 for (k = 0; k < s_gpu.idx_count && k < 3; k++) {
@@ -1965,8 +2208,8 @@ static void draw_primitive(void)
                 }
                 fprintf(stderr, "  [GPU]   tex: off 0x%08X %ux%u pitch %u"
                                 " colour 0x%02X valid %d\n",
-                        s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
-                        s_gpu.tex.pitch, s_gpu.tex.color, s_gpu.tex.valid);
+                        s_gpu.texs[0].offset, s_gpu.texs[0].width, s_gpu.texs[0].height,
+                        s_gpu.texs[0].pitch, s_gpu.texs[0].color, s_gpu.texs[0].valid);
             }
             {
                 /* Every attribute the batch has, not just position. If the
@@ -2188,6 +2431,59 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
     }
     return 0;
 }
+/* The texture stage registers, all four stages. Stage i's registers are
+ * 0x1B00 + 0x40*i onwards; only stage 0 used to be decoded, which was
+ * enough for menus drawn one texture at a time and not for a 3D frame that
+ * composites its scene through a second stage. */
+static void tex_stage_method(uint32_t method, uint32_t param)
+{
+    uint32_t stage = (method - NV_TEX_FIRST) / 0x40;
+    uint32_t reg = NV_TEX_FIRST + ((method - NV_TEX_FIRST) & 0x3F);
+    Texture *t = &s_gpu.texs[stage];
+
+    switch (reg) {
+    case NV097_SET_TEXTURE_OFFSET:
+        /* A DMA-object offset like a surface's: physical, reached through
+         * the contiguous window when it names contiguous memory. */
+        t->offset = dma_resolve(param);
+        break;
+    case NV097_SET_TEXTURE_FORMAT:
+        t->color = (param >> 8) & 0xFF;
+        t->cube = (param >> 2) & 1;
+        t->levels = (param >> 16) & 0xF;
+        /* A swizzled texture carries its own dimensions here, as log2 in
+         * BASE_SIZE_U/V. It has to: IMAGE_RECT describes a linear image, and
+         * a title that only uses swizzled textures never sends one. */
+        if (tex_size_from_format(t->color)) {
+            t->width  = 1u << ((param >> 20) & 0xF);
+            t->height = 1u << ((param >> 24) & 0xF);
+        }
+        break;
+    case NV097_SET_TEXTURE_PALETTE:
+        /* The low six bits carry the DMA context and the entry count. */
+        t->palette = dma_resolve(param & ~0x3Fu);
+        break;
+    case NV097_SET_TEXTURE_ADDRESS:
+        /* Four bits per axis. 1 is wrap, 3 clamp-to-edge; mirror and border
+         * fall back to clamp, wrong at an edge rather than everywhere. */
+        t->addr_u =  param        & 0xF;
+        t->addr_v = (param >>  8) & 0xF;
+        break;
+    case NV097_SET_TEXTURE_CONTROL1:
+        t->pitch = param >> 16;          /* linear formats only */
+        break;
+    case NV097_SET_TEXTURE_IMAGE_RECT:
+        t->width  = param >> 16;
+        t->height = param & 0xFFFF;
+        break;
+    default:
+        break;
+    }
+    tex_update_valid(t);
+    if (stage == 0)
+        record_tex_reg(method, param);
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -2218,6 +2514,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     subch, method, param);
     }
 
+    if (subch == 0 && method >= NV_TEX_FIRST && method <= NV_TEX_LAST) {
+        tex_stage_method(method, param);
+        return;
+    }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
         note_unhandled(method, param);
         return;
@@ -2254,6 +2554,28 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x0358:                                  /* SET_COLOR_MASK */
         s_gpu.color_mask = param;
         break;
+
+    /* Register combiners. */
+    case 0x0288: s_gpu.rc.final0 = param; break;  /* SPECULAR_FOG_CW0 */
+    case 0x028C: s_gpu.rc.final1 = param; break;  /* SPECULAR_FOG_CW1 */
+    case 0x1E20: s_gpu.rc.final_c0 = param; break;/* SPECULAR_FOG_FACTOR */
+    case 0x1E24: s_gpu.rc.final_c1 = param; break;
+    case 0x1E60:                                  /* COMBINER_CONTROL */
+        s_gpu.rc.control = param;
+        s_gpu.rc_seen = 1;
+        break;
+    case 0x1E70: s_gpu.rc.stage_program = param; break;
+    case 0x17F8: s_gpu.clip_plane_mode = param; break;
+
+    /* Alpha test and fog. */
+    case 0x0300: s_gpu.alpha_test = param; break;
+    case 0x033C: s_gpu.alpha_func = param; break;
+    case 0x0340: s_gpu.alpha_ref = param; break;
+    case 0x02A4: s_gpu.fog_enable = param; break;
+    case 0x02A8: s_gpu.fog_color = param; break;  /* R in bits 0-7 */
+    case 0x029C: s_gpu.fog_mode = param; break;
+    case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
+    case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
     case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
         s_gpu.zpass_count = 0;
         break;
@@ -2351,13 +2673,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
         }
         break;
-    case NV097_SET_TEXTURE_OFFSET:
-        /* A texture offset is a DMA-object offset, exactly like a surface or a
-         * vertex array offset -- physical, and reachable only through the
-         * contiguous window when it names contiguous memory. */
-        s_gpu.tex.offset = dma_resolve(param);
-        record_tex_reg(method, param);
-        break;
 
     case NV097_SET_FLIP_READ:
         if (s_ftrace == 2)
@@ -2430,50 +2745,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         return;
 
-    case NV097_SET_TEXTURE_FORMAT:
-        s_gpu.tex.color = (param >> 8) & 0xFF;
-        /* A swizzled texture carries its own dimensions here, as log2 in
-         * BASE_SIZE_U/V (nv2a_regs.h: 0x00F00000 / 0x0F000000). It has to:
-         * SET_TEXTURE_IMAGE_RECT describes a linear image, and a title that
-         * only uses swizzled textures never sends one -- this title sends it
-         * once and sets a format 3,176 times. Without this the width and
-         * height stayed zero and nothing was ever sampled. */
-        if (tex_size_from_format((param >> 8) & 0xFF)) {
-            s_gpu.tex.width  = 1u << ((param >> 20) & 0xF);
-            s_gpu.tex.height = 1u << ((param >> 24) & 0xF);
-        }
-        record_tex_reg(method, param);
-        break;
-
-    case NV097_SET_TEXTURE_PALETTE:
-        /* Where a P8 texture's 256 A8R8G8B8 entries live. The low six bits
-         * carry the DMA context and the entry count, so the offset is what is
-         * left -- and it is physical, like every other DMA offset. */
-        s_gpu.tex.palette = dma_resolve(param & ~0x3Fu);
-        record_tex_reg(method, param);
-        break;
-
-    case NV097_SET_TEXTURE_ADDRESS:
-        /* Four bits per axis. 1 is wrap, 3 is clamp-to-edge; the rest (mirror,
-         * border) fall back to clamp, which is wrong at an edge rather than
-         * wrong everywhere. */
-        s_gpu.tex.addr_u =  param        & 0xF;
-        s_gpu.tex.addr_v = (param >>  8) & 0xF;
-        record_tex_reg(method, param);
-        break;
-
-    case NV097_SET_TEXTURE_CONTROL1:
-        /* Pitch lives in the top half. Only meaningful for a linear format; a
-         * swizzled texture has no pitch because it has no rows. */
-        s_gpu.tex.pitch = param >> 16;
-        record_tex_reg(method, param);
-        break;
-
-    case NV097_SET_TEXTURE_IMAGE_RECT:
-        s_gpu.tex.width  = param >> 16;
-        s_gpu.tex.height = param & 0xFFFF;
-        record_tex_reg(method, param);
-        break;
 
     /* Vertex programs and their constants: forwarded as they arrive. */
     case 0x1E94:                                  /* TRANSFORM_EXECUTION_MODE */
@@ -2500,6 +2771,30 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
 
     default:
+        if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
+            s_gpu.rc.alpha_icw[(method - 0x0260) / 4] = param;
+            break;
+        }
+        if (method >= 0x0AC0 && method < 0x0AE0) {         /* COLOR_ICW(i) */
+            s_gpu.rc.color_icw[(method - 0x0AC0) / 4] = param;
+            break;
+        }
+        if (method >= 0x1E40 && method < 0x1E60) {         /* COLOR_OCW(i) */
+            s_gpu.rc.color_ocw[(method - 0x1E40) / 4] = param;
+            break;
+        }
+        if (method >= 0x0AA0 && method < 0x0AC0) {         /* ALPHA_OCW(i) */
+            s_gpu.rc.alpha_ocw[(method - 0x0AA0) / 4] = param;
+            break;
+        }
+        if (method >= 0x0A60 && method < 0x0A80) {         /* FACTOR0(i) */
+            s_gpu.rc.factor0[(method - 0x0A60) / 4] = param;
+            break;
+        }
+        if (method >= 0x0A80 && method < 0x0AA0) {         /* FACTOR1(i) */
+            s_gpu.rc.factor1[(method - 0x0A80) / 4] = param;
+            break;
+        }
         /* SET_VIEWPORT_OFFSET / _SCALE. The GPU keeps these in the constant
          * file, at c[59] and c[58] -- exactly where the D3D epilogue reads
          * them -- so they are constants that happen to arrive by method.
