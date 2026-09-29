@@ -279,6 +279,10 @@ static struct {
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
     uint32_t blend_equation, blend_color;
+    uint32_t color_mask;        /* SET_COLOR_MASK: A<<24 R<<16 G<<8 B */
+    /* Visibility tests (D3D's Begin/EndVisibilityTest): pixels that pass the
+     * depth test while counting is on, reported by GET_REPORT. */
+    uint32_t zpass_enable, zpass_count, reports;
     uint32_t blend_pairs[16];   /* sfactor<<16 | dfactor seen, for the report */
     int blend_npairs;
     Texture  tex;
@@ -1122,6 +1126,22 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         argb = pack_color(out);
     }
 
+    if (s_gpu.color_mask != 0x01010101u) {
+        uint32_t keep = 0, old;
+        if (!(s_gpu.color_mask & 0x01000000u)) keep |= 0xFF000000u;
+        if (!(s_gpu.color_mask & 0x00010000u)) keep |= 0x00FF0000u;
+        if (!(s_gpu.color_mask & 0x00000100u)) keep |= 0x0000FF00u;
+        if (!(s_gpu.color_mask & 0x00000001u)) keep |= 0x000000FFu;
+        if (keep == 0xFFFFFFFFu)
+            return;
+        if (bpp == 4) {
+            old = ((const uint32_t *)row)[x];
+        } else {
+            uint32_t t = ((const uint16_t *)row)[x];
+            old = ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5) | ((t & 0x001Fu) << 3);
+        }
+        argb = (argb & ~keep) | (old & keep);
+    }
     if (bpp == 4) {
         ((uint32_t *)row)[x] = argb;
     } else if (bpp == 2) {
@@ -1587,6 +1607,10 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                 if (s_gpu.depth_mask)
                     *zp = z;
             }
+            if (s_gpu.zpass_enable)
+                s_gpu.zpass_count++;
+            if (!(s_gpu.color_mask & 0x01010101u))
+                continue;                  /* colour writes off: depth only */
             s_gpu.xf_pixels++;
             for (k = 0; k < 4; k++)
                 col[k] = l0 * va->d0[k] + l1 * vb->d0[k] + l2 * vc->d0[k];
@@ -1888,6 +1912,14 @@ static void draw_primitive(void)
                     s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                     s_gpu.tris_drawn - t0,
                     (unsigned long long)(s_gpu.pixels - p0));
+            if ((s_gpu.xf_mode & 3) == 2) {
+                uint32_t r;
+                for (r = 112; r < 116; r++) {
+                    const float *c = nv2a_vsh_constant(r);
+                    fprintf(stderr, "[FTRACE]     c[%u] %g %g %g %g%c", r,
+                            c[0], c[1], c[2], c[3], 10);
+                }
+            }
         }
     }
 
@@ -2161,6 +2193,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     static int inited;
     if (!inited) {
         inited = 1;
+        s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
     }
@@ -2216,6 +2249,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_BLEND_EQUATION:
         s_gpu.blend_equation = param;
         break;
+    case 0x0358:                                  /* SET_COLOR_MASK */
+        s_gpu.color_mask = param;
+        break;
+    case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
+        s_gpu.zpass_count = 0;
+        break;
+    case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
+        s_gpu.zpass_enable = param;
+        break;
+    case 0x17D0: {                                /* GET_REPORT */
+        /* The GPU's answer to a visibility test: 16 bytes at the report
+         * DMA offset -- a timestamp, the pixel count, and 0 for "done".
+         * Never written, a title polling it (D3D's GetVisibilityTestResult
+         * starts the slot at 0xFFFFFFFF) sees every test incomplete. Burnout
+         * 3 culls its world with these, so the race's main view drew only
+         * the sky while the cube-map passes, which do not test, drew it all.
+         * The report DMA object starts at physical 0 here, as D3D sets it. */
+        uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+        uint32_t at = dma_resolve(param & 0x00FFFFFFu);
+        uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
+        memcpy(mem + at, &stamp, 8);
+        memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
+        memset(mem + at + 12, 0, 4);
+        break;
+    }
     case NV097_SET_BLEND_COLOR:
         s_gpu.blend_color = param;
         break;
