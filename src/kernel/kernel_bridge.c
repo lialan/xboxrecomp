@@ -26,6 +26,7 @@
  */
 
 #include "kernel.h"
+#include "guest_vmem.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
@@ -831,6 +832,33 @@ static void bridge_NtAllocateVirtualMemory(void)
         fflush(stderr);
     }
 
+    /* RECOMP_EXT_VMA: a request for a specific address above the RAM mirrors
+     * gets exactly that address, or a failure the caller can act on. The heap
+     * path below never honours a base; it substitutes whatever its cursor is
+     * at, which breaks any title that checks what it got against what it asked
+     * for. Everything else (base = 0, or an address in mapped RAM) carries on
+     * below. */
+    if (base_ptr && size_ptr) {
+        uint32_t vm_base = base_hint;
+        uint32_t vm_size = size;
+        uint32_t vm_status;
+
+        if (guest_vmem_allocate(&vm_base, &vm_size, alloc_type, protect, &vm_status)) {
+            if (KERNEL_LOG_ON()) {
+                fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory (extended VMA): "
+                                "base=0x%08X size=%u status=0x%08X\n",
+                        vm_base, vm_size, vm_status);
+                fflush(stderr);
+            }
+            if (vm_status == 0) {
+                BRIDGE_MEM32(base_ptr) = vm_base;
+                BRIDGE_MEM32(size_ptr) = vm_size;
+            }
+            g_eax = vm_status;
+            return;
+        }
+    }
+
     if (size == 0) {
         g_eax = 0xC0000045u; /* STATUS_INVALID_PAGE_PROTECTION */
         return;
@@ -1007,6 +1035,26 @@ static void bridge_NtQueryVirtualMemory(void)
         return;
     }
 
+    /* Anything the extended-VMA tracker owns is answered from its own records.
+     * The generic answer below calls everything above RAM free, so a caller
+     * walking its address space for a free range would be handed one that is
+     * live. */
+    {
+        uint32_t vm_info[7];
+
+        if (guest_vmem_query(base_va, vm_info)) {
+            BRIDGE_MEM32(info_va + 0x00) = vm_info[0]; /* BaseAddress */
+            BRIDGE_MEM32(info_va + 0x04) = vm_info[1]; /* AllocationBase */
+            BRIDGE_MEM32(info_va + 0x08) = vm_info[2]; /* AllocationProtect */
+            BRIDGE_MEM32(info_va + 0x0C) = vm_info[3]; /* RegionSize */
+            BRIDGE_MEM32(info_va + 0x10) = vm_info[4]; /* State */
+            BRIDGE_MEM32(info_va + 0x14) = vm_info[5]; /* Protect */
+            BRIDGE_MEM32(info_va + 0x18) = vm_info[6]; /* Type */
+            g_eax = 0;
+            return;
+        }
+    }
+
     BRIDGE_MEM32(info_va + 0x00) = page_base;          /* BaseAddress */
     BRIDGE_MEM32(info_va + 0x04) = page_base;          /* AllocationBase */
     BRIDGE_MEM32(info_va + 0x08) = 0x04;               /* PAGE_READWRITE */
@@ -1017,7 +1065,27 @@ static void bridge_NtQueryVirtualMemory(void)
         BRIDGE_MEM32(info_va + 0x0C) = XBOX_TOTAL_RAM - page_base; /* RegionSize */
         BRIDGE_MEM32(info_va + 0x10) = 0x1000;         /* MEM_COMMIT */
     } else {
-        BRIDGE_MEM32(info_va + 0x0C) = 0x1000;
+        /* Free to the next boundary, not one page. A caller enumerating free
+         * memory then steps across the range instead of crawling it 4 KB at a
+         * time; past the user range that is 0x80000 queries per lap, and on the
+         * title this came from the walk wrapped at 0xFFFFFFFF and never ended.
+         * Only with RECOMP_EXT_VMA, since it changes what every query above
+         * the image answers. */
+        uint32_t region = 0x1000;
+
+        if (guest_vmem_active()) {
+            /* Only where nothing else owns the answer: below the image, and
+             * above the tracker's range. */
+            uint32_t end = 0;
+
+            if (page_base < g_xbox_code_lo)
+                end = g_xbox_code_lo;
+            else if (page_base >= GUEST_VMEM_TOP)
+                end = 0xFFFFFFFFu;
+            if (end > page_base)
+                region = end - page_base;
+        }
+        BRIDGE_MEM32(info_va + 0x0C) = region;
         BRIDGE_MEM32(info_va + 0x10) = 0x10000;        /* MEM_FREE */
         BRIDGE_MEM32(info_va + 0x08) = 0;
         BRIDGE_MEM32(info_va + 0x18) = 0;
@@ -1038,6 +1106,21 @@ static void bridge_NtFreeVirtualMemory(void)
     uint32_t base_ptr = STACK_ARG(0);
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
+
+    if (base_ptr && size_ptr) {
+        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
+        uint32_t vm_size = BRIDGE_MEM32(size_ptr);
+        uint32_t vm_status;
+
+        if (guest_vmem_free(&vm_base, &vm_size, free_type, &vm_status)) {
+            if (vm_status == 0) {
+                BRIDGE_MEM32(base_ptr) = vm_base;
+                BRIDGE_MEM32(size_ptr) = vm_size;
+            }
+            g_eax = vm_status;
+            return;
+        }
+    }
 
     /* Memory NtAllocateVirtualMemory took from the guest heap. The call below
      * reads the 32-bit guest slots as host pointers and hands them to

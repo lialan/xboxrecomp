@@ -14,6 +14,7 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "guest_vmem.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2583,6 +2584,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
     }
 
+    /* Guest address space above the mirrors, for titles that ask for a specific
+     * high address. RECOMP_EXT_VMA; a no-op without it. Straight after the
+     * mirrors, while a fixed host address is still likely to be free. */
+    guest_vmem_init(g_memory_offset, g_memory_size,
+                    (uint64_t)g_memory_size * (1u + XBOX_NUM_MIRRORS));
+
     /*
      * Tiled / write-combined aperture at 0xF0000000.
      *
@@ -2757,6 +2764,8 @@ void xbox_MemoryLayoutShutdown(void)
         CloseHandle(g_mapping_handle);
         g_mapping_handle = NULL;
     }
+
+    guest_vmem_shutdown();
 
     /* Whatever is left of the base+mirrors reservation. The views carved out
      * of it are already unmapped above; this releases the range itself. */
