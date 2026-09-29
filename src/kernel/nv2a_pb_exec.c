@@ -197,11 +197,14 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_VERTEX4F                0x1518   /* +0..0x0C, 4 floats */
 #define NV097_SET_VERTEX_DATA2F_M         0x1880   /* + attr*8,  2 floats */
 #define NV097_SET_VERTEX_DATA4F_M         0x1A00   /* + attr*16, 4 floats */
-#define NV097_SET_VERTEX_DATA4UB          0x1940   /* + attr*4,  D3DCOLOR */
+#define NV097_SET_VERTEX_DATA4UB          0x1940   /* + attr*4,  4 x u8 */
+#define NV097_SET_VERTEX_DATA2S           0x1900   /* + attr*4,  2 x s16 */
+#define NV097_SET_VERTEX_DATA4S_M         0x1980   /* + attr*8,  4 x s16 */
 
 /* One immediate vertex, as this file packs it for the shared draw path:
  * position float4, diffuse D3DCOLOR, texcoord0 float2. */
-#define IMM_VERTEX_DWORDS 7
+/* An immediate-mode vertex: all 16 attributes as float4. */
+#define IMM_VERTEX_DWORDS (NV_VERTEX_ATTRS * 4)
 
 #define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
 
@@ -216,7 +219,7 @@ typedef struct {
 
 #define NV_VERTEX_ATTRS 16
 #define NV_MAX_INDICES  4096
-#define NV_MAX_INLINE   4096            /* dwords of INLINE_ARRAY per batch */
+#define NV_MAX_INLINE   65536           /* dwords of INLINE_ARRAY per batch */
 
 /* Texture stage 0, decoded from what the title programmed.
  *
@@ -248,9 +251,10 @@ static struct {
     uint32_t   inline_count;
     /* Current values of the immediate-mode attributes, and how many complete
      * vertices they have produced in this batch. */
-    float      imm_pos[4];
-    uint32_t   imm_diffuse;
-    float      imm_tex[2];
+    /* Immediate mode: every attribute's current value, as the SET_VERTEX
+     * methods leave it. Writing attribute 0 (position) emits a vertex. */
+    float      imm_attr[NV_VERTEX_ATTRS][4];
+    uint16_t   imm_used;                /* attributes written since BEGIN */
     uint32_t   imm_count;
     int        inline_active;
     uint32_t   draws, verts, nonzero_draws;
@@ -2074,8 +2078,18 @@ static void frame_trace_flip(void)
     static const char *flag = (const char *)-1;
     if (flag == (const char *)-1)
         flag = getenv("RECOMP_FRAME_TRACE");
-    if (!flag || s_ftrace == 3)
+    if (!flag)
         return;
+    if (s_ftrace == 3) {
+        /* Deleting the flag file re-arms the trace for the next time it
+         * appears, so one run can trace several moments. */
+        FILE *f = fopen(flag, "rb");
+        if (f)
+            fclose(f);
+        else
+            s_ftrace = 0;
+        return;
+    }
     if (s_ftrace == 2) {
         s_ftrace = 3;
         fprintf(stderr, "[FTRACE] end of frame\n");
@@ -2339,15 +2353,15 @@ static void draw_immediate(void)
     memset(s_gpu.attr, 0, sizeof s_gpu.attr);
     /* Offsets are byte offsets into inline_buf here, not guest addresses --
      * fetch_attr reads them that way while inline_active is set, which is
-     * also why 0 is a legal offset for position. */
-    s_gpu.attr[0].type = 2; s_gpu.attr[0].size = 4;   /* position float4  */
-    s_gpu.attr[0].offset = 0;
-    s_gpu.attr[3].type = 0; s_gpu.attr[3].size = 4;   /* diffuse D3DCOLOR */
-    s_gpu.attr[3].offset = 16;
-    s_gpu.attr[9].type = 2; s_gpu.attr[9].size = 2;   /* texcoord0 float2 */
-    s_gpu.attr[9].offset = 20;
-    s_gpu.attr[0].stride = s_gpu.attr[3].stride = s_gpu.attr[9].stride =
-        IMM_VERTEX_DWORDS * 4;
+     * also why 0 is a legal offset for position. Every attribute is a float4;
+     * the ones the batch never set carry their standing values, as on the
+     * GPU. */
+    for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+        s_gpu.attr[i].type = 2;
+        s_gpu.attr[i].size = 4;
+        s_gpu.attr[i].offset = i * 16;
+        s_gpu.attr[i].stride = IMM_VERTEX_DWORDS * 4;
+    }
 
     for (i = 0; i < s_gpu.imm_count && i < NV_MAX_INDICES; i++)
         s_gpu.idx[i] = (uint16_t)i;
@@ -2364,16 +2378,15 @@ static void draw_immediate(void)
     s_gpu.inline_count = 0;
 }
 
-/* A vertex is complete: append it in the layout draw_immediate describes. */
+/* A vertex is complete: append all 16 attributes in the layout
+ * draw_immediate describes. */
 static void imm_emit_vertex(void)
 {
     uint32_t at = s_gpu.imm_count * IMM_VERTEX_DWORDS;
 
     if (!s_gpu.prim || at + IMM_VERTEX_DWORDS > NV_MAX_INLINE)
         return;
-    memcpy(&s_gpu.inline_buf[at],     s_gpu.imm_pos, 4 * sizeof(float));
-    memcpy(&s_gpu.inline_buf[at + 4], &s_gpu.imm_diffuse, sizeof(uint32_t));
-    memcpy(&s_gpu.inline_buf[at + 5], s_gpu.imm_tex, 2 * sizeof(float));
+    memcpy(&s_gpu.inline_buf[at], s_gpu.imm_attr, sizeof s_gpu.imm_attr);
     s_gpu.imm_count++;
 }
 
@@ -2382,51 +2395,97 @@ static void imm_emit_vertex(void)
  * Split out because it is a range test against five separate bases, and that
  * reads better than five more cases in an already long switch.
  */
+/* The immediate-mode attribute methods (xemu pgraph.c SET_VERTEX_DATA*).
+ * Each sets an attribute's current value; completing attribute 0 -- the
+ * position -- emits a vertex carrying every attribute as it stands. This used
+ * to keep position, diffuse and texcoord 0 only, which dropped any quad with
+ * a second texture coordinate: Burnout 3 composites its whole 3D scene into
+ * the frame with exactly such a quad, and the frame never got the scene. */
 static int imm_vertex_method(uint32_t method, uint32_t param)
 {
     union { uint32_t u; float f; } v;
+    uint32_t attr, c;
+    float *a;
     v.u = param;
 
     if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16) {
-        uint32_t c = (method - NV097_SET_VERTEX4F) / 4;
-        s_gpu.imm_pos[c] = v.f;
-        if (c == 3)                      /* w completes the vertex */
+        c = (method - NV097_SET_VERTEX4F) / 4;
+        s_gpu.imm_attr[0][c] = v.f;
+        s_gpu.imm_used |= 1;
+        if (c == 3)
             imm_emit_vertex();
         return 1;
     }
     if (method >= NV097_SET_VERTEX3F && method < NV097_SET_VERTEX3F + 12) {
-        uint32_t c = (method - NV097_SET_VERTEX3F) / 4;
-        s_gpu.imm_pos[c] = v.f;
-        if (c == 2) {                    /* z completes it, w is implicitly 1 */
-            s_gpu.imm_pos[3] = 1.0f;
+        c = (method - NV097_SET_VERTEX3F) / 4;
+        s_gpu.imm_attr[0][c] = v.f;
+        s_gpu.imm_used |= 1;
+        if (c == 2) {
+            s_gpu.imm_attr[0][3] = 1.0f;
             imm_emit_vertex();
         }
         return 1;
     }
     if (method >= NV097_SET_VERTEX_DATA2F_M
             && method < NV097_SET_VERTEX_DATA2F_M + NV_VERTEX_ATTRS * 8) {
-        uint32_t off = method - NV097_SET_VERTEX_DATA2F_M;
-        if (off / 8 == 9)                /* attribute 9 is texture coord 0 */
-            s_gpu.imm_tex[(off % 8) / 4] = v.f;
+        attr = (method - NV097_SET_VERTEX_DATA2F_M) / 8;
+        c = ((method - NV097_SET_VERTEX_DATA2F_M) % 8) / 4;
+        a = s_gpu.imm_attr[attr];
+        a[c] = v.f;
+        if (c == 1) {
+            a[2] = 0.0f; a[3] = 1.0f;
+        }
+        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        if (attr == 0 && c == 1)
+            imm_emit_vertex();
         return 1;
     }
     if (method >= NV097_SET_VERTEX_DATA4F_M
             && method < NV097_SET_VERTEX_DATA4F_M + NV_VERTEX_ATTRS * 16) {
-        uint32_t off = method - NV097_SET_VERTEX_DATA4F_M;
-        uint32_t attr = off / 16, c = (off % 16) / 4;
-        if (attr == 0) {
-            s_gpu.imm_pos[c] = v.f;
-            if (c == 3)
-                imm_emit_vertex();
-        } else if (attr == 9 && c < 2) {
-            s_gpu.imm_tex[c] = v.f;
-        }
+        attr = (method - NV097_SET_VERTEX_DATA4F_M) / 16;
+        c = ((method - NV097_SET_VERTEX_DATA4F_M) % 16) / 4;
+        s_gpu.imm_attr[attr][c] = v.f;
+        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        if (attr == 0 && c == 3)
+            imm_emit_vertex();
+        return 1;
+    }
+    if (method >= NV097_SET_VERTEX_DATA2S
+            && method < NV097_SET_VERTEX_DATA2S + NV_VERTEX_ATTRS * 4) {
+        attr = (method - NV097_SET_VERTEX_DATA2S) / 4;
+        a = s_gpu.imm_attr[attr];
+        a[0] = (float)(int16_t)(param & 0xFFFF);
+        a[1] = (float)(int16_t)(param >> 16);
+        a[2] = 0.0f; a[3] = 1.0f;
+        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        if (attr == 0)
+            imm_emit_vertex();
         return 1;
     }
     if (method >= NV097_SET_VERTEX_DATA4UB
             && method < NV097_SET_VERTEX_DATA4UB + NV_VERTEX_ATTRS * 4) {
-        if ((method - NV097_SET_VERTEX_DATA4UB) / 4 == 3)   /* diffuse */
-            s_gpu.imm_diffuse = param;
+        /* Bytes in register order, x from the low byte (xemu). */
+        attr = (method - NV097_SET_VERTEX_DATA4UB) / 4;
+        a = s_gpu.imm_attr[attr];
+        a[0] = (float)( param        & 0xFF) / 255.0f;
+        a[1] = (float)((param >>  8) & 0xFF) / 255.0f;
+        a[2] = (float)((param >> 16) & 0xFF) / 255.0f;
+        a[3] = (float)( param >> 24        ) / 255.0f;
+        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        if (attr == 0)
+            imm_emit_vertex();
+        return 1;
+    }
+    if (method >= NV097_SET_VERTEX_DATA4S_M
+            && method < NV097_SET_VERTEX_DATA4S_M + NV_VERTEX_ATTRS * 8) {
+        attr = (method - NV097_SET_VERTEX_DATA4S_M) / 8;
+        c = ((method - NV097_SET_VERTEX_DATA4S_M) % 8) / 4;
+        a = s_gpu.imm_attr[attr];
+        a[c * 2]     = (float)(int16_t)(param & 0xFFFF);
+        a[c * 2 + 1] = (float)(int16_t)(param >> 16);
+        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        if (attr == 0 && c == 1)
+            imm_emit_vertex();
         return 1;
     }
     return 0;
@@ -2490,6 +2549,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (!inited) {
         inited = 1;
         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
+        {
+            int i;
+            for (i = 0; i < NV_VERTEX_ATTRS; i++)
+                s_gpu.imm_attr[i][3] = 1.0f;
+        }
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
     }
@@ -2514,6 +2578,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     subch, method, param);
     }
 
+    if (s_ftrace == 2) {
+        /* RECOMP_FRAME_TRACE_METHODS: every method of the traced frame,
+         * less the bulk (vertex data, program and constant uploads). */
+        static int all = -1;
+        if (all < 0)
+            all = getenv("RECOMP_FRAME_TRACE_METHODS") != NULL;
+        if (all && !(method >= 0x1800 && method < 0x1A00)
+            && !(method >= 0x0B00 && method < 0x0C00))
+            fprintf(stderr, "[FTRACE]   m %u:%04X = %08X%c", subch, method,
+                    param, 10);
+    }
     if (subch == 0 && method >= NV_TEX_FIRST && method <= NV_TEX_LAST) {
         tex_stage_method(method, param);
         return;
