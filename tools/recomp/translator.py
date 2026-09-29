@@ -28,6 +28,16 @@ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
 
+# Float compares snapshot at the compare as well, and their conditions read
+# nothing else: comiss/ucomiss/comisd/ucomisd store both operands into the
+# doubles _fca/_fcb (a float widens to double exactly, and the ordered and
+# unordered forms set identical flags), and the fcomi family stores the
+# ordering into g_fp_cmp. So a join of any two members of one family is the
+# same state whatever the operands were.
+_SSE_COMPARES = frozenset({"comiss", "ucomiss", "comisd", "ucomisd"})
+_FPU_COMPARES = frozenset({"fcomi", "fcomip", "fcompi", "fucomi", "fucomip", "fucompi"})
+
+
 def _merge_flag_states(states):
     """Merge comparable snapshots without requiring identical source operands.
 
@@ -35,12 +45,20 @@ def _merge_flag_states(states):
     runtime. A shared consumer can use whichever predecessor executed. Keep
     operation and width equal because sign/parity handling depends on them;
     arithmetic states still reconstruct operands and cannot use this merge.
+
+    Float compares join the same way (see _SSE_COMPARES). Without that, a jbe
+    after "comiss xmm3, xmm0" on one edge and "comiss xmm0, xmm3" on the other
+    -- MSVC's shape for a clamp whose direction depends on a sign -- fell back
+    to the never-assigned _flags, and the clamp always fired. T()NY zeroed its driven wheels' torque that way; the car crawled.
     """
     if not states or any(not state or not state[0] for state in states):
         return None
     first = states[0]
     if all(state == first for state in states[1:]):
         return first
+    for family in (_SSE_COMPARES, _FPU_COMPARES):
+        if all(state[0] in family for state in states):
+            return first
     if first[0] in ("cmp", "test") and len(first[1]) == 2:
         width = _operand_width(first[1][0]) or _operand_width(first[1][1])
         for kind, ops in states[1:]:
