@@ -1039,6 +1039,24 @@ static void bridge_NtFreeVirtualMemory(void)
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
 
+    /* Memory NtAllocateVirtualMemory took from the guest heap. The call below
+     * reads the 32-bit guest slots as host pointers and hands them to
+     * VirtualFree, which fails, so none of it ever came back. Under
+     * RECOMP_HEAP_RECLAIM a release returns the block to the heap and a
+     * decommit does nothing, since heap memory is always committed. */
+    if (xbox_HeapReclaimEnabled() && base_ptr && size_ptr) {
+        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
+
+        if (xbox_HeapBlockSize(vm_base)) {
+            if (free_type & 0x8000) {              /* MEM_RELEASE */
+                xbox_HeapFree(vm_base);
+                BRIDGE_MEM32(size_ptr) = 0;
+            }
+            g_eax = 0;
+            return;
+        }
+    }
+
     g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
         XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
 }
