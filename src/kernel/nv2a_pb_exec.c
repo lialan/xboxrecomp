@@ -2238,6 +2238,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.pitch = param & 0xFFFF;      /* colour pitch; zeta is the top half */
         break;
     case NV097_SET_SURFACE_COLOR_OFFSET:
+        if (s_ftrace == 2)
+            fprintf(stderr, "[FTRACE] color offset -> %08X%c", param, 10);
         s_gpu.color_offset = param;
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
@@ -2358,10 +2360,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     case NV097_SET_FLIP_READ:
+        if (s_ftrace == 2)
+            fprintf(stderr, "[FTRACE] P_READ %u%c", param, 10);
         s_gpu.flip_read = param;
         return;
 
     case NV097_SET_FLIP_WRITE:
+        if (s_ftrace == 2)
+            fprintf(stderr, "[FTRACE] P_WRITE %u%c", param, 10);
         s_gpu.flip_write = param;
         return;
 
@@ -2378,6 +2384,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_FLIP_STALL:
+        if (s_ftrace == 2)
+            fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
+                    s_gpu.drawn_offset, s_gpu.color_offset, 10);
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now. */
         s_gpu.flip_read = s_gpu.flip_write;
