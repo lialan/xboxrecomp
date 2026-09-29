@@ -70,3 +70,34 @@ def test_float_and_integer_compares_are_not_merged():
     y = Operand(type='reg', reg='xmm1')
     assert _merge_flag_states([('comiss', [x, y]), ('cmp', [a, b])]) is None
     assert _merge_flag_states([('comiss', [x, y]), ('fcomip', [])]) is None
+
+
+def test_mixed_setters_evaluate_the_join_on_each_edge():
+    # test ecx,ecx; jz alt; sub eax,1; jmp join; alt: test eax,eax;
+    # join: jne out; nop; out: ret
+    # A result snapshot (sub) meets a compare snapshot (test): the states do
+    # not merge, and the join used to read the never-assigned _flags.
+    code = translate(bytes.fromhex('85c9740583e801eb0285c0750190c3'))
+    assert 'if (_jf_0001000B /* jne' in code, code
+    assert 'if (_flags' not in code, code
+    # the sub edge sets it before its jmp, the test edge before falling in
+    assert ('_jf_0001000B = ((_fa != 0)) ? 1 : 0; /* flags of this edge */\n'
+            '    goto loc_0001000B;') in code, code
+    tail = code.index('_jf_0001000B = (CMP_NE(_fa, _fb)) ? 1 : 0; /* flags of this edge */')
+    assert code.index('loc_00010009:') < tail < code.index('loc_0001000B:'), code
+    assert 'int _jf_0001000B = 0;' in code, code
+
+
+def test_edges_read_snapshots_across_a_move_at_the_join():
+    # neg eax on one edge, dec ebx on the other, then the join moves eax
+    # before its je. Both edges read their result snapshot, not eax.
+    # test ecx,ecx; jz alt; neg eax; jmp join; alt: dec ebx; join: mov eax,1; je out; nop; out: ret
+    code = translate(bytes.fromhex('85c97404f7d8eb014bb801000000740190c3'))
+    assert code.count('_jf_00010009 = ((_fa == 0)) ? 1 : 0;') == 2, code
+    assert 'if (_jf_00010009 /* je' in code, code
+
+
+def test_a_join_with_an_unknown_predecessor_is_not_guessed():
+    from tools.recomp.translator import _edge_flag_plan
+    assert _edge_flag_plan(None, set(), {}) is None
+    assert _edge_flag_plan(None, {1, 2}, {1: ('cmp', []), 2: None}) is None
