@@ -407,6 +407,16 @@ _FLAGS_UNDEFINED = frozenset({
     "popfd",
 })
 
+# SSE compare predicates, by the CMPPS/CMPSS immediate. The named forms
+# (cmpltss, cmpnleps, ...) are the same instruction with the immediate
+# spelled out, so both lift through one table.
+_SSE_CMP_PRED = {"eq": 0, "lt": 1, "le": 2, "unord": 3,
+                 "neq": 4, "nlt": 5, "nle": 6, "ord": 7}
+_SSE_CMP_NAMED = {f"cmp{p}{w}": (n, w) for p, n in _SSE_CMP_PRED.items()
+                  for w in ("ps", "ss")}
+_BARE_STRING_COMPARES = ("cmpsb", "cmpsw", "cmpsd", "scasb", "scasw", "scasd")
+
+
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
 _EFLAGS_PRESERVE = frozenset({
     # General-purpose data movement / stack
@@ -1443,6 +1453,13 @@ class Lifter:
         if m in ("movsb", "movsd", "movsw", "stosb", "stosd", "stosw",
                  "lodsb", "lodsd", "lodsw") and not _has_xmm_operand(ops):
             return self._lift_string_op(insn, m)
+        # A single cmps/scas is the rep form run once, with ecx left alone.
+        # These were RECOMP_UNIMPL: no compare, no advance, stale flags --
+        # and MSVC unrolls short memcmps into exactly `cmpsd; jne` chains.
+        if m in _BARE_STRING_COMPARES and not _has_xmm_operand(ops):
+            return (["{ uint32_t _rc = ecx; ecx = 1;"]
+                    + self._lift_rep_string(insn, "repe " + m)
+                    + ["ecx = _rc; }"])
         if m == "wait":
             return ["/* wait - FPU sync */"]
 
@@ -1606,8 +1623,9 @@ class Lifter:
                  "minps", "maxps", "rsqrtss", "rcpss",
                  "sqrtps", "rsqrtps", "rcpps",
                  "cmpneqps", "cmpeqps", "cmpltps", "cmpleps",
+                 "cmpps", "cmpss",
                  "movmskps",
-                 "pand", "pandn", "por", "pxor", "pcmpgtd"):
+                 "pand", "pandn", "por", "pxor", "pcmpgtd")                 or m in _SSE_CMP_NAMED:
             return self._lift_sse(insn, m, ops)
 
         # ── FPU ──
@@ -3328,26 +3346,46 @@ class Lifter:
         # rsqrtps/sqrtps are the workhorse of 3D vector normalize; some titles
         # use them heavily, which is why this surfaced on those binaries.
         if m == "sqrtps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"sqrtf({_sse_read(ops[1])})")
-                        + " /* sqrtps (low lane; 4-lane model TODO) */"]
-        if m == "rsqrtps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"1.0f / sqrtf({_sse_read(ops[1])})")
-                        + " /* rsqrtps (low lane; 4-lane model TODO) */"]
-        if m == "rcpps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"1.0f / {_sse_read(ops[1])}")
-                        + " /* rcpps (low lane; 4-lane model TODO) */"]
-
-        # ── Packed comparison ──
-        if m in ("cmpneqps", "cmpeqps", "cmpltps", "cmpleps"):
-            helper = {"cmpeqps": "XMM_CMP_EQ", "cmpltps": "XMM_CMP_LT",
-                      "cmpleps": "XMM_CMP_LE", "cmpneqps": "XMM_CMP_NEQ"}[m]
-            lifted = _packed_binary(helper)
+            lifted = _packed_binary("XMM_SQRT")
             if lifted is not None:
                 return lifted
             return [f"/* {m} {insn.op_str} */"]
+        if m == "rsqrtps":
+            lifted = _packed_binary("XMM_RSQRT")
+            if lifted is not None:
+                return lifted
+            return [f"/* {m} {insn.op_str} */"]
+        if m == "rcpps":
+            lifted = _packed_binary("XMM_RCP")
+            if lifted is not None:
+                return lifted
+            return [f"/* {m} {insn.op_str} */"]
+
+        # ── Comparison ──
+        # Every predicate, packed and scalar, named or by immediate. Only
+        # four packed forms were lifted; the rest -- cmpltss above all --
+        # fell to RECOMP_UNIMPL and left the destination as it was. That
+        # is not harmless: RenderWare's frustum build normalises each side
+        # plane as `cmpltss mask, len2; rsqrtss; andps mask`, so with the
+        # mask stuck at zero every side plane came out (0,0,0,0) and
+        # culled the whole world out of Burnout 3's race view.
+        if m in _SSE_CMP_NAMED or m in ("cmpps", "cmpss"):
+            if m in _SSE_CMP_NAMED:
+                pred, width = _SSE_CMP_NAMED[m]
+            else:
+                if nops < 3 or ops[2].type != "imm":
+                    return [f"/* {m} {insn.op_str} - no predicate */"]
+                pred, width = ops[2].imm & 7, m[-2:]
+            if nops < 2 or not _is_xmm(ops[0]):
+                return [f"/* {m} {insn.op_str} */"]
+            if width == "ps":
+                b = _packed_read(ops[1])
+                if b is None:
+                    return [f"/* {m} {insn.op_str} */"]
+                return [_packed_write(ops[0], f"XMM_CMP_PRED({ops[0].reg}, {b}, {pred})")
+                        + f" /* {m} */"]
+            return [f"{ops[0].reg}.u[0] = recomp_cmp_pred({ops[0].reg}.f[0], "
+                    f"{_sse_read(ops[1])}, {pred}) ? 0xFFFFFFFFu : 0u; /* {m} */"]
 
         # ── Move mask ──
         # This feeds branches, so a hardcoded 0 silently picked one side.
@@ -3920,7 +3958,16 @@ def lift_basic_block(lifter, bb, flag_state=None):
         stmts.extend(results)
 
         # Track flag-setting instructions
-        if curr.mnemonic in FLAG_SETTERS:
+        if (curr.mnemonic in _BARE_STRING_COMPARES
+                and not _has_xmm_operand(curr.operands)):
+            # A single cmps/scas sets the flags like cmp. "cmpsd" is also
+            # the SSE2 scalar compare, which is why it sits in
+            # _EFLAGS_PRESERVE and has to be caught before that test.
+            last_flag_setter = curr.mnemonic
+            last_flag_ops = list(curr.operands)
+        elif curr.mnemonic in _SSE_CMP_NAMED:
+            pass  # SSE compares write a mask, not EFLAGS
+        elif curr.mnemonic in FLAG_SETTERS:
             last_flag_setter, last_flag_ops = normalise_zero_test(
                 curr.mnemonic, list(curr.operands))
         elif curr.mnemonic in _FLAGS_UNDEFINED:
