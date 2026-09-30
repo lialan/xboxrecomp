@@ -51,7 +51,7 @@ def test_float_compares_with_swapped_operands_join():
     # test cl,cl; jle alt; comiss xmm3,xmm0; jmp join;
     # alt: comiss xmm0,xmm3; join: jbe skip; movaps xmm0,xmm3; skip: ret
     code = translate(bytes.fromhex('84c97e050f2fd8eb030f2fc376030f28c3c3'))
-    assert '(!(_fca > _fcb))' in code, code
+    assert 'if ((_fca <= _fcb || (_fca != _fca || _fcb != _fcb)))' in code, code
     assert 'if (_flags' not in code, code
 
 
@@ -59,7 +59,7 @@ def test_fcomi_family_joins():
     # fld st0; fcomip st1 on one edge, fucomip st1 on the other, then ja.
     # test cl,cl; jle alt; fcomip st(1); jmp join; alt: fucomip st(1); join: ja skip; nop; skip: ret
     code = translate(bytes.fromhex('84c97e04dff1eb02dfe97701' + '90c3'))
-    assert '(g_fp_cmp > 0)' in code, code
+    assert 'if ((g_fp_cmp == 1)' in code, code
     assert 'if (_flags' not in code, code
 
 
