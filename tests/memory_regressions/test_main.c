@@ -20,6 +20,10 @@
  *   3. NtFreeVirtualMemory(MEM_RELEASE) on memory NtAllocateVirtualMemory took
  *      from the heap gives it back. It handed the 32-bit guest slot to the host
  *      VirtualFree as a pointer, which failed, so none of it ever returned.
+ *   5. MEM_DECOMMIT then MEM_COMMIT on heap memory gives zeroed pages, as on
+ *      the console. Both were no-ops, so the old contents came back.
+ *   6. MmFreeContiguousMemory gives a contiguous block back and the next
+ *      request of that size reuses it; the default keeps the bump allocator.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
@@ -273,6 +277,43 @@ int main(int argc, char **argv)
         st = nt_alloc(size, &b2);
         snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", b2, b1);
         check(st == 0 && b2 == b1, "the next 2 MB request reuses it", d);
+    }
+
+    /* 5. Decommitted heap memory comes back zeroed. */
+    if (reclaim) {
+        const uint32_t size = 0x10000;
+        uint32_t b1, base, sz, args[3], st;
+
+        nt_alloc(size, &b1);
+        memset(G(b1), 0xA5, size);
+        *G(OUT_VA) = b1 + 0x1000;            /* decommit the second page only */
+        *G(OUT_VA + 4) = 0x1000;
+        args[0] = OUT_VA; args[1] = OUT_VA + 4; args[2] = 0x4000;   /* MEM_DECOMMIT */
+        st = call(S_FREE, 3, args);
+        base = b1 + 0x1000; sz = 0x1000;
+        nt_alloc_at(&base, &sz, 0x1000);     /* MEM_COMMIT it again */
+        snprintf(d, sizeof d, "status 0x%08X, page 0x%08X, neighbour 0x%08X",
+                 st, *G(b1 + 0x1000), *G(b1 + 0x2000));
+        check(st == 0 && *G(b1 + 0x1000) == 0 && *G(b1 + 0x1FFC) == 0 &&
+              *G(b1) == 0xA5A5A5A5u && *G(b1 + 0x2000) == 0xA5A5A5A5u,
+              "a decommitted page comes back zeroed, its neighbours kept", d);
+    }
+
+    /* 6. Contiguous memory can be given back. */
+    if (!ext) {
+        extern int xbox_ContiguousFree(uint32_t addr);
+        uint32_t c1 = xbox_ContiguousAlloc(0x20000, 4096);
+        uint32_t c2;
+
+        snprintf(d, sizeof d, "free said %d", xbox_ContiguousFree(c1));
+        c2 = xbox_ContiguousAlloc(0x20000, 4096);
+        if (reclaim) {
+            char d2[160];
+            snprintf(d2, sizeof d2, "%s, got 0x%08X, expected 0x%08X", d, c2, c1);
+            check(c1 && c2 == c1, "a freed contiguous block is reused", d2);
+        } else {
+            check(c1 && c2 != c1, "default: contiguous memory is never reused", d);
+        }
     }
 
     /* 4. Above the RAM mirrors: [0x74000000, 0x7FFE0000) at 64 MB. */

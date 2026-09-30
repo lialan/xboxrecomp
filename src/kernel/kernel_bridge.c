@@ -804,8 +804,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
  */
 static void bridge_MmFreeContiguousMemory(void)
 {
+    extern int xbox_ContiguousFree(uint32_t addr);
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+    /* Contiguous blocks come from their own arena, not the heap: passing
+     * them to xbox_HeapFree found nothing, so none ever came back. */
+    if (!xbox_ContiguousFree(addr))
+        xbox_HeapFree(addr);
     g_eax = 0;
 }
 
@@ -1126,14 +1130,22 @@ static void bridge_NtFreeVirtualMemory(void)
      * reads the 32-bit guest slots as host pointers and hands them to
      * VirtualFree, which fails, so none of it ever came back. Under
      * RECOMP_HEAP_RECLAIM a release returns the block to the heap and a
-     * decommit does nothing, since heap memory is always committed. */
+     * decommit zeroes the pages it names, since heap memory stays committed. */
     if (xbox_HeapReclaimEnabled() && base_ptr && size_ptr) {
         uint32_t vm_base = BRIDGE_MEM32(base_ptr);
+        uint32_t left = xbox_HeapBlockSize(vm_base);
 
-        if (xbox_HeapBlockSize(vm_base)) {
+        if (left) {
             if (free_type & 0x8000) {              /* MEM_RELEASE */
                 xbox_HeapFree(vm_base);
                 BRIDGE_MEM32(size_ptr) = 0;
+            } else {
+                /* MEM_DECOMMIT keeps the block, but on the console the pages
+                 * are gone and a later MEM_COMMIT (a no-op here) brings them
+                 * back zeroed. Zero them now so it does. */
+                uint32_t vm_size = BRIDGE_MEM32(size_ptr);
+                uint32_t n = (vm_size && vm_size < left) ? vm_size : left;
+                memset(XBOX_TO_NATIVE(vm_base), 0, n);
             }
             g_eax = 0;
             return;
@@ -4120,7 +4132,10 @@ static void bridge_MmLockUnlockBufferPages(void)
  */
 static void bridge_MmQueryAllocationSize(void)
 {
-    g_eax = xbox_HeapBlockSize(STACK_ARG(0));
+    extern uint32_t xbox_ContiguousBlockSize(uint32_t addr);
+    uint32_t va = STACK_ARG(0);
+    uint32_t n = xbox_ContiguousBlockSize(va);   /* XPhysicalSize asks this too */
+    g_eax = n ? n : xbox_HeapBlockSize(va);
 }
 
 /* ── NtCreateMutant (ordinal 192, 3 args) */
