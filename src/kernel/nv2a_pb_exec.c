@@ -279,7 +279,7 @@ static struct {
      * often after the main scene, so "last surface drawn" alone picked one of
      * those and read it with the framebuffer's pitch: horizontal noise. The
      * biggest surface drawn since the last flip is the one being presented. */
-    uint32_t drawn_pitch, drawn_x, drawn_y, drawn_w, drawn_h;
+    uint32_t drawn_pitch, drawn_x, drawn_y, drawn_w, drawn_h, drawn_bpp;
     int drawn_stale;      /* set at a flip: the next draw starts a new frame */
     uint64_t pixels;
     uint32_t pixel_max;   /* brightest value any pixel write carried */
@@ -527,6 +527,8 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     }
 }
 
+static uint32_t surface_bpp(void);
+
 static void note_drawn(void)
 {
     if (!s_gpu.drawn_stale && s_gpu.drawn_offset
@@ -535,12 +537,28 @@ static void note_drawn(void)
     s_gpu.drawn_stale = 0;
     s_gpu.drawn_offset = s_gpu.color_offset;
     s_gpu.drawn_pitch = s_gpu.pitch;
+    s_gpu.drawn_bpp = surface_bpp();
     s_gpu.drawn_x = s_gpu.clip_x; s_gpu.drawn_y = s_gpu.clip_y;
     s_gpu.drawn_w = s_gpu.clip_w; s_gpu.drawn_h = s_gpu.clip_h;
 }
 
 static uint32_t surface_bpp(void)
 {
+    /* The surface format says it outright (NV097_SET_SURFACE_FORMAT_COLOR).
+     * Deriving it from pitch / clip width -- the only way before -- is right
+     * only while the clip spans the whole surface: Burnout 3 narrows the clip
+     * to a 250-pixel window to draw its option values, 2560 / 250 came out as
+     * 10 bytes a pixel, and every such text quad was refused. */
+    switch (s_gpu.format & 0xF) {
+    case 0x1: case 0x2: case 0x3: case 0xA:
+        return 2;
+    case 0x4: case 0x5: case 0x6: case 0x7: case 0x8:
+        return 4;
+    case 0x9:
+        return 1;
+    default:
+        break;
+    }
     /* The pitch and the clip width together give the pixel size, which is more
      * reliable than decoding the format field: the format's colour code is
      * only meaningful alongside a type the title also sets, while the pitch is
@@ -573,7 +591,7 @@ static void dump_surface_bmp(void)
     char path[512];
     uint32_t w = drawn ? s_gpu.drawn_w : s_gpu.clip_w;
     uint32_t h = drawn ? s_gpu.drawn_h : s_gpu.clip_h, y, x;
-    uint32_t bpp = w ? pitch / w : 0;
+    uint32_t bpp = drawn ? s_gpu.drawn_bpp : surface_bpp();
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
     FILE *f;
@@ -865,12 +883,12 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          * a streamed mip) never returns stale texels.
          * ponytail: single-threaded executor, so a plain static table. */
         static NV_TLS struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
-                        uint32_t px[16]; } cache[512];
+                        uint32_t px[16]; } cache[4096];
         uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
         uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
         const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
         uintptr_t key = (uintptr_t)blk;
-        size_t slot = (key / bb) & 511;
+        size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
         uint64_t raw[2] = {0, 0};
         memcpy(raw, blk, bb);
         if (cache[slot].key != key || cache[slot].fmt != fmt
@@ -2431,6 +2449,11 @@ static void draw_primitive(void)
                     s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                     s_gpu.tris_drawn - t0,
                     (unsigned long long)(s_gpu.pixels - p0));
+            if ((s_gpu.xf_mode & 3) == 2)
+                fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
+                        s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
+                        s_xf[0].pos[3], s_xf[1].pos[0], s_xf[1].pos[1],
+                        s_xf[2].pos[0], s_xf[2].pos[1], 10);
             if (s_gpu.rc_seen) {
                 int st;
                 fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",
