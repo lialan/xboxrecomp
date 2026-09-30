@@ -235,6 +235,7 @@ typedef struct {
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
     uint32_t palette;                   /* guest address of the CLUT, P8 */
     uint32_t levels;                    /* mip levels, from FORMAT       */
+    uint32_t filter;                    /* SET_TEXTURE_FILTER            */
     int      cube;                      /* FORMAT: six faces, not one    */
     int      valid;
 } Texture;
@@ -793,11 +794,15 @@ static void clear_surface(uint32_t param)
  */
 static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
 {
+    /* Coordinates are signed: a bilinear tap one texel left of or above
+     * texel 0 is -1, which must wrap to the far edge or clamp to 0 -- as an
+     * unsigned value it clamped to the far edge instead. */
+    int32_t sc = (int32_t)c, n = (int32_t)size;
     if (!size)
         return 0;
     if (mode == 1)                         /* wrap */
-        return c % size;
-    return c >= size ? size - 1 : c;       /* clamp, and everything else */
+        return (uint32_t)(((sc % n) + n) % n);
+    return sc < 0 ? 0u : (sc >= n ? size - 1 : c);   /* clamp, and the rest */
 }
 
 static uint32_t expand(uint32_t v, uint32_t bits)
@@ -1585,10 +1590,33 @@ static uint32_t tex_face_stride(const Texture *t)
 static void rc_texel(const Texture *t, uint32_t face, float u, float v,
                      float out[4])
 {
-    uint32_t texel;
+    uint32_t texel, mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
     if (tex_size_from_format(t->color)) {
         u *= (float)t->width;
         v *= (float)t->height;
+    }
+    /* TENT (bilinear) when the title asks for it, magnifying or minifying:
+     * a 64x32 sky gradient stretched over the screen is blocks with nearest
+     * texels and a gradient with four. MAG 2 is tent; MIN 2 is tent at LOD 0
+     * and 4/6 the tent mip modes.
+     * ponytail: level 0 only, no mip selection -- minified textures shimmer.
+     * Add LOD from the screen-space derivative when that shows. */
+    if (mag == 2 || min == 2 || min == 4 || min == 6) {
+        float fu = u - 0.5f, fv = v - 0.5f, wu, wv, c[4][4];
+        int32_t iu = (int32_t)floorf(fu), iv = (int32_t)floorf(fv), k, j;
+        wu = fu - (float)iu;
+        wv = fv - (float)iv;
+        for (k = 0; k < 4; k++) {
+            if (sample_tex(t, face, (uint32_t)(iu + (k & 1)),
+                           (uint32_t)(iv + (k >> 1)), &texel))
+                nv2a_rc_unpack(texel, c[k]);
+            else
+                c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
+        }
+        for (j = 0; j < 4; j++)
+            out[j] = (c[0][j] * (1.0f - wu) + c[1][j] * wu) * (1.0f - wv)
+                   + (c[2][j] * (1.0f - wu) + c[3][j] * wu) * wv;
+        return;
     }
     if (sample_tex(t, face, (uint32_t)(int32_t)floorf(u),
                    (uint32_t)(int32_t)floorf(v), &texel))
@@ -2534,6 +2562,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     case NV097_SET_TEXTURE_IMAGE_RECT:
         t->width  = param >> 16;
         t->height = param & 0xFFFF;
+        break;
+    case 0x1B14:                                  /* SET_TEXTURE_FILTER */
+        t->filter = param;
         break;
     default:
         break;
