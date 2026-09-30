@@ -578,6 +578,11 @@ static uint32_t surface_bpp(void)
  * ponytail: bottom-up 24bpp BMP, no palette, no compression. That is the one
  * format every viewer reads and it is 30 lines; PNG would need a dependency.
  */
+/* Set while RECOMP_FB_DUMP_FLIPS is dumping every flip: the report and
+ * after-draw dumps stand down then, or they would put duplicate frames into
+ * the sequence. */
+static int s_flip_dumping;
+
 static void dump_surface_bmp(void)
 {
     const char *prefix = getenv("RECOMP_FB_DUMP");
@@ -603,7 +608,7 @@ static void dump_surface_bmp(void)
     pad = (4 - (row_bytes & 3)) & 3;
     filesz = 54 + (row_bytes + pad) * h;
 
-    snprintf(path, sizeof path, "%s%03d.bmp", prefix, seq++);
+    snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq++);
     f = fopen(path, "wb");
     if (!f)
         return;
@@ -2356,7 +2361,8 @@ static void raster_batch(void)
      * was wiped a moment ago -- which reads as "nothing was drawn" when the
      * triangles went down correctly just before it. A few frames that actually
      * contain geometry are worth more than any number of clears. */
-    if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW) {
+    if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW
+        && !s_flip_dumping) {
         s_drawn_dumps++;
         dump_surface_bmp();
     }
@@ -3118,6 +3124,27 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
             }
         }
+        {
+            /* RECOMP_FB_DUMP_FLIPS: dump every presented frame, not one per
+             * report -- a consecutive sequence, which is what a headless
+             * recording (frames -> ffmpeg) needs. "1" dumps from boot; any
+             * other value names a file, and frames are dumped while it
+             * exists, so a capture can start mid-game without writing
+             * gigabytes of menus first. */
+            static const char *spec = (const char *)-1;
+            if (spec == (const char *)-1)
+                spec = getenv("RECOMP_FB_DUMP_FLIPS");
+            if (spec) {
+                int on = strcmp(spec, "1") == 0;
+                if (!on) {
+                    FILE *f = fopen(spec, "rb");
+                    if (f) { fclose(f); on = 1; }
+                }
+                s_flip_dumping = on;
+                if (on)
+                    dump_surface_bmp();
+            }
+        }
         s_gpu.drawn_stale = 1;
 
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
@@ -3416,7 +3443,8 @@ void nv2a_pb_exec_report(void)
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
-    dump_surface_bmp();
+    if (!s_flip_dumping)
+        dump_surface_bmp();
 
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
      * a vertex program we do not run" look identical on screen, and only one
