@@ -51,10 +51,11 @@ static const uint8_t s_config_desc[32] = {
     7, 0x05, 0x02, 0x03, 0x20, 0x00, 0x04
 };
 
-static uint8_t s_address;
-static uint8_t s_configuration;
+static uint8_t s_address[USB_GAMEPAD_MAX];
+static uint8_t s_configuration[USB_GAMEPAD_MAX];
 
-uint8_t usb_gamepad_address(void) { return s_address; }
+uint8_t usb_gamepad_address(int pad) { return s_address[pad & 3]; }
+int usb_gamepad_configured(int pad) { return s_configuration[pad & 3] != 0; }
 
 /* ---- control transfers ------------------------------------------------- */
 
@@ -81,7 +82,7 @@ static int copy_out(uint8_t *out, int max, const uint8_t *src, int len,
     return len;
 }
 
-int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
+int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
 {
     int is_in = (setup->bmRequestType & 0x80) != 0;
     int type  = (setup->bmRequestType >> 5) & 3;   /* 0 standard, 1 class */
@@ -106,16 +107,16 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
             }
 
         case REQ_SET_ADDRESS:
-            s_address = (uint8_t)(setup->wValue & 0x7F);
+            s_address[pad & 3] = (uint8_t)(setup->wValue & 0x7F);
             return 0;                    /* zero-length status stage */
 
         case REQ_SET_CONFIGURATION:
-            s_configuration = (uint8_t)(setup->wValue & 0xFF);
+            s_configuration[pad & 3] = (uint8_t)(setup->wValue & 0xFF);
             return 0;
 
         case REQ_GET_CONFIGURATION:
             if (!is_in || max < 1) return -1;
-            out[0] = s_configuration;
+            out[0] = s_configuration[pad & 3];
             return 1;
 
         case REQ_GET_STATUS:
@@ -152,7 +153,7 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
         && setup->bRequest == 0x01u                    /* GET_REPORT */
         && is_in) {
         uint8_t report[20];
-        int n = usb_gamepad_report(report, (int)sizeof report);
+        int n = usb_gamepad_report(pad, report, (int)sizeof report);
         if (n <= 0)
             return -1;
         return copy_out(out, max, report, n, setup->wLength);
@@ -311,6 +312,7 @@ typedef struct {
     unsigned long at_ms, hold_ms;
     uint8_t digital;         /* report byte 2 */
     uint8_t analog;          /* bit n = report byte 4 + n */
+    uint8_t pad;             /* which controller: "p2-a" is pad 1 */
     uint8_t stick;           /* full deflection: 1 L-left 2 L-right 4 L-up
                                 8 L-down, then the same four for the right */
     int announced;
@@ -382,6 +384,12 @@ static void pad_script_parse(const char *text)
             break;
         }
         b = end + 1;
+        /* "p2-" .. "p4-": the step is for that controller, not the first. */
+        if ((b[0] == 'p' || b[0] == 'P') && b[1] >= '1' && b[1] <= '4'
+            && b[2] == '-') {
+            st.pad = (uint8_t)(b[1] - '1');
+            b += 3;
+        }
         for (;;) {
             size_t n = strcspn(b, "+:,\r\n ");
             if (!pad_button_bits(b, n, &st.digital, &st.analog, &st.stick))
@@ -444,7 +452,7 @@ static void pad_live_poll(unsigned long t)
     static unsigned long last_poll;
     static char pending[512];
     static size_t npending;
-    static unsigned long next_free;
+    static unsigned long next_free[USB_GAMEPAD_MAX];
     FILE *f;
     int c;
 
@@ -475,14 +483,19 @@ static void pad_live_poll(unsigned long t)
                  * 200 ms release between: a title polling its pad a few times
                  * a second would otherwise see "down" and "a" in the same
                  * report, which is a different input from "down, then a". */
-                unsigned long at = t > next_free ? t : next_free;
+                /* Serialised per pad: pad 2's throttle must not wait out
+                 * pad 1's -- split-screen players press at the same time. */
+                int pd = (pending[0] == 'p' || pending[0] == 'P')
+                         && pending[1] >= '1' && pending[1] <= '4'
+                         && pending[2] == '-' ? pending[1] - '1' : 0;
+                unsigned long at = t > next_free[pd] ? t : next_free[pd];
                 pending[npending] = 0;
                 snprintf(line, sizeof line, "%lu:%s", at, pending);
                 if (s_script_len >= PAD_SCRIPT_MAX - 1)
                     pad_script_compact(t);
                 pad_script_parse(line);
                 if (s_script_len > 0)
-                    next_free = at + s_script[s_script_len - 1].hold_ms + 200;
+                    next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
                 fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
                 fflush(stderr);
                 npending = 0;
@@ -494,7 +507,7 @@ static void pad_live_poll(unsigned long t)
     fclose(f);
 }
 
-static void pad_script_apply(uint8_t *out)
+static void pad_script_apply(int pad, uint8_t *out)
 {
     static unsigned long t0;
     unsigned long now, t;
@@ -511,6 +524,8 @@ static void pad_script_apply(uint8_t *out)
         return;
     for (i = 0; i < s_script_len; i++) {
         PadStep *st = &s_script[i];
+        if (st->pad != pad)
+            continue;
         if (t < st->at_ms || t >= st->at_ms + st->hold_ms)
             continue;
         if (!st->announced) {
@@ -541,7 +556,7 @@ static void pad_script_apply(uint8_t *out)
     }
 }
 
-int usb_gamepad_report(uint8_t *out, int max)
+int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;
@@ -590,9 +605,12 @@ int usb_gamepad_report(uint8_t *out, int max)
         }
     }
 
-    if (xbox_InputGetState(0, &state) != 0) {
+    /* The synthetic press and the host pad drive pad n from host pad n. */
+    if (pad != 0)
+        synth = 0;
+    if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
-        pad_script_apply(out);
+        pad_script_apply(pad, out);
         return 20;
     }
 
@@ -609,6 +627,6 @@ int usb_gamepad_report(uint8_t *out, int max)
     out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
-    pad_script_apply(out);
+    pad_script_apply(pad, out);
     return 20;
 }

@@ -168,6 +168,7 @@ static int s_device_hc;
  * MCPX's own hubs have; RECOMP_USB_NDP exists because which slot XAPI gives a
  * pad is decided somewhere in here and the mapping is worth measuring. */
 static unsigned s_ndp = OHCI_PORTS;
+static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_enabled;
 static int s_trace;
 
@@ -393,8 +394,11 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 #define TD_CC_STALL    4u
 
 
-static uint32_t g_setup_pending;      /* wLength of the last SETUP seen */
-static UsbSetup g_setup;
+/* Per pad: each device on the bus has its own control pipe state. */
+static uint32_t g_setup_pending_[USB_GAMEPAD_MAX];
+static UsbSetup g_setup_[USB_GAMEPAD_MAX];
+#define g_setup_pending g_setup_pending_[pad]
+#define g_setup         g_setup_[pad]
 
 /* The control transfer's data stage, across however many descriptors it takes.
  *
@@ -405,9 +409,30 @@ static UsbSetup g_setup;
  * again, which is exactly the loop DDS9 sat in -- GET_DESCRIPTOR, SET_ADDRESS,
  * GET_DESCRIPTOR, forever. The answer is computed once per setup packet and
  * then consumed. */
-static uint8_t g_ctrl_buf[64];
-static int     g_ctrl_len = -1;   /* -1 = not answered yet */
-static int     g_ctrl_sent;
+static uint8_t g_ctrl_buf_[USB_GAMEPAD_MAX][64];
+static int     g_ctrl_len_[USB_GAMEPAD_MAX] = {-1, -1, -1, -1};
+static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
+#define g_ctrl_buf  g_ctrl_buf_[pad]
+#define g_ctrl_len  g_ctrl_len_[pad]
+#define g_ctrl_sent g_ctrl_sent_[pad]
+
+/* Pads plugged in so far, in port order. */
+static int s_plugged_pads;
+
+/* Which pad an endpoint descriptor talks to: by its function address, and
+ * address 0 -- the default address a device answers before SET_ADDRESS --
+ * is the plugged pad that has not been given one yet. Pads are plugged one
+ * at a time, each after the previous is configured, so there is never more
+ * than one at address 0. */
+static int ohci_pad_for(uint32_t ed0)
+{
+    uint32_t fa = ed0 & 0x7Fu;
+    int d;
+    for (d = 0; d < s_plugged_pads; d++)
+        if (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0)
+            return d;
+    return -1;
+}
 
 /* Every address below came out of guest memory, so none of them are trusted.
  *
@@ -513,6 +538,10 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     int      len  = (cbp && be >= cbp) ? (int)(be - cbp + 1) : 0;
     uint32_t endpoint = (ed0 >> 7) & 0xFu;
     int      moved = 0;
+    int      pad = ohci_pad_for(ed0);
+
+    if (pad < 0)
+        return TD_CC_NOERROR;   /* no device at that address: ignore */
 
     if (s_trace) {
         static unsigned n;
@@ -555,7 +584,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             if (!g_setup_pending)
                 return TD_CC_NOERROR;
             if (g_ctrl_len < 0) {
-                g_ctrl_len = usb_gamepad_control(&g_setup, g_ctrl_buf,
+                g_ctrl_len = usb_gamepad_control(pad, &g_setup, g_ctrl_buf,
                                                  (int)sizeof g_ctrl_buf);
                 if (g_ctrl_len < 0) {
                     /* Worth saying out loud. A stall here halts the
@@ -593,7 +622,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             /* The pad's report, on its interrupt endpoint. */
             uint8_t rep[32];
             s_n_report++;
-            int n = usb_gamepad_report(rep, (int)sizeof rep);
+            int n = usb_gamepad_report(pad, rep, (int)sizeof rep);
             if (n > len) n = len;
             if (n > 0 && guest_ptr(cbp, (uint32_t)n))
                 memcpy(guest_ptr(cbp, (uint32_t)n), rep, (size_t)n);
@@ -969,6 +998,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     unsigned held_off = 0;
     int      held_off_warned = 0, held_off_forced = 0;
     unsigned last_ack = 0;
+    unsigned first_port = 0, settle = 0;
 
     (void)unused;
     {
@@ -1017,9 +1047,29 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
             plugged = 1;
+            s_plugged_pads = 1;
+            first_port = port;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
                             "arriving on port 1\n", waited * 20);
             fflush(stderr);
+        }
+
+        /* More pads, one at a time: each arrives after the previous one is
+         * configured, on the next port, so the driver enumerates them in
+         * turn and there is only ever one device at the default address.
+         * RECOMP_USB_PADS sets how many (1-4). */
+        if (plugged && s_plugged_pads < s_npads
+            && usb_gamepad_configured(s_plugged_pads - 1)) {
+            if (++settle > 50) {                 /* ~1 s after the last */
+                unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
+                hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
+                hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+                fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
+                        s_plugged_pads + 1, port + 1, 10);
+                fflush(stderr);
+                s_plugged_pads++;
+                settle = 0;
+            }
         }
 
         /* The frame clock.
@@ -1198,10 +1248,17 @@ void xbox_OhciInit(void)
         const char *hcspec = getenv("RECOMP_USB_HC");
         const char *ndpspec = getenv("RECOMP_USB_NDP");
         s_device_hc = (hcspec && atoi(hcspec) == 1) ? 1 : 0;
+        const char *padspec = getenv("RECOMP_USB_PADS");
         if (ndpspec) {
             int n = atoi(ndpspec);
             if (n >= 1 && n <= 4) s_ndp = (unsigned)n;
         }
+        if (padspec) {
+            int n = atoi(padspec);
+            if (n >= 1 && n <= USB_GAMEPAD_MAX) s_npads = n;
+        }
+        if ((unsigned)s_npads > s_ndp)
+            s_ndp = (unsigned)s_npads;      /* a port for every pad */
     }
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
