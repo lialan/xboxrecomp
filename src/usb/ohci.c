@@ -499,6 +499,10 @@ static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
 }
 
+/* Transfer counts for RECOMP_USB_STATS: input reports served, control
+ * transfer stages, and OUT packets (rumble) by endpoint. */
+static unsigned long s_n_report, s_n_ctrl, s_n_out_ep0, s_n_out_other;
+
 /* Move one transfer descriptor. Returns the condition code to report. */
 static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
 {
@@ -521,6 +525,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     }
     if (dp == TD_DP_SETUP) {
         /* Eight bytes of setup, kept for the data stage that follows. */
+        s_n_ctrl++;
         if (len >= 8) {
             const uint8_t *p = guest_ptr(cbp, 8);
             if (!p) return TD_CC_NOERROR;
@@ -587,6 +592,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
         } else {
             /* The pad's report, on its interrupt endpoint. */
             uint8_t rep[32];
+            s_n_report++;
             int n = usb_gamepad_report(rep, (int)sizeof rep);
             if (n > len) n = len;
             if (n > 0 && guest_ptr(cbp, (uint32_t)n))
@@ -602,8 +608,12 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
          * engine-rev rumble on the Crash countdown and then paused with the
          * pad unresponsive. */
         moved = len;
-        if (endpoint == 0)
+        if (endpoint == 0) {
             g_setup_pending = 0;
+            s_n_out_ep0++;
+        } else {
+            s_n_out_other++;
+        }
     }
 
     /* CBP is zero when everything asked for moved, and otherwise points past
@@ -746,8 +756,10 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
             int nseen = 0, i;
             last = now;
             fprintf(stderr, "  [OHCI%d] stats: %u periodic transfers; "
+                    "reports %lu setups %lu out0 %lu outN %lu; "
                     "ctl=%08X ien=%08X ists=%08X irql-depth=%d",
-                    hc->index, total, hc->reg[HcControl / 4],
+                    hc->index, total, s_n_report, s_n_ctrl, s_n_out_ep0,
+                    s_n_out_other, hc->reg[HcControl / 4],
                     hc->reg[HcInterruptEnable / 4],
                     hc->reg[HcInterruptStatus / 4], xbox_IrqlRaisedCount());
             {
