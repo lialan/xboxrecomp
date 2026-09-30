@@ -595,9 +595,15 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
         }
     } else {
         /* OUT: the status stage of an IN control transfer, or rumble. Both
-         * are accepted and discarded. */
+         * are accepted and discarded -- but only the control pipe's ends a
+         * control transfer. A rumble packet on endpoint 2 used to clear the
+         * pending setup too, so a force-feedback write landing between a
+         * control request's stages broke that request; Burnout 3 starts its
+         * engine-rev rumble on the Crash countdown and then paused with the
+         * pad unresponsive. */
         moved = len;
-        g_setup_pending = 0;
+        if (endpoint == 0)
+            g_setup_pending = 0;
     }
 
     /* CBP is zero when everything asked for moved, and otherwise points past

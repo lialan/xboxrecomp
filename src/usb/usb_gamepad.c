@@ -291,8 +291,9 @@ static uint8_t synthetic_buttons(void)
  * process start) and a default hold of 150 ms. RECOMP_PAD_SCRIPT=@file reads
  * the same syntax from a file, one entry per line or comma separated.
  *
- * Buttons: up down left right start back lthumb rthumb (the digital byte) and
- * a b x y black white lt rt (the analog bytes, reported fully pressed).
+ * Buttons: up down left right start back lthumb rthumb (the digital byte),
+ * a b x y black white lt rt (the analog bytes, reported fully pressed), and
+ * lleft lright lup ldown / rleft rright rup rdown (a stick at full throw).
  * Every entry is printed as it fires, so a run log says what was pressed when.
  *
  * RECOMP_PAD_LIVE=<file> is the same thing driven while the title runs: each
@@ -310,6 +311,8 @@ typedef struct {
     unsigned long at_ms, hold_ms;
     uint8_t digital;         /* report byte 2 */
     uint8_t analog;          /* bit n = report byte 4 + n */
+    uint8_t stick;           /* full deflection: 1 L-left 2 L-right 4 L-up
+                                8 L-down, then the same four for the right */
     int announced;
 } PadStep;
 
@@ -325,8 +328,15 @@ static int same_word(const char *a, const char *b, size_t n)
     return 1;
 }
 
-static int pad_button_bits(const char *name, size_t n, uint8_t *dig, uint8_t *ana)
+static int pad_button_bits(const char *name, size_t n, uint8_t *dig,
+                           uint8_t *ana, uint8_t *stick)
 {
+    /* Stick directions, for screens and games that read the stick and
+     * ignore the d-pad: Burnout 3 steers and picks map locations with it. */
+    static const struct { const char *name; uint8_t bit; } sk[] = {
+        {"lleft", 0x01}, {"lright", 0x02}, {"lup", 0x04}, {"ldown", 0x08},
+        {"rleft", 0x10}, {"rright", 0x20}, {"rup", 0x40}, {"rdown", 0x80},
+    };
     static const struct { const char *name; uint8_t dig, ana; } k[] = {
         {"up", 0x01, 0}, {"down", 0x02, 0}, {"left", 0x04, 0},
         {"right", 0x08, 0}, {"start", 0x10, 0}, {"back", 0x20, 0},
@@ -335,6 +345,12 @@ static int pad_button_bits(const char *name, size_t n, uint8_t *dig, uint8_t *an
         {"black", 0, 0x10}, {"white", 0, 0x20}, {"lt", 0, 0x40}, {"rt", 0, 0x80},
     };
     size_t i;
+    for (i = 0; i < sizeof sk / sizeof sk[0]; i++) {
+        if (strlen(sk[i].name) == n && same_word(sk[i].name, name, n)) {
+            *stick |= sk[i].bit;
+            return 1;
+        }
+    }
     for (i = 0; i < sizeof k / sizeof k[0]; i++) {
         if (strlen(k[i].name) == n && same_word(k[i].name, name, n)) {
             *dig |= k[i].dig;
@@ -368,7 +384,7 @@ static void pad_script_parse(const char *text)
         b = end + 1;
         for (;;) {
             size_t n = strcspn(b, "+:,\r\n ");
-            if (!pad_button_bits(b, n, &st.digital, &st.analog))
+            if (!pad_button_bits(b, n, &st.digital, &st.analog, &st.stick))
                 fprintf(stderr, "  PAD: unknown button \"%.*s\"\n", (int)n, b);
             b += n;
             if (*b != '+')
@@ -507,6 +523,21 @@ static void pad_script_apply(uint8_t *out)
         for (j = 0; j < 8; j++)
             if (st->analog & (1u << j))
                 out[4 + j] = 0xFF;
+        if (st->stick) {
+            /* Axes at 12..19: LX LY RX RY, signed 16-bit, up positive. */
+            static const int16_t full = 32767;
+            int16_t ax[4];
+            memcpy(ax, &out[12], sizeof ax);
+            if (st->stick & 0x01) ax[0] = (int16_t)-full;
+            if (st->stick & 0x02) ax[0] = full;
+            if (st->stick & 0x04) ax[1] = full;
+            if (st->stick & 0x08) ax[1] = (int16_t)-full;
+            if (st->stick & 0x10) ax[2] = (int16_t)-full;
+            if (st->stick & 0x20) ax[2] = full;
+            if (st->stick & 0x40) ax[3] = full;
+            if (st->stick & 0x80) ax[3] = (int16_t)-full;
+            memcpy(&out[12], ax, sizeof ax);
+        }
     }
 }
 
