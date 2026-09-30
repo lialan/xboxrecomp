@@ -9,6 +9,15 @@
  */
 #include "nv2a_combiner.h"
 
+#include <string.h>
+
+/* The rasteriser evaluates pixels on several threads. */
+#if defined(_MSC_VER)
+#define NV_RC_TLS __declspec(thread)
+#else
+#define NV_RC_TLS __thread
+#endif
+
 enum { R_ZERO = 0, R_C0 = 1, R_C1 = 2, R_FOG = 3, R_V0 = 4, R_V1 = 5,
        R_T0 = 8, R_R0 = 12, R_R1 = 13, R_SUM = 14, R_EF = 15 };
 
@@ -18,6 +27,23 @@ void nv2a_rc_unpack(uint32_t c, float o[4])
     o[1] = (float)((c >>  8) & 0xFF) / 255.0f;
     o[2] = (float)( c        & 0xFF) / 255.0f;
     o[3] = (float)( c >> 24        ) / 255.0f;
+}
+
+/* D3DCOLOR to floats, memoised: a program's constants are the same for
+ * every pixel of a batch, and unpacking them per pixel was a measurable
+ * share of the executor. */
+static const float *unpack_cached(uint32_t c)
+{
+    static NV_RC_TLS uint32_t key[16];
+    static NV_RC_TLS float val[16][4];
+    static NV_RC_TLS int valid[16];
+    unsigned slot = (c ^ (c >> 8) ^ (c >> 16) ^ (c >> 24)) & 15u;
+    if (!valid[slot] || key[slot] != c) {
+        nv2a_rc_unpack(c, val[slot]);
+        key[slot] = c;
+        valid[slot] = 1;
+    }
+    return val[slot];
 }
 
 static float clampf(float x, float lo, float hi)
@@ -72,12 +98,18 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
                   const float v1[4], const float fog[4],
                   const float t[4][4], float out[4])
 {
-    float R[16][4] = {{0}};
+    float R[16][4];
     uint32_t n = rc->control & 0xFF, flags = rc->control >> 8, s;
     int i;
 
     if (n > 8)
         n = 8;
+    /* Only the registers a program can read before writing need a value:
+     * zero, r0, r1 and the final-combiner specials. */
+    for (i = 0; i < 4; i++) {
+        R[0][i] = R[6][i] = R[7][i] = 0.0f;
+        R[12][i] = R[13][i] = R[14][i] = R[15][i] = 0.0f;
+    }
     for (i = 0; i < 4; i++) {
         R[R_FOG][i] = fog[i];
         R[R_V0][i] = v0[i];
@@ -99,8 +131,8 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
         int mux_cd;
 
         /* One c0/c1 for every stage, or one per stage (COMBINERCOUNT). */
-        nv2a_rc_unpack(rc->factor0[(flags & 0x010) ? s : 0], R[R_C0]);
-        nv2a_rc_unpack(rc->factor1[(flags & 0x100) ? s : 0], R[R_C1]);
+        memcpy(R[R_C0], unpack_cached(rc->factor0[(flags & 0x010) ? s : 0]), 16);
+        memcpy(R[R_C1], unpack_cached(rc->factor1[(flags & 0x100) ? s : 0]), 16);
         mux_cd = (flags & 1) ? R[R_R0][3] >= 0.5f
                              : ((int)(R[R_R0][3] * 255.0f) & 1);
 
@@ -155,8 +187,8 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
         uint32_t f0 = rc->final0, f1 = rc->final1, fflags = f1 & 0xFF;
         float A[3], B[3], C[3], D[3], E[3], F[3];
 
-        nv2a_rc_unpack(rc->final_c0, R[R_C0]);
-        nv2a_rc_unpack(rc->final_c1, R[R_C1]);
+        memcpy(R[R_C0], unpack_cached(rc->final_c0), 16);
+        memcpy(R[R_C1], unpack_cached(rc->final_c1), 16);
         /* V1R0 sum: optional complements (0x40 v1, 0x20 r0), clamp (0x80). */
         for (i = 0; i < 3; i++) {
             float a = (fflags & 0x40) ? 1.0f - R[R_V1][i] : R[R_V1][i];

@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
@@ -36,6 +37,12 @@
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_interp.h"
 #include "nv2a_combiner.h"
+#if defined(_WIN32)
+#include <windows.h>
+#define NV_TLS __declspec(thread)
+#else
+#define NV_TLS __thread
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -703,7 +710,10 @@ static void clear_surface(uint32_t param)
      * zero.
      *
      * ponytail: bring-up aid, not a feature. It costs one branch per clear. */
-    if (getenv("RECOMP_RASTER_TEST")) {
+    static int raster_test = -1;
+    if (raster_test < 0)
+        raster_test = getenv("RECOMP_RASTER_TEST") != NULL;
+    if (raster_test) {
         static int announced;
         /* Every clear, not once: the title clears each frame and double-buffers,
          * so a triangle drawn a single time is erased before anyone sees it. */
@@ -846,8 +856,38 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     v = wrap_coord(v, t->height, t->addr_v);
 
     fmt = t->color;
-    if (d3d8_format_dxt_block_bytes(fmt))
-        return d3d8_dxt_decode_texel(mem + base, fmt, u, v, t->width, argb);
+    if (d3d8_format_dxt_block_bytes(fmt)) {
+        /* Decoded blocks, direct-mapped by address. Every texel of a DXT
+         * texture decodes its whole 4x4 block, and bilinear reads four
+         * neighbours that nearly always share one -- this was a tenth of
+         * the executor's time. Keyed on the block's bytes as well as its
+         * address, so a texture rewritten in place (a render target reused,
+         * a streamed mip) never returns stale texels.
+         * ponytail: single-threaded executor, so a plain static table. */
+        static NV_TLS struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
+                        uint32_t px[16]; } cache[512];
+        uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
+        uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
+        const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
+        uintptr_t key = (uintptr_t)blk;
+        size_t slot = (key / bb) & 511;
+        uint64_t raw[2] = {0, 0};
+        memcpy(raw, blk, bb);
+        if (cache[slot].key != key || cache[slot].fmt != fmt
+            || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
+            uint32_t i;
+            for (i = 0; i < 16; i++)
+                d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
+                                      by * 4 + (i >> 2), t->width,
+                                      &cache[slot].px[i]);
+            cache[slot].key = key;
+            cache[slot].fmt = fmt;
+            cache[slot].raw[0] = raw[0];
+            cache[slot].raw[1] = raw[1];
+        }
+        *argb = cache[slot].px[(v & 3) * 4 + (u & 3)];
+        return 1;
+    }
     if (d3d8_format_is_swizzled(fmt)) {
         /* Morton order: a texel's index is interleaved from x and y instead of
          * v*pitch + u, so index from the base of the image. The switch below
@@ -1722,28 +1762,230 @@ static int alpha_test_pass(float a)
     }
 }
 
+/* Everything a triangle's pixels need, computed once per triangle, so the
+ * pixel loop can run over any subset of rows on any thread. */
+typedef struct {
+    uint8_t *mem;
+    uint32_t bpp;
+    const Nv2aVshOutput *va, *vb, *vc;
+    const float *a, *b, *c;
+    float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
+    float *zb;
+    int minx, maxx, miny, maxy, use_rc, textured;
+} XfTri;
+
+typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
+
+/* Rows y0, y0+step, ... < maxy of triangle T. */
+static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+{
+    const float *a = T->a, *b = T->b, *c = T->c;
+    const Nv2aVshOutput *va = T->va, *vb = T->vb, *vc = T->vc;
+    int x, y, k;
+
+    for (y = y0; y < T->maxy; y += step) {
+        for (x = T->minx; x < T->maxx; x++) {
+            float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
+            float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
+            float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
+            float l0, l1, l2, z, col[4], pw;
+            uint32_t argb;
+            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
+               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                continue;
+            /* w1 is opposite a, w2 opposite b, w0 opposite c. */
+            l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
+            z = l0 * a[2] + l1 * b[2] + l2 * c[2];
+            {
+                float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
+                int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
+                /* Depth test, then shade, then alpha test, and only then the
+                 * depth write: an alpha-tested texel that is cut away must
+                 * not leave its depth behind (foliage, fences). */
+                if (zp && s_gpu.depth_test && !depth_pass(z, *zp)) {
+                    cnt->depth_fail++;
+                    continue;
+                }
+                argb = 0;
+                if (shade) {
+                    for (k = 0; k < 4; k++)
+                        col[k] = l0 * va->d0[k] + l1 * vb->d0[k] + l2 * vc->d0[k];
+                    pw = l0 * T->iw[0] + l1 * T->iw[1] + l2 * T->iw[2];
+                    if (T->use_rc) {
+                        float d1[4], fog[4], t[4][4], out[4], tc[4];
+                        int st, j, keep = 1;
+                        for (k = 0; k < 4; k++)
+                            d1[k] = l0 * va->d1[k] + l1 * vb->d1[k] + l2 * vc->d1[k];
+                        fog[0] = T->fogc[0]; fog[1] = T->fogc[1]; fog[2] = T->fogc[2];
+                        fog[3] = l0 * T->vfog[0] + l1 * T->vfog[1] + l2 * T->vfog[2];
+                        for (st = 0; st < 4 && keep; st++) {
+                            if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)) {
+                                t[st][0] = t[st][1] = t[st][2] = 0.0f;
+                                t[st][3] = 1.0f;
+                                continue;
+                            }
+                            for (j = 0; j < 4; j++)
+                                tc[j] = (l0 * T->stc[0][st][j] + l1 * T->stc[1][st][j]
+                                       + l2 * T->stc[2][st][j]) / pw;
+                            keep = rc_stage_fetch(st, tc, t[st]);
+                        }
+                        if (!keep)
+                            continue;
+                        nv2a_rc_eval(&s_gpu.rc, col, d1, fog,
+                                     (const float (*)[4])t, out);
+                        if (s_gpu.alpha_test && !alpha_test_pass(out[3]))
+                            continue;
+                        argb = pack_color(out);
+                    } else {
+                        argb = pack_color(col);
+                        if (T->textured) {
+                            uint32_t texel;
+                            float tu, tv;
+                            tu = (l0 * T->uv[0][0] + l1 * T->uv[1][0] + l2 * T->uv[2][0]) / pw;
+                            tv = (l0 * T->uv[0][1] + l1 * T->uv[1][1] + l2 * T->uv[2][1]) / pw;
+                            if (sample_texture((uint32_t)(int32_t)floorf(tu),
+                                               (uint32_t)(int32_t)floorf(tv), &texel))
+                                argb = modulate(texel, col);
+                        }
+                        if (s_gpu.alpha_test
+                            && !alpha_test_pass((float)(argb >> 24) / 255.0f))
+                            continue;
+                    }
+                }
+                if (zp && s_gpu.depth_mask)
+                    *zp = z;
+                if (s_gpu.zpass_enable)
+                    cnt->zpass++;
+                if (!(s_gpu.color_mask & 0x01010101u))
+                    continue;              /* colour writes off: depth only */
+                cnt->pixels++;
+            }
+            put_pixel(T->mem, T->bpp, x, y, argb);
+        }
+    }
+}
+
+/* Worker threads for big triangles.
+ *
+ * The rasteriser is a software GPU, and a Burnout 3 frame is dominated by a
+ * handful of full-screen passes -- composites, blurs, the menu backdrops --
+ * each two triangles of 300,000 pixels through the register combiners. Those
+ * split cleanly by row: every pixel reads only its own depth and colour, so
+ * interleaved rows on N threads need no locking. Small triangles stay on the
+ * executor thread, where waking workers would cost more than it saves.
+ * RECOMP_RASTER_THREADS=<n> sets the count (1 = off); the default leaves a
+ * few cores for the title and the host.
+ * ponytail: s_gpu.pixels/pixel_max in put_pixel are unsynchronised stats and
+ * may undercount; nothing depends on them. */
+#define NV_RASTER_MAX_THREADS 16
+#define NV_RASTER_MT_MIN_PIXELS 8192
+
+#if defined(_WIN32)
+static struct {
+    int n;                                  /* threads incl. the caller */
+    HANDLE start[NV_RASTER_MAX_THREADS], done;
+    volatile LONG pending;
+    const XfTri *tri;
+    XfCount cnt[NV_RASTER_MAX_THREADS];
+} s_pool;
+
+static DWORD WINAPI raster_worker(LPVOID arg)
+{
+    int k = (int)(intptr_t)arg;
+    for (;;) {
+        WaitForSingleObject(s_pool.start[k], INFINITE);
+        memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
+        xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
+        if (InterlockedDecrement(&s_pool.pending) == 0)
+            SetEvent(s_pool.done);
+    }
+    return 0;
+}
+
+static int raster_pool_size(void)
+{
+    static int init;
+    if (!init) {
+        const char *e = getenv("RECOMP_RASTER_THREADS");
+        SYSTEM_INFO si;
+        int n, k;
+        init = 1;
+        GetSystemInfo(&si);
+        n = e ? atoi(e) : (int)si.dwNumberOfProcessors - 4;
+        if (n < 1) n = 1;
+        if (n > NV_RASTER_MAX_THREADS) n = NV_RASTER_MAX_THREADS;
+        s_pool.n = n;
+        if (n > 1) {
+            s_pool.done = CreateEventA(NULL, FALSE, FALSE, NULL);
+            for (k = 0; k < n - 1; k++) {
+                s_pool.start[k] = CreateEventA(NULL, FALSE, FALSE, NULL);
+                CloseHandle(CreateThread(NULL, 0, raster_worker,
+                                         (LPVOID)(intptr_t)k, 0, NULL));
+            }
+        }
+    }
+    return s_pool.n;
+}
+
+static void xf_rows_parallel(const XfTri *T, XfCount *total)
+{
+    int n = raster_pool_size(), k;
+    long px = (long)(T->maxx - T->minx) * (T->maxy - T->miny);
+
+    if (n <= 1 || px < NV_RASTER_MT_MIN_PIXELS || T->maxy - T->miny < n) {
+        xf_rows(T, T->miny, 1, total);
+        return;
+    }
+    s_pool.tri = T;
+    s_pool.pending = n - 1;
+    for (k = 0; k < n - 1; k++)
+        SetEvent(s_pool.start[k]);
+    {
+        XfCount mine = {0, 0, 0};
+        xf_rows(T, T->miny + (n - 1), n, &mine);
+        WaitForSingleObject(s_pool.done, INFINITE);
+        total->depth_fail += mine.depth_fail;
+        total->pixels += mine.pixels;
+        total->zpass += mine.zpass;
+    }
+    for (k = 0; k < n - 1; k++) {
+        total->depth_fail += s_pool.cnt[k].depth_fail;
+        total->pixels += s_pool.cnt[k].pixels;
+        total->zpass += s_pool.cnt[k].zpass;
+    }
+}
+#else
+static void xf_rows_parallel(const XfTri *T, XfCount *total)
+{
+    xf_rows(T, T->miny, 1, total);
+}
+#endif
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
-    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = surface_bpp();
+    XfTri T;
+    XfCount cnt = {0, 0, 0};
     const Nv2aVshOutput *v[3];
     const float *a, *b, *c;
-    float area, iw[3], uv[3][2], su = 1.0f, sv = 1.0f;
-    float *zb = NULL;
-    int minx, maxx, miny, maxy, x, y, k;
-    int textured = s_gpu.texs[0].valid;
+    float area, su = 1.0f, sv = 1.0f;
+    int k;
     static int no_rc = -1;
-    int use_rc;
-    float stc[3][4][4], vfog[3], fogc[4];
 
     if (no_rc < 0)
         no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
-    use_rc = s_gpu.rc_seen && !no_rc;
+    memset(&T, 0, sizeof T);
+    T.mem = (uint8_t *)xbox_GetMemoryOffset();
+    T.bpp = surface_bpp();
+    T.textured = s_gpu.texs[0].valid;
+    T.use_rc = s_gpu.rc_seen && !no_rc;
+    T.va = va; T.vb = vb; T.vc = vc;
 
     v[0] = va; v[1] = vb; v[2] = vc;
     a = va->pos; b = vb->pos; c = vc->pos;
-    if (bpp != 4 && bpp != 2)
+    T.a = a; T.b = b; T.c = c;
+    if (T.bpp != 4 && T.bpp != 2)
         return;
     if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
         s_gpu.tris_behind++;
@@ -1761,132 +2003,142 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         if (a[k] > s_gpu.xf_max[k]) s_gpu.xf_max[k] = a[k];
     }
     s_gpu.xf_seeded = 1;
-    if (!surface_begin_batch(mem))
+    if (!surface_begin_batch(T.mem))
         return;
     if (s_gpu.depth_test || s_gpu.depth_mask)
-        zb = zbuf_current(1);
+        T.zb = zbuf_current(1);
     if (tex_size_from_format(s_gpu.texs[0].color)) {
         su = (float)s_gpu.texs[0].width;
         sv = (float)s_gpu.texs[0].height;
     }
     for (k = 0; k < 3; k++) {
-        iw[k] = 1.0f / v[k]->pos[3];
-        uv[k][0] = v[k]->tex[0][0] * su * iw[k];
-        uv[k][1] = v[k]->tex[0][1] * sv * iw[k];
+        T.iw[k] = 1.0f / v[k]->pos[3];
+        T.uv[k][0] = v[k]->tex[0][0] * su * T.iw[k];
+        T.uv[k][1] = v[k]->tex[0][1] * sv * T.iw[k];
     }
-    if (use_rc) {
+    if (T.use_rc) {
         int st, j;
         for (k = 0; k < 3; k++) {
             for (st = 0; st < 4; st++)
                 for (j = 0; j < 4; j++)
-                    stc[k][st][j] = v[k]->tex[st][j] * iw[k];
-            vfog[k] = fog_factor(v[k]->fog[0]);
+                    T.stc[k][st][j] = v[k]->tex[st][j] * T.iw[k];
+            T.vfog[k] = fog_factor(v[k]->fog[0]);
         }
         /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
-        nv2a_rc_unpack(s_gpu.fog_color, fogc);
-        { float r = fogc[2]; fogc[2] = fogc[0]; fogc[0] = r; }
+        nv2a_rc_unpack(s_gpu.fog_color, T.fogc);
+        { float r = T.fogc[2]; T.fogc[2] = T.fogc[0]; T.fogc[0] = r; }
     }
 
-    minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
-    maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
-    miny = (int)floorf(fminf(a[1], fminf(b[1], c[1])));
-    maxy = (int)ceilf (fmaxf(a[1], fmaxf(b[1], c[1])));
-    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
-    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
-    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
-    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
-    if (maxx > NV_ZBUF_W) maxx = NV_ZBUF_W;
-    if (maxy > NV_ZBUF_H) maxy = NV_ZBUF_H;
-    if (minx >= maxx || miny >= maxy) {
+    T.minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
+    T.maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
+    T.miny = (int)floorf(fminf(a[1], fminf(b[1], c[1])));
+    T.maxy = (int)ceilf (fmaxf(a[1], fmaxf(b[1], c[1])));
+    if (T.minx < (int)s_gpu.clip_x) T.minx = (int)s_gpu.clip_x;
+    if (T.miny < (int)s_gpu.clip_y) T.miny = (int)s_gpu.clip_y;
+    if (T.maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) T.maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
+    if (T.maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) T.maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (T.maxx > NV_ZBUF_W) T.maxx = NV_ZBUF_W;
+    if (T.maxy > NV_ZBUF_H) T.maxy = NV_ZBUF_H;
+    if (T.minx >= T.maxx || T.miny >= T.maxy) {
         s_gpu.tris_skipped_offscreen++;
         s_gpu.xf_offscreen++;
         return;
     }
     s_gpu.xf_drawn++;
+    T.inv_area = 1.0f / area;
 
-    for (y = miny; y < maxy; y++) {
-        for (x = minx; x < maxx; x++) {
-            float px = (float)x + 0.5f, py = (float)y + 0.5f;
-            float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
-            float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
-            float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
-            float l0, l1, l2, z, col[4], pw;
-            uint32_t argb;
-            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
-               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
-                continue;
-            /* w1 is opposite a, w2 opposite b, w0 opposite c. */
-            l0 = w1 / area; l1 = w2 / area; l2 = w0 / area;
-            z = l0 * a[2] + l1 * b[2] + l2 * c[2];
-            {
-                float *zp = zb ? &zb[(size_t)y * NV_ZBUF_W + x] : NULL;
-                int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
-                /* Depth test, then shade, then alpha test, and only then the
-                 * depth write: an alpha-tested texel that is cut away must
-                 * not leave its depth behind (foliage, fences). */
-                if (zp && s_gpu.depth_test && !depth_pass(z, *zp)) {
-                    s_gpu.xf_depth_fail++;
-                    continue;
-                }
-                argb = 0;
-                if (shade) {
-                    for (k = 0; k < 4; k++)
-                        col[k] = l0 * va->d0[k] + l1 * vb->d0[k] + l2 * vc->d0[k];
-                    pw = l0 * iw[0] + l1 * iw[1] + l2 * iw[2];
-                    if (use_rc) {
-                        float d1[4], fog[4], t[4][4], out[4], tc[4];
-                        int st, j, keep = 1;
-                        for (k = 0; k < 4; k++)
-                            d1[k] = l0 * va->d1[k] + l1 * vb->d1[k] + l2 * vc->d1[k];
-                        fog[0] = fogc[0]; fog[1] = fogc[1]; fog[2] = fogc[2];
-                        fog[3] = l0 * vfog[0] + l1 * vfog[1] + l2 * vfog[2];
-                        for (st = 0; st < 4 && keep; st++) {
-                            if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)) {
-                                t[st][0] = t[st][1] = t[st][2] = 0.0f;
-                                t[st][3] = 1.0f;
-                                continue;
-                            }
-                            for (j = 0; j < 4; j++)
-                                tc[j] = (l0 * stc[0][st][j] + l1 * stc[1][st][j]
-                                       + l2 * stc[2][st][j]) / pw;
-                            keep = rc_stage_fetch(st, tc, t[st]);
-                        }
-                        if (!keep)
-                            continue;
-                        nv2a_rc_eval(&s_gpu.rc, col, d1, fog,
-                                     (const float (*)[4])t, out);
-                        if (s_gpu.alpha_test && !alpha_test_pass(out[3]))
-                            continue;
-                        argb = pack_color(out);
-                    } else {
-                        argb = pack_color(col);
-                        if (textured) {
-                            uint32_t texel;
-                            float tu, tv;
-                            tu = (l0 * uv[0][0] + l1 * uv[1][0] + l2 * uv[2][0]) / pw;
-                            tv = (l0 * uv[0][1] + l1 * uv[1][1] + l2 * uv[2][1]) / pw;
-                            if (sample_texture((uint32_t)(int32_t)floorf(tu),
-                                               (uint32_t)(int32_t)floorf(tv), &texel))
-                                argb = modulate(texel, col);
-                        }
-                        if (s_gpu.alpha_test
-                            && !alpha_test_pass((float)(argb >> 24) / 255.0f))
-                            continue;
-                    }
-                }
-                if (zp && s_gpu.depth_mask)
-                    *zp = z;
-                if (s_gpu.zpass_enable)
-                    s_gpu.zpass_count++;
-                if (!(s_gpu.color_mask & 0x01010101u))
-                    continue;              /* colour writes off: depth only */
-                s_gpu.xf_pixels++;
-            }
-            put_pixel(mem, bpp, x, y, argb);
-        }
-    }
+    xf_rows_parallel(&T, &cnt);
+    s_gpu.xf_depth_fail += cnt.depth_fail;
+    s_gpu.xf_pixels += cnt.pixels;
+    s_gpu.zpass_count += cnt.zpass;
     s_gpu.tris_drawn++;
     note_drawn();
+}
+
+
+/* Near-plane clipping.
+ *
+ * A triangle with a vertex behind the eye (w <= 0) used to be dropped whole.
+ * That is invisible for distant geometry and ruinous close up: in a chase
+ * view the road under the camera is exactly the set of triangles that reach
+ * behind it, so the bottom of the frame showed a hole -- a quarter of every
+ * race frame's triangles went this way.
+ *
+ * Clipping has to happen in clip space, but the D3D epilogue has already
+ * divided x, y and z by w and applied the viewport (c[58] scale, c[59]
+ * offset) while leaving w itself alone. So each vertex is taken back to clip
+ * space first: clip = (screen - offset) / scale * w. Everything else the
+ * vertex carries -- colours, fog, texture coordinates -- is linear in clip
+ * space and is interpolated directly. The polygon is clipped against
+ * w = NV_CLIP_W (Sutherland-Hodgman, one plane), re-projected, and fanned.
+ * ponytail: the near plane only; x/y/far fall to the rasteriser's bounds
+ * check, which is correct, just slower for huge off-screen triangles. */
+#define NV_CLIP_W 1e-3f
+
+static void xf_to_clip(const Nv2aVshOutput *v, const float k[3],
+                       const float o[3], float c[3])
+{
+    int i;
+    for (i = 0; i < 3; i++)
+        c[i] = k[i] != 0.0f ? (v->pos[i] - o[i]) / k[i] * v->pos[3] : 0.0f;
+}
+
+static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
+                    Nv2aVshOutput *out)
+{
+    const float *pa = (const float *)a, *pb = (const float *)b;
+    float *po = (float *)out;
+    size_t i, n = sizeof(Nv2aVshOutput) / sizeof(float);
+    for (i = 0; i < n; i++)
+        po[i] = pa[i] + (pb[i] - pa[i]) * t;
+}
+
+static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+                              const Nv2aVshOutput *c)
+{
+    const Nv2aVshOutput *in[3];
+    Nv2aVshOutput poly[4], va, vb;
+    float k[3], o[3], ca[3], cb[3];
+    int n = 0, i, j;
+
+    if (a->pos[3] > NV_CLIP_W && b->pos[3] > NV_CLIP_W && c->pos[3] > NV_CLIP_W) {
+        raster_xf_triangle(a, b, c);
+        return;
+    }
+    if (a->pos[3] <= NV_CLIP_W && b->pos[3] <= NV_CLIP_W
+        && c->pos[3] <= NV_CLIP_W) {
+        s_gpu.tris_behind++;                  /* wholly behind: nothing */
+        return;
+    }
+    {
+        const float *sc = nv2a_vsh_constant(58), *of = nv2a_vsh_constant(59);
+        for (i = 0; i < 3; i++) { k[i] = sc[i]; o[i] = of[i]; }
+    }
+    in[0] = a; in[1] = b; in[2] = c;
+    for (i = 0; i < 3; i++) {
+        const Nv2aVshOutput *p = in[i], *q = in[(i + 1) % 3];
+        int pin = p->pos[3] > NV_CLIP_W, qin = q->pos[3] > NV_CLIP_W;
+        if (pin) {
+            va = *p;
+            xf_to_clip(p, k, o, ca);
+            for (j = 0; j < 3; j++) va.pos[j] = ca[j];
+            poly[n++] = va;
+        }
+        if (pin != qin) {
+            float t = (NV_CLIP_W - p->pos[3]) / (q->pos[3] - p->pos[3]);
+            va = *p; vb = *q;
+            xf_to_clip(p, k, o, ca);
+            xf_to_clip(q, k, o, cb);
+            for (j = 0; j < 3; j++) { va.pos[j] = ca[j]; vb.pos[j] = cb[j]; }
+            xf_lerp(&va, &vb, t, &poly[n++]);
+        }
+    }
+    /* Back to screen space: divide by the (now positive) w, viewport. */
+    for (i = 0; i < n; i++)
+        for (j = 0; j < 3; j++)
+            poly[i].pos[j] = poly[i].pos[j] / poly[i].pos[3] * k[j] + o[j];
+    for (i = 1; i + 1 < n; i++)
+        raster_xf_triangle(&poly[0], &poly[i], &poly[i + 1]);
 }
 
 static Nv2aVshOutput s_xf[NV_MAX_INDICES];
@@ -1972,27 +2224,27 @@ static void raster_batch_program(void)
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
-            raster_xf_triangle(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
         for (i = 0; i + 2 < n; i++)
-            raster_xf_triangle(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
         for (i = 1; i + 1 < n; i++)
-            raster_xf_triangle(&s_xf[0], &s_xf[i], &s_xf[i+1]);
+            raster_xf_clipped(&s_xf[0], &s_xf[i], &s_xf[i+1]);
         break;
     case NV_PRIM_QUADS:
         for (i = 0; i + 3 < n; i += 4) {
-            raster_xf_triangle(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
-            raster_xf_triangle(&s_xf[i], &s_xf[i+2], &s_xf[i+3]);
+            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+            raster_xf_clipped(&s_xf[i], &s_xf[i+2], &s_xf[i+3]);
         }
         break;
     case NV_PRIM_QUAD_STRIP:
         for (i = 0; i + 3 < n; i += 2) {
-            raster_xf_triangle(&s_xf[i], &s_xf[i+1], &s_xf[i+3]);
-            raster_xf_triangle(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
+            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+3]);
+            raster_xf_clipped(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
         }
         break;
     default:
@@ -2590,8 +2842,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
-     * the values are visible. */
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+     * the values are visible. Cached: this runs for every method, and an
+     * uncached getenv here was a quarter of the executor's time. */
+    static int verbose = -1;
+    if (verbose < 0)
+        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    if (verbose) {
         static int shown[8];
         int slot = -1;
         switch (method) {
@@ -3114,6 +3370,18 @@ void nv2a_pb_exec_report(void)
     }
     int i, j;
 
+    {
+        /* Frames per second of guest time, from flips between reports. */
+        static uint32_t last_flips;
+        static unsigned long last_ms;
+        unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
+        if (last_ms && now > last_ms)
+            fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
+                    (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),
+                    s_gpu.flips, 10);
+        last_flips = s_gpu.flips;
+        last_ms = now;
+    }
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                     " clears %u | %u unhandled methods (%d distinct)\n",
             s_gpu.color_offset, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
