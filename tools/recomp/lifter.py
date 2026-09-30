@@ -554,21 +554,30 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
                         "fucomip", "fcomi", "sahf"):
+        # g_fp_cmp is -1 less, 0 equal, 1 greater, 2 unordered. An
+        # unordered compare sets ZF, PF and CF all three, so it reads as
+        # below AND equal AND parity. Comparing g_fp_cmp against 0 made 2 look
+        # "greater": ja/jae went the wrong way on every NaN, and jp/jnp were
+        # constants.
         fpu_cmp_map = {
-            "ja": ">", "jnbe": ">",
-            "jae": ">=", "jnb": ">=", "jnc": ">=",
-            "jb": "<", "jnae": "<", "jc": "<",
-            "jbe": "<=", "jna": "<=",
-            "je": "==", "jz": "==",
-            "jne": "!=", "jnz": "!=",
+            "ja": "(g_fp_cmp == 1)", "jnbe": "(g_fp_cmp == 1)",
+            "jae": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
+            "jnb": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
+            "jnc": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
+            "jb": "(g_fp_cmp < 0 || g_fp_cmp == 2)",
+            "jnae": "(g_fp_cmp < 0 || g_fp_cmp == 2)",
+            "jc": "(g_fp_cmp < 0 || g_fp_cmp == 2)",
+            "jbe": "(g_fp_cmp != 1)", "jna": "(g_fp_cmp != 1)",
+            "je": "(g_fp_cmp == 0 || g_fp_cmp == 2)",
+            "jz": "(g_fp_cmp == 0 || g_fp_cmp == 2)",
+            "jne": "(g_fp_cmp == -1 || g_fp_cmp == 1)",
+            "jnz": "(g_fp_cmp == -1 || g_fp_cmp == 1)",
+            "jp": "(g_fp_cmp == 2)", "jpe": "(g_fp_cmp == 2)",
+            "jnp": "(g_fp_cmp != 2)", "jpo": "(g_fp_cmp != 2)",
         }
-        op = fpu_cmp_map.get(jcc)
-        if op:
-            return f"(g_fp_cmp {op} 0) /* {flag_setter} */", desc
-        if jcc == "jp":
-            return "0 /* fpu: unordered/NaN */", desc
-        if jcc == "jnp":
-            return "1 /* fpu: ordered */", desc
+        expr = fpu_cmp_map.get(jcc)
+        if expr:
+            return f"{expr} /* {flag_setter} */", desc
         return None
 
     # If no operands available for other flag-setters, can't generate condition

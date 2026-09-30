@@ -34,3 +34,18 @@ class LahfTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FpuUnorderedTest(unittest.TestCase):
+    """fcomi/fucomi/sahf set ZF, PF and CF on an unordered compare; g_fp_cmp
+    is 2 then, which must not read as "greater"."""
+
+    def test_ja_is_false_and_jb_true_when_unordered(self):
+        from .lifter import _make_condition
+        ja = _make_condition("ja", "fucomip", [])[0]
+        jb = _make_condition("jb", "fucomip", [])[0]
+        jp = _make_condition("jp", "sahf", [])[0]
+        self.assertIn("g_fp_cmp == 1", ja)
+        self.assertNotIn(">", ja)
+        self.assertIn("g_fp_cmp == 2", jb)
+        self.assertIn("g_fp_cmp == 2", jp)
