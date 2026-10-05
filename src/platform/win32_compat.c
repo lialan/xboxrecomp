@@ -1124,6 +1124,12 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
 }
 #endif
 
+/* This is for compiling with gcc and linux */
+#if defined(__linux__)
+void view_register(void *addr, size_t len);
+size_t view_take(const void *addr);
+#endif
+
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
