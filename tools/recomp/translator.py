@@ -117,6 +117,10 @@ def write_if_changed(path, text):
     return True
 
 
+# Hooked starts are protected before boundary repair by the CLI.
+ENTRY_HOOKS = set()
+
+
 def _fixup_icall_esp_save(lines):
     """
     Post-process generated C lines to insert _icall_esp save points.
@@ -2039,6 +2043,9 @@ class FunctionTranslator:
         # Function signature
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
+        if func_addr in ENTRY_HOOKS:
+            lines.append(f"    extern void sub_{func_addr:08X}_enter(void);")
+            lines.append(f"    sub_{func_addr:08X}_enter();")
 
         # Optional entry trace. Bring-up is mostly "which of these ten init
         # calls does it not come back from", and answering that by overriding

@@ -91,9 +91,10 @@ def _load_manual_protection(manual_functions, exclude_manual):
     protected = _load_addrs(manual_functions)
     scan_result = None
     if exclude_manual:
-        from .manual_scan import scan as _scan_manual
+        from .manual_scan import scan as _scan_manual, entry_hooks
         scan_result = _scan_manual(exclude_manual)
         protected.update(set().union(*scan_result))
+        protected.update(entry_hooks(exclude_manual))
     return protected, scan_result
 
 
@@ -259,6 +260,12 @@ def main():
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
     args = parser.parse_args()
+
+    # Reset on every CLI invocation, including one with no manual file.
+    from . import translator as translator_module
+    from .manual_scan import entry_hooks
+    translator_module.ENTRY_HOOKS = (entry_hooks(args.exclude_manual)
+                                    if args.exclude_manual else set())
 
     # Boundary repair is destructive: an interior function start disappears
     # once it is coalesced into its owner. Load hand-written entry points before
