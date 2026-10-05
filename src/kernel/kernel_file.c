@@ -309,6 +309,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_dir_context_drop(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -612,6 +613,28 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
     }
     LeaveCriticalSection(&s_dir_cs);
     return NULL;
+}
+
+/* A closed directory handle takes its enumeration with it. Host handle values
+ * are reused, and a search abandoned part-way (a title that stops at the first
+ * match) otherwise carried on under the next directory opened at the same
+ * value: its first answer was the old search's next entry. */
+void xbox_dir_context_drop(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init)
+        return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].file_handle == FileHandle) {
+            if (s_dir_contexts[i].find_handle &&
+                s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+                FindClose(s_dir_contexts[i].find_handle);
+            s_dir_contexts[i].find_handle = NULL;
+            s_dir_contexts[i].file_handle = NULL;
+            s_dir_contexts[i].first_done = FALSE;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
 }
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
