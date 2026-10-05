@@ -117,6 +117,12 @@ def write_if_changed(path, text):
     return True
 
 
+def _is_safe_icall(line):
+    return any(name + "(" in line for name in (
+        "RECOMP_ICALL_SAFE", "RECOMP_ICALL_SAFE_AT",
+        "RECOMP_ICALL_SAFE_CC", "RECOMP_ICALL_SAFE_AT_CC"))
+
+
 def _fixup_icall_esp_save(lines):
     """
     Post-process generated C lines to insert _icall_esp save points.
@@ -156,7 +162,7 @@ def _fixup_icall_esp_save(lines):
     # Find indices of all ICALL_SAFE lines
     icall_indices = []
     for i, line in enumerate(lines):
-        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
+        if _is_safe_icall(line):
             icall_indices.append(i)
 
     if not icall_indices:
@@ -216,7 +222,7 @@ def _fixup_icall_esp_save(lines):
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
         result.append(line)
-        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
+        if _is_safe_icall(line):
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}}}")
 
@@ -1916,6 +1922,17 @@ class FunctionTranslator:
         name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
         size = end - start
         instructions, blocks = self.decode_function(start, end)
+        # Classify the actual immediately following guest instruction;
+        # generated ADD snapshots must not hide caller cleanup.
+        self.lifter.caller_cleanup_sites = {
+            call.address for call, following in zip(instructions, instructions[1:])
+            if call.is_call and call.end_address == following.address
+            and following.mnemonic == "add" and len(following.operands) == 2
+            and following.operands[0].type == "reg"
+            and following.operands[0].reg == "esp"
+            and following.operands[1].type == "imm"
+            and following.operands[1].imm > 0
+        }
         if not blocks:
             return None
 

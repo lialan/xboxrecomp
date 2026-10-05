@@ -1338,6 +1338,7 @@ class Lifter:
         # generic dispatch stays as the fallback, so an unseen target is
         # slow, never wrong. See _lift_call.
         self.icall_site_targets = {}
+        self.caller_cleanup_sites = set()
         # Addresses loaded as immediates into a register inside the current
         # function, used to resolve `jmp <reg>`. See _lift_jmp.
         self.imm_code_refs = set()
@@ -2297,6 +2298,9 @@ class Lifter:
     LONGJMP_FN = None
 
     def _lift_call(self, insn, ops):
+        caller_cleans = insn.address in self.caller_cleanup_sites
+        safe_macro = "RECOMP_ICALL_SAFE_CC" if caller_cleans else "RECOMP_ICALL_SAFE"
+        safe_at_macro = "RECOMP_ICALL_SAFE_AT_CC" if caller_cleans else "RECOMP_ICALL_SAFE_AT"
         # x86 'call' pushes the address of the following instruction, then jumps.
         # Push that real guest address, not a placeholder: the value is visible
         # to the callee, and plenty of x86 code reads it. __SEH_prolog locates
@@ -2358,7 +2362,7 @@ class Lifter:
                 # replacement silently. Contributed in #15.
                 lines.append(
                     f"PUSH32(esp, 0x{ret_va:08X}u); "
-                    f"RECOMP_ICALL_SAFE(0x{insn.call_target:08X}u, "
+                    f"{safe_macro}(0x{insn.call_target:08X}u, "
                     "_icall_esp); "
                     f"/* manual call 0x{insn.call_target:08X} */")
             else:
@@ -2410,7 +2414,7 @@ class Lifter:
             site = insn.address
             head = (f"{{ uint32_t _icall_target = {target}; "
                     f"PUSH32(esp, 0x{ret_va:08X}u); ")
-            fallback = (f"RECOMP_ICALL_SAFE_AT(_icall_target, _icall_esp, "
+            fallback = (f"{safe_at_macro}(_icall_target, _icall_esp, "
                         f"0x{site:08X}u); }}")
             recorded = self.icall_site_targets.get(site)
             guards = [t for t in (recorded or [])

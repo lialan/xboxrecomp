@@ -1018,6 +1018,26 @@ extern volatile uint64_t g_icall_guard_misses;
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
 
+/* Caller cleanup: a failed call pops only its return address. */
+#define RECOMP_ICALL_SAFE_CC(xbox_va, saved_esp) do { \
+    (void)(saved_esp); \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va); \
+        g_esp += 4; eax = 0; break; \
+    } \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
+} while(0)
+
 /**
  * RECOMP_ICALL_SAFE_AT - RECOMP_ICALL_SAFE that also names the call SITE.
  *
@@ -1043,6 +1063,27 @@ extern volatile uint64_t g_icall_guard_misses;
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+} while(0)
+
+/* Caller cleanup: a failed call pops only its return address. */
+#define RECOMP_ICALL_SAFE_AT_CC(xbox_va, saved_esp, site) do { \
+    (void)(saved_esp); \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va); \
+        g_esp += 4; eax = 0; break; \
+    } \
+    RECOMP_ICALL_OBSERVE_SITE((site), _va); \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
 
 /**
