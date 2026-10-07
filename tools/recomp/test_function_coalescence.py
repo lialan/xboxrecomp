@@ -621,6 +621,62 @@ def test_static_callback_rescan_uses_recovered_cfg():
     assert subject.func_db[callback]["called_by"] == [f"0x{BASE:08X}"]
 
 
+def static_callback_subject(cover, callback_code, inner=None):
+    # An _initterm-style caller walks [table, table+4); its one callback sits
+    # after a gap alias (or a real function) whose end runs past it. `inner`
+    # is an optional alias start inside the callback's own code.
+    table = BASE + 0x300
+    alias = BASE + 0x40
+    callback = BASE + 0x80
+    following = BASE + 0x100
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x40] = raw[0x100] = 0xC3
+    raw[0x80:0x80 + len(callback_code)] = callback_code
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        alias: {**function(alias, following), "detection_method": cover},
+        following: function(following, following + 1),
+    })
+    if inner is not None:
+        subject.func_db[inner] = {
+            **function(inner, following), "detection_method": "tail_jump_alias"}
+    subject.discover_static_indirect_targets()
+    return subject, callback
+
+
+@pytest.mark.parametrize("cover, recovered", [
+    ("tail_jump_alias", True), ("prologue", False)])
+def test_static_callback_inside_alias_range_is_recovered(cover, recovered):
+    # Only a real function's range may hide the callback.
+    subject, callback = static_callback_subject(cover, b"\xc3")
+    assert (callback in subject.func_db) is recovered
+    if recovered:
+        assert subject.func_db[callback]["end"] == BASE + 0x100
+        assert subject.func_db[callback]["detection_method"] == (
+            "static_indirect_table")
+
+
+@pytest.mark.parametrize("inner, recovered", [
+    (BASE + 0x84, True), (BASE + 0x83, False)])
+def test_static_callback_may_fall_into_an_alias(inner, recovered):
+    # nop x4 then the alias's ret: no ret before the alias start, but the
+    # decode lands exactly on it. A start mid-instruction is not a fallthrough.
+    code = b"\x90" * 4 + b"\xc3" if inner == BASE + 0x84 else b"\x90\x90\x05" + b"\x00" * 4
+    subject, callback = static_callback_subject("tail_jump_alias", code, inner)
+    assert (callback in subject.func_db) is recovered
+    if recovered:
+        assert subject.func_db[callback]["end"] == inner
+        body = subject.translate_function(callback, subject.func_db[callback])
+        assert f"sub_{inner:08X}" in body, body
+
+
 def test_jump_table_case_can_recover_register_continuation():
     case = BASE + 7
     continuation = case + 7

@@ -394,6 +394,14 @@ class FunctionTranslator:
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover function entries from bounded static callback tables."""
         original_starts = sorted(self.func_db)
+        # An alias's end is borrowed from the body it enters or, in a gap, runs
+        # to the next known start, so it says nothing about the bytes after the
+        # alias's own code. Dead or Alive 3 has 17 _initterm initializers in a
+        # 100 KB gap that only gap aliases claim; letting an alias range hide
+        # them left the CRT calling addresses with no body.
+        owner_starts = [
+            start for start in original_starts
+            if self.func_db[start].get("detection_method") != "tail_jump_alias"]
         recovered_callers = {}
 
         for caller, func_info in list(self.func_db.items()):
@@ -439,11 +447,13 @@ class FunctionTranslator:
             next_index = bisect.bisect_right(original_starts, target)
             if next_index == 0 or next_index >= len(original_starts):
                 continue
-            previous = self.func_db[original_starts[next_index - 1]]
             next_start = original_starts[next_index]
             next_func = self.func_db[next_start]
-            if previous.get("end", previous["_addr"]) > target:
-                continue
+            owner_index = bisect.bisect_right(owner_starts, target)
+            if owner_index:
+                owner = self.func_db[owner_starts[owner_index - 1]]
+                if owner.get("end", owner["_addr"]) > target:
+                    continue
             section = next_func.get("section", "")
             if section in (".rdata", ".data"):
                 continue
@@ -453,7 +463,17 @@ class FunctionTranslator:
                 continue
             instructions = self.disasm.disassemble_function(
                 raw_bytes, target, next_start)
-            if not instructions or not any(insn.is_ret for insn in instructions):
+            # A callback that decodes straight into an alias start continues in
+            # that alias's body, and translation bridges the fallthrough to it.
+            # DOA3's initializer 0x0019EC10 has two aliases inside it before
+            # its ret.
+            falls_into_alias = bool(instructions) and (
+                next_func.get("detection_method") == "tail_jump_alias"
+                and instructions[-1].address + instructions[-1].size
+                == next_start)
+            if not instructions or not (
+                    falls_into_alias
+                    or any(insn.is_ret for insn in instructions)):
                 continue
 
             self.func_db[target] = {
