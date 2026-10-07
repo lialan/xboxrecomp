@@ -652,7 +652,8 @@ class FunctionTranslator:
             tables = (self._recovered_cfg.get(target) or {}).get("jump_tables", {})
             claimed_end = max(
                 claimed_end, *(insn.end_address for insn in instructions),
-                *(table + len(arms) * 4 for table, arms in tables.items()))
+                *(table + len(arms) * 4 for table, arms in tables.items()
+                  if target <= table < bound))
 
         return self.recovered_function_starts
 

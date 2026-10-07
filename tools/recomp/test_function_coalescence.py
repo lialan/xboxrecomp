@@ -815,6 +815,39 @@ def test_recovered_callback_exposes_a_later_helper():
     assert subject.func_db[callback]["end"] == helper
 
 
+def test_callback_table_outside_its_range_claims_nothing_after_it(monkeypatch):
+    # The callback's switch table lives in .data, past its range. Only code
+    # and tables inside the callback are claimed, so a later immediate
+    # callback in another gap is still recovered.
+    callback, following, later, last = (
+        BASE + 0x80, BASE + 0x100, BASE + 0x180, BASE + 0x200)
+    table = BASE + 0x300
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", BASE, 0x280, 0, 0x280, True),
+        config.Section(".data", BASE + 0x280, 0x180, 0x280, 0x180, False),
+    ])
+    pattern = (b"\x68" + callback.to_bytes(4, "little")
+               + b"\x68" + later.to_bytes(4, "little") + bytes.fromhex("ffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    code = (bytes.fromhex("83e001ff2485") + table.to_bytes(4, "little")
+            + bytes.fromhex("40ebf348ebf0"))
+    raw[0x80:0x80 + len(code)] = code
+    raw[0x300:0x308] = ((BASE + 0x8a).to_bytes(4, "little")
+                        + (BASE + 0x8d).to_bytes(4, "little"))
+    raw[0x100] = raw[0x180] = raw[0x200] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+        last: function(last, last + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert later in subject.func_db
+
+
 def test_callback_in_a_sections_last_gap_stops_at_its_section(monkeypatch):
     # The next start is in a later code section whose bytes are elsewhere in
     # the file, so decoding must stop at the callback's own section end.
