@@ -2750,6 +2750,28 @@ class Lifter:
 
     # ── String operations ──
 
+    def _lift_rep_movs(self, size, m):
+        """Keep forward non-overlap memcpy; MMIO/overlap/DF use volatile elements.
+
+        Validate the entire guest range in 64 bits before the host fast path,
+        including a range crossing into MMIO or wrapping the 32-bit address.
+        """
+        mem = f"MEM{size*8}"
+        return [
+            "{ uint64_t _n = (uint64_t)ecx * %du;" % size,
+            "if (!g_df && esi < 0xFD000000u && edi < 0xFD000000u"
+            " && (uint64_t)esi + _n <= 0xFD000000u"
+            " && (uint64_t)edi + _n <= 0xFD000000u) {",
+            "  uint8_t *_d = (uint8_t*)XBOX_PTR(edi), *_s = (uint8_t*)XBOX_PTR(esi);",
+            "  if ((uint64_t)edi + _n <= esi || (uint64_t)esi + _n <= edi) memcpy(_d, _s, (size_t)_n);",
+            f"  else {{ uint32_t _i; for (_i = 0; _i < ecx; _i++) {mem}(edi + _i*{size}u) = {mem}(esi + _i*{size}u); }}",
+            f"  esi += ecx * {size}u; edi += ecx * {size}u; }}",
+            f"else {{ uint32_t _i; int32_t _st = RECOMP_DF_STEP({size});",
+            f"  for (_i = 0; _i < ecx; _i++) {mem}(edi + _i*_st) = {mem}(esi + _i*_st);",
+            "  esi += ecx * _st; edi += ecx * _st; }",
+            f"ecx = 0; }} /* {m} */",
+        ]
+
     def _lift_rep_string(self, insn, m):
         # Every one of these steps by RECOMP_DF_STEP(size) rather than a
         # literal, because EFLAGS.DF decides the direction and the block
@@ -2773,34 +2795,11 @@ class Lifter:
         # memcpy is still used when the ranges provably do not overlap, which
         # is the overwhelming majority of calls.
         if "movsb" in m:
-            return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
-                    " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
-                    "  else { uint32_t _i; for (_i = 0; _i < _n; _i++) _d[_i] = _s[_i]; }",
-                    "  esi += ecx; edi += ecx; }",
-                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
-                    " MEM8(edi - _i) = MEM8(esi - _i); esi -= ecx; edi -= ecx; }",
-                    "ecx = 0; /* rep movsb */"]
+            return self._lift_rep_movs(1, m)
         if "movsd" in m:
-            return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
-                    " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 4;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
-                    "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
-                    " MEM32(edi + _i*4) = MEM32(esi + _i*4); }",
-                    "  esi += ecx * 4; edi += ecx * 4; }",
-                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
-                    " MEM32(edi - _i*4) = MEM32(esi - _i*4); esi -= ecx * 4; edi -= ecx * 4; }",
-                    "ecx = 0; /* rep movsd */"]
+            return self._lift_rep_movs(4, m)
         if "movsw" in m:
-            return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
-                    " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 2;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
-                    "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
-                    " MEM16(edi + _i*2) = MEM16(esi + _i*2); }",
-                    "  esi += ecx * 2; edi += ecx * 2; }",
-                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
-                    " MEM16(edi - _i*2) = MEM16(esi - _i*2); esi -= ecx * 2; edi -= ecx * 2; }",
-                    "ecx = 0; /* rep movsw */"]
+            return self._lift_rep_movs(2, m)
         if "stosb" in m:
             return ["if (!g_df) { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
