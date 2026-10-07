@@ -2558,7 +2558,10 @@ class Lifter:
         skipped = self._leading_arms(self._read_jump_table(table_va + 4))
         if len(skipped) >= 2:
             return skipped
-        below = self._leading_arms(self._read_jump_table_backward(table_va - 4))
+        # A table counted down from its last slot (`jmp [ecx*4 + LAST]`) has
+        # that one slot at the displacement itself, already in `inside`.
+        below = inside + self._leading_arms(
+            self._read_jump_table_backward(table_va - 4))
         if len(below) >= 2:
             return below
         return []
