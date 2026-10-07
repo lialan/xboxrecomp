@@ -330,6 +330,28 @@ static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits)
     return (int64_t)rounded;
 }
 
+/* fld/fstp tbyte: 64-bit significand with an explicit integer bit, 15-bit
+ * exponent biased by 16383, sign on top. The stack is double, so a load
+ * rounds to 53 bits and a store is exact. */
+static inline double recomp_f80_load(uint64_t mant, uint16_t se) {
+    int e = se & 0x7fff;
+    double v = e == 0x7fff ? ((mant << 1) ? NAN : INFINITY)
+                           : ldexp((double)mant, e - 16383 - 63);
+    return (se & 0x8000u) ? -v : v;
+}
+static inline uint16_t recomp_f80_store(double v, uint64_t *mant) {
+    union { double d; uint64_t u; } bits;
+    uint16_t sign = signbit(v) ? 0x8000u : 0u;
+    int e;
+    bits.d = v;
+    if (v != v) { *mant = 0x8000000000000000ull | (bits.u << 11); return sign | 0x7fffu; }
+    if (isinf(v)) { *mant = 0x8000000000000000ull; return sign | 0x7fffu; }
+    if (v == 0.0) { *mant = 0; return sign; }
+    v = frexp(fabs(v), &e);
+    *mant = (uint64_t)(int64_t)ldexp(v, 63) << 1;
+    return (uint16_t)(sign | (e + 16382));
+}
+
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
  * ================================================================ */

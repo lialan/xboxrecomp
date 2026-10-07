@@ -20,6 +20,8 @@ CASES = (
     # EFLAGS from sahf, fcomi and comiss, read by every jcc/setcc/cmovcc.
     "fcomp_m32_t", "fcomi", "fucomi", "comiss", "ucomiss", "fcom_st1_sahf",
     "fcomp_m32_sahf", "fcompp_sahf", "fucompp_sahf", "ftst_sahf",
+    # fld/fstp tbyte, as the CRT loads its constants.
+    "fld_m80",
 )
 
 

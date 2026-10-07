@@ -3497,6 +3497,12 @@ class Lifter:
                         return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld float */"]
                     elif ops[0].mem_size == 8:
                         return [f"fp_push(MEMD({_fmt_mem(ops[0])})); /* fld double */"]
+                    elif ops[0].mem_size == 10:
+                        # The CRT's libm loads its constants this way. Read as
+                        # a float, 1.0L came back as 0.0.
+                        a = _fmt_mem(ops[0])
+                        return [f"fp_push(recomp_f80_load(((uint64_t)MEM32(({a}) + 4) << 32)"
+                                f" | MEM32({a}), MEM16(({a}) + 8))); /* fld tbyte */"]
                     return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld */"]
                 if ops[0].type == "reg":
                     # fld st(i) pushes a COPY of st(i). Was a no-op comment,
@@ -3524,6 +3530,13 @@ class Lifter:
                     return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top();{do_pop} /* {m} */"]
                 elif ops[0].mem_size == 8:
                     return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{do_pop} /* {m} */"]
+                elif ops[0].mem_size == 10:
+                    # Only fstp has a tbyte form. This was a comment, so the
+                    # spill stored nothing and the stack kept a slot.
+                    a = _fmt_mem(ops[0])
+                    return [f"{{ uint64_t _m; uint16_t _se = recomp_f80_store(fp_top(), &_m);"
+                            f" MEM32({a}) = (uint32_t)_m; MEM32(({a}) + 4) = (uint32_t)(_m >> 32);"
+                            f" MEM16(({a}) + 8) = _se; }}{do_pop} /* {m} tbyte */"]
             # fst/fstp st(i): copy st0 to st(i); fstp then pops. This used to be
             # a bare comment -- a no-op -- which LEAKS the FPU stack. `fstp st(0)`
             # is the common idiom for "pop the value fptan/fsincos just pushed";
