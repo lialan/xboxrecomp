@@ -688,6 +688,7 @@ def test_static_callback_may_fall_into_an_alias(inner, recovered):
     (bytes.fromhex("85c074fceb79"), False),  # exit has no known entry
     (bytes.fromhex("85c0747cebfa"), False),  # conditional exit is not a tail call
     (bytes.fromhex("85c074fc"), False),  # loop with a trap fallthrough
+    (bytes.fromhex("85c074fce877000000"), True),  # loop, then no-return call
 ])
 def test_immediate_callback_in_gap_is_recovered(code, recovered):
     # `push callback; call eax; ret`: the callback sits in a gap and has no

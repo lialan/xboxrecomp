@@ -533,9 +533,13 @@ class FunctionTranslator:
                     continue
                 decoded, tables, _ = recovered
                 starts = {insn.address for insn in decoded}
+                # MSVC pads a no-return call (ExitThread) with int3.
+                call_ends = {insn.end_address for insn in decoded if insn.is_call}
                 closed = bool(decoded)
                 backward = False
                 for insn in decoded:
+                    if insn.mnemonic == "int3" and insn.address in call_ends:
+                        continue
                     if insn.mnemonic in ("int3", "ud2", "hlt", "iret", "iretd"):
                         closed = False
                     edges = []
