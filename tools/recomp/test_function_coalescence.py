@@ -765,6 +765,78 @@ def test_immediate_inside_a_callback_found_in_the_same_pass_is_rejected():
     assert constant not in subject.func_db
 
 
+def test_immediate_inside_a_same_pass_callback_table_is_rejected():
+    # The callback's switch table follows its last instruction. A constant
+    # pointing into the table must not become a function even though the
+    # table bytes decode to a closed run ending in a ret.
+    callback, following = BASE + 0x80, BASE + 0x100
+    table = BASE + 0x90
+    constant = table
+    pattern = (b"\x68" + callback.to_bytes(4, "little")
+               + b"\x68" + constant.to_bytes(4, "little") + bytes.fromhex("ffd0c3"))
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    code = (bytes.fromhex("83e001ff2485") + table.to_bytes(4, "little")
+            + bytes.fromhex("40ebf348ebf0")
+            + (BASE + 0x8a).to_bytes(4, "little")
+            + (BASE + 0x8d).to_bytes(4, "little"))
+    raw[0x80:0x80 + len(code)] = code
+    raw[0x98] = 0xC3
+    raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert constant not in subject.func_db
+
+
+def test_recovered_callback_exposes_a_later_helper():
+    # The callback calls a helper later in the same gap. The callback's end
+    # was a guess, so its proven CFG may end before the helper, which then
+    # needs a body of its own.
+    callback, helper, following = BASE + 0x80, BASE + 0xa0, BASE + 0x100
+    pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x86] = b"\xe8" + (helper - callback - 5).to_bytes(4, "little") + b"\xc3"
+    raw[0xa0] = raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert helper in subject.func_db
+    assert subject.func_db[callback]["end"] == helper
+
+
+def test_callback_in_a_sections_last_gap_stops_at_its_section(monkeypatch):
+    # The next start is in a later code section whose bytes are elsewhere in
+    # the file, so decoding must stop at the callback's own section end.
+    callback, second = BASE + 0x80, BASE + 0x1000
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", BASE, 0x100, 0, 0x100, True),
+        config.Section("LIB", second, 0x100, 0x100, 0x100, True),
+    ])
+    pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x80] = 0xC3
+    raw[0x100] = 0xC3
+    subject = FunctionTranslator(bytes(raw), {
+        BASE: function(BASE, BASE + len(pattern)),
+        second: function(second, second + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert subject.func_db[callback]["end"] == BASE + 0x100
+
+
 def test_jump_table_case_can_recover_register_continuation():
     case = BASE + 7
     continuation = case + 7

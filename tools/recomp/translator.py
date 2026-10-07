@@ -490,6 +490,15 @@ class FunctionTranslator:
                 continue
             next_start = original_starts[next_index]
             next_func = self.func_db[next_start]
+            # Decode no further than the target's own section: the next start
+            # can sit in another section, and the bytes between are not
+            # contiguous in the file.
+            section_end = next(
+                (s.va + min(s.va_size, s.raw_size) for s in _config._SECTIONS
+                 if s.va <= target < s.va + s.va_size), target)
+            bound = min(next_start, section_end)
+            if bound <= target:
+                continue
             weak = target not in strong
             if weak:
                 if target < claimed_end or not is_code_address(target):
@@ -515,20 +524,25 @@ class FunctionTranslator:
                         continue
                     # Linear decoding can run through a trailing switch table
                     # into a separate callback. Only trim that overlap after
-                    # proving the owner's table-aware CFG ends before it.
+                    # proving the owner's table-aware CFG ends before it. A
+                    # callback recovered here only guessed its end, so its
+                    # proven CFG may expose a later helper without a table.
+                    guessed = owner["_addr"] in self.recovered_function_starts
                     recovered_owner = self._recover_cfg(
                         owner["_addr"], owner["end"], set(), set(), coalescing=True)
                     if not recovered_owner:
                         continue
                     owned, tables, _ = recovered_owner
-                    if (not owned or not tables
+                    if (not owned or (not tables and not guessed)
                             or any(insn.end_address > target for insn in owned)
                             or any(table + len(arms) * 4 > target
                                    for table, arms in tables.items())
                             or any(insn.is_jump and insn.jump_target is None
-                                   and (not insn.operands
-                                        or insn.operands[0].type != "mem"
-                                        or insn.operands[0].mem_disp not in tables)
+                                   and not (insn.operands
+                                            and insn.operands[0].type == "mem"
+                                            and insn.operands[0].mem_disp in tables)
+                                   and not (guessed and self._is_pointer_tail_jump(
+                                       insn, tables))
                                    for insn in owned)):
                         continue
                     overlapping_owner = owner, owned, tables
@@ -536,11 +550,11 @@ class FunctionTranslator:
             if section in (".rdata", ".data"):
                 continue
 
-            raw_bytes = self._read_func_bytes(target, next_start)
+            raw_bytes = self._read_func_bytes(target, bound)
             if not raw_bytes:
                 continue
             instructions = self.disasm.disassemble_function(
-                raw_bytes, target, next_start)
+                raw_bytes, target, bound)
             # A callback that decodes straight into an alias start continues in
             # that alias's body, and translation bridges the fallthrough to it.
             # DOA3's initializer 0x0019EC10 has two aliases inside it before
@@ -561,7 +575,7 @@ class FunctionTranslator:
                 # this range (the next pass recovers it as a dependency), or
                 # through a register or plain memory pointer.
                 recovered = self._recover_cfg(
-                    target, next_start, set(), set(), coalescing=True)
+                    target, bound, set(), set(), coalescing=True)
                 if not recovered:
                     continue
                 decoded, tables, _ = recovered
@@ -580,13 +594,7 @@ class FunctionTranslator:
                         continue
                     if insn.mnemonic in ("int3", "ud2", "hlt", "iret", "iretd"):
                         closed = False
-                    operand = insn.operands[0] if insn.operands else None
-                    if (insn.mnemonic == "jmp" and insn.jump_target is None
-                            and operand is not None
-                            and (operand.type == "reg"
-                                 or (operand.type == "mem"
-                                     and not operand.mem_index
-                                     and operand.mem_disp not in tables))):
+                    if self._is_pointer_tail_jump(insn, tables):
                         exits = True
                         continue
                     edges = []
@@ -604,7 +612,7 @@ class FunctionTranslator:
                             continue
                         if insn.mnemonic == "jmp" and (
                                 edge in self.func_db
-                                or (not target <= edge < next_start
+                                or (not target <= edge < bound
                                     and is_code_address(edge))):
                             exits = True
                             continue
@@ -614,7 +622,7 @@ class FunctionTranslator:
                     continue
                 instructions = decoded
                 self._recovered_cfg[target] = {
-                    "end": next_start, "instructions": decoded,
+                    "end": bound, "instructions": decoded,
                     "jump_tables": tables,
                 }
 
@@ -629,8 +637,8 @@ class FunctionTranslator:
             self.func_db[target] = {
                 "_addr": target,
                 "start": f"0x{target:08X}",
-                "end": next_start,
-                "size": next_start - target,
+                "end": bound,
+                "size": bound - target,
                 "name": self.label_db.get(target, f"sub_{target:08X}"),
                 "section": section,
                 "confidence": 0.9,
@@ -641,10 +649,22 @@ class FunctionTranslator:
                 "called_by": sorted(callers),
             }
             self.recovered_function_starts.add(target)
-            claimed_end = max(claimed_end,
-                              max(insn.end_address for insn in instructions))
+            tables = (self._recovered_cfg.get(target) or {}).get("jump_tables", {})
+            claimed_end = max(
+                claimed_end, *(insn.end_address for insn in instructions),
+                *(table + len(arms) * 4 for table, arms in tables.items()))
 
         return self.recovered_function_starts
+
+    @staticmethod
+    def _is_pointer_tail_jump(insn, tables):
+        """Return whether insn tail-calls through a register or plain pointer."""
+        operand = insn.operands[0] if insn.operands else None
+        return (insn.mnemonic == "jmp" and insn.jump_target is None
+                and operand is not None
+                and (operand.type == "reg"
+                     or (operand.type == "mem" and not operand.mem_index
+                         and operand.mem_disp not in tables)))
 
     def coalesce_function(self, target, end, expected_starts):
         """Merge an explicitly named set of false interior function starts.
