@@ -506,11 +506,8 @@ class FunctionDetector:
             print(f"  {found} function address(es) installed into"
                   f" indirect-call slots")
 
-    def _probes_as_direct_thunk(self, target, starts, sections) -> bool:
-        """Prove a direct thunk's tail dependencies in their own bounded gaps."""
-        first = self.engine.get_instruction(target)
-        if first is None or not first.is_jump or first.jump_target is None:
-            return False
+    def _probes_as_tail_body(self, target, starts, sections, *, entry_frame=False) -> bool:
+        """Prove a callback's direct tail dependencies in their bounded gaps."""
         proven = set(self.functions) | self._alias_entries.keys()
         pending = [target]
         visiting = set()
@@ -527,7 +524,9 @@ class FunctionDetector:
             index = bisect.bisect_right(starts, entry)
             if index < len(starts):
                 upper = min(upper, starts[index])
-            if self.engine.probes_as_callback_body(entry, upper, tail_targets=proven):
+            if self.engine.probes_as_callback_body(
+                    entry, upper, tail_targets=proven,
+                    require_entry_frame=entry_frame and entry == target):
                 proven.add(entry)
                 pending.pop()
                 continue
@@ -630,7 +629,9 @@ class FunctionDetector:
                 upper = min(upper, starts[i])
             if not (self.engine.probes_as_callback_body(target, upper)
                     or self.engine.probes_as_vcall_thunk(target)
-                    or self._probes_as_direct_thunk(target, starts, sections)):
+                    or (self.engine.get_instruction(target) is not None
+                        and self.engine.get_instruction(target).is_jump
+                        and self._probes_as_tail_body(target, starts, sections))):
                 continue
             if target not in self.engine.instructions:
                 if not self.engine.decode_at(target):
@@ -814,7 +815,8 @@ class FunctionDetector:
             # A borrowed alias extent is not an entry boundary. Table words
             # can name valid instruction suffixes inside an already-reachable
             # callback; only disconnected bodies remain weak entry candidates.
-            if target in claimed:
+            if (target in claimed and not self._probes_as_tail_body(
+                    target, starts, sections, entry_frame=True)):
                 continue
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bounds[j][0] < target < bounds[j][1]:
@@ -860,7 +862,7 @@ class FunctionDetector:
                 if not (self.engine.probes_as_callback_body(
                             target, end, lower, tail_targets=tails)
                         or self.engine.probes_as_vcall_thunk(target)):
-                    if not self._probes_as_direct_thunk(target, starts, sections):
+                    if not self._probes_as_tail_body(target, starts, sections):
                         continue
             if end <= target:
                 continue

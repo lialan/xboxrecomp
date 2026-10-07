@@ -133,3 +133,46 @@ def test_table_thunk_chain_requires_a_proven_destination(valid):
     assert not engine.probes_as_callback_body(BASE + 16, BASE + 32)
     detector._pass_data_ptr_targets([text])
     assert (BASE + 16 in detector._alias_entries) == valid
+
+
+def test_entry_frame_rejects_an_epilogue_without_its_saves():
+    for body, accepted in ((b'\x5b\xc3', False), (b'\x53\x5b\xc3', True)):
+        engine, _ = _engine(body)
+        assert engine.probes_as_callback_body(
+            BASE, BASE + len(body), require_entry_frame=True) == accepted
+
+
+def test_entry_frame_allows_a_stack_neutral_forwarder():
+    for prefix, accepted in ((b'\x89\xc8', True), (b'\x50', False)):
+        branch = b'\xe9' + struct.pack('<i', 20 - len(prefix) - 5)
+        body = (prefix + branch).ljust(20, b'\xcc') + b'\xc3'
+        engine, _ = _engine(body)
+        assert engine.probes_as_callback_body(
+            BASE, BASE + 20, tail_targets={BASE + 20},
+            require_entry_frame=True) == accepted
+
+
+def test_backward_external_tail_is_not_a_closed_loop():
+    prefix = b'\x6a\x01\xe8\x00\x01\x00\x00'
+    body = prefix + b'\xe9' + struct.pack('<i', -16 - len(prefix) - 5)
+    engine, _ = _engine(body)
+    assert engine.probes_as_callback_body(
+        BASE, BASE + len(body), tail_targets={BASE - 16})
+    assert not engine.probes_as_callback_body(
+        BASE, BASE + len(body), tail_targets={BASE - 16}, require_entry_frame=True)
+
+
+def test_shared_callback_with_its_own_frame_remains_callable():
+    from tools.disasm.engine import DisasmEngine
+    body = b'\xc3' + b'\x90' * 15 + b'\x74\x06\xc3' + b'\x90' * 5
+    body += b'\x53' + b'\x40' * 100 + b'\x5b\xc3'
+    table = struct.pack('<II', BASE + 16, BASE + 24)
+    text = SectionInfo('.text', BASE, len(body), 0, len(body), False, True, '')
+    data = SectionInfo('.data', BASE + 0x1000, len(table), len(body), len(table), False, False, '')
+    image = BinaryImage('synthetic', body + table, 0, 0x20000, BASE, 0, [text, data])
+    engine = DisasmEngine(image)
+    engine.linear_sweep(text)
+    detector = FunctionDetector(engine, image, None, LabelManager())
+    detector.functions[BASE] = Function(BASE, BASE + 1, 'known')
+    detector._pass_data_ptr_targets([text])
+    assert {BASE + 16, BASE + 24} <= detector._alias_entries.keys()

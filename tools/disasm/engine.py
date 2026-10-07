@@ -534,7 +534,7 @@ class DisasmEngine:
 
     def probes_as_callback_body(self, addr: int, upper: int,
                                 lower: Optional[int] = None,
-                                tail_targets=()) -> bool:
+                                tail_targets=(), *, require_entry_frame=False) -> bool:
         """Read-only proof of a closed callback CFG inside an unclaimed gap.
 
         Calls may return from other functions; branches and fallthrough must
@@ -615,7 +615,20 @@ class DisasmEngine:
                     exits = True  # preserve proven tails to existing bodies
                     continue
                 return False
-            backward |= any(edge <= insn.address for edge in edges)
+            backward |= any(edge in starts and edge <= insn.address for edge in edges)
+        if require_entry_frame:
+            saved = {insn.op_str for insn in decoded if insn.mnemonic == "push"}
+            restored = {insn.op_str for insn in decoded if insn.mnemonic == "pop"}
+            restored &= {"ebx", "esi", "edi", "ebp"}
+            # A callable shared body must supply its own saved registers. An
+            # epilogue suffix that consumes its owner's saves is not an entry.
+            if restored - saved:
+                return False
+            if not (backward or restored or any(insn.is_ret for insn in decoded)
+                    or any(insn.mnemonic == "int3" and insn.address in call_ends
+                           for insn in decoded)
+                    or all("esp" not in insn.regs_written for insn in decoded)):
+                return False
         return bool(decoded) and (exits or backward)
 
     def _first_arm_after(self, table: int, site: int) -> Optional[int]:
