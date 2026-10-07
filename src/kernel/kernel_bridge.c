@@ -7019,6 +7019,16 @@ static void bridge_KePulseEvent(void)
     (void)increment;
     (void)wait;
 
+    {
+        int type;
+        HANDLE ge = ke_guest_event(guest_va, &type);
+        if (ge) {
+            PulseEvent(ge);
+            BRIDGE_MEM32(guest_va + 4) = 0;
+            g_eax = 0;
+            return;
+        }
+    }
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
@@ -7062,16 +7072,6 @@ static void bridge_KeReleaseSemaphore(void)
     (void)increment;
     (void)wait;
 
-    {
-        int type;
-        HANDLE ge = ke_guest_event(guest_va, &type);
-        if (ge) {
-            PulseEvent(ge);
-            BRIDGE_MEM32(guest_va + 4) = 0;
-            g_eax = 0;
-            return;
-        }
-    }
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
