@@ -1317,3 +1317,26 @@ def test_batch_preserves_callbacks_exposed_between_repairs(
         bounds.write_text(json.dumps(repairs), encoding="utf-8")
     with pytest.raises(ValueError, match="independent evidence|callback"):
         BatchTranslator(image, functions, coalesce_json_paths=paths)
+
+
+@pytest.mark.parametrize("opcode", [0xe8, 0xe9])
+def test_recovered_callback_recovers_gap_callee(opcode):
+    callback, callee, following = BASE + 0x80, BASE + 0x40, BASE + 0x100
+    registration = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(registration)] = registration
+    # The trailing ret also permits the tail-jump thunk to be discovered by
+    # the existing linear callback probe; its target must receive a body too.
+    body = bytes([opcode]) + (callee - callback - 5).to_bytes(4, "little", signed=True) + b"\xc3"
+    raw[0x80:0x80 + len(body)] = body
+    raw[0x40] = raw[0x100] = 0xc3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(registration)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert callee in subject.func_db
+    assert subject.func_db[callee]["called_by"] == [callback]

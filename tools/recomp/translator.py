@@ -392,7 +392,17 @@ class FunctionTranslator:
         self._ownership_ready = False
 
     def discover_static_indirect_targets(self, *, coalescing=False):
-        """Recover function entries from bounded static callback tables."""
+        """Recover callbacks and the gap entries their bodies reference."""
+        callers = None
+        while True:
+            before = set(self.func_db)
+            self._discover_static_indirect_targets(coalescing, callers)
+            callers = set(self.func_db) - before
+            if not callers:
+                return self.recovered_function_starts
+
+    def _discover_static_indirect_targets(self, coalescing, callers):
+        """Scan each newly recovered body once, keeping existing owners intact."""
         original_starts = sorted(self.func_db)
         # An alias's end is borrowed from the body it enters or, in a gap, runs
         # to the next known start, so it says nothing about the bytes after the
@@ -405,6 +415,8 @@ class FunctionTranslator:
         recovered_callers = {}
 
         for caller, func_info in list(self.func_db.items()):
+            if callers is not None and caller not in callers:
+                continue
             end = func_info.get("end", caller)
             recovered = self._recovered_cfg.get(caller)
             if recovered and recovered.get("instructions"):
@@ -424,13 +436,13 @@ class FunctionTranslator:
                 for target in targets:
                     if target in self.func_db:
                         if coalescing:
-                            callers = {
+                            known_callers = {
                                 int(value, 16) if isinstance(value, str) else value
                                 for value in self.func_db[target].get("called_by") or []
                             }
-                            callers.add(caller)
+                            known_callers.add(caller)
                             self.func_db[target]["called_by"] = [
-                                f"0x{value:08X}" for value in sorted(callers)]
+                                f"0x{value:08X}" for value in sorted(known_callers)]
                         continue
                     if coalescing:
                         index = bisect.bisect_right(original_starts, target)
@@ -446,6 +458,11 @@ class FunctionTranslator:
             # DOA3 registers 0x0016C0B0 with `push imm; call eax`. The gap and
             # decode checks below reject immediates that are not code.
             for insn in instructions:
+                if caller in self.recovered_function_starts:
+                    target = insn.call_target if insn.is_call else (
+                        insn.jump_target if insn.mnemonic == "jmp" else None)
+                    if target is not None and target not in self.func_db:
+                        recovered_callers.setdefault(target, set()).add(caller)
                 operands = insn.operands
                 if insn.mnemonic == "push" and operands:
                     source = operands[0]
