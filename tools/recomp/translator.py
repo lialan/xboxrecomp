@@ -506,8 +506,8 @@ class FunctionTranslator:
                     falls_into_alias
                     or any(insn.is_ret for insn in instructions)):
                 # Fiber/task callbacks may loop forever. Accept only a closed
-                # bounded CFG: every jump and fallthrough must reach a decoded
-                # instruction, including all arms of an indexed jump table.
+                # bounded CFG: every edge must reach a decoded instruction or
+                # tail-call an existing function, including indexed table arms.
                 recovered = self._recover_cfg(
                     target, next_start, set(), set(), coalescing=True)
                 if not recovered:
@@ -520,7 +520,7 @@ class FunctionTranslator:
                     if insn.mnemonic in ("int3", "ud2", "hlt", "iret", "iretd"):
                         closed = False
                     edges = []
-                    if insn.is_jump:
+                    if insn.is_jump or insn.jump_target is not None:
                         edges = ([insn.jump_target] if insn.jump_target is not None
                                  else tables.get(insn.operands[0].mem_disp, [])
                                  if insn.operands and insn.operands[0].type == "mem"
@@ -529,7 +529,10 @@ class FunctionTranslator:
                             closed = False
                     if insn.mnemonic != "jmp":
                         edges = [*edges, insn.end_address]
-                    closed &= all(edge in starts for edge in edges)
+                    closed &= all(
+                        edge in starts or (
+                            insn.mnemonic == "jmp" and edge in self.func_db)
+                        for edge in edges)
                     backward |= any(edge <= insn.address for edge in edges)
                 if not closed or not backward:
                     continue

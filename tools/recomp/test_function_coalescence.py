@@ -684,7 +684,9 @@ def test_static_callback_may_fall_into_an_alias(inner, recovered):
      + bytes.fromhex("40ebf348ebf0")
      + (BASE + 0x8a).to_bytes(4, "little")
      + (BASE + 0x8d).to_bytes(4, "little"), True),  # both table arms loop
-    (bytes.fromhex("85c074fceb7a"), False),  # one edge leaves the gap
+    (bytes.fromhex("85c074fceb7a"), True),  # loop can tail-call a known function
+    (bytes.fromhex("85c074fceb79"), False),  # exit has no known entry
+    (bytes.fromhex("85c0747cebfa"), False),  # conditional exit is not a tail call
     (bytes.fromhex("85c074fc"), False),  # loop with a trap fallthrough
 ])
 def test_immediate_callback_in_gap_is_recovered(code, recovered):
