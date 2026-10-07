@@ -677,10 +677,19 @@ def test_static_callback_may_fall_into_an_alias(inner, recovered):
         assert f"sub_{inner:08X}" in body, body
 
 
-@pytest.mark.parametrize("code, recovered", [(b"\xc3", True), (b"\xcc", False)])
+@pytest.mark.parametrize("code, recovered", [
+    (b"\xc3", True), (b"\xcc", False),
+    (bytes.fromhex("ebfe"), True),  # closed non-returning task loop
+    (bytes.fromhex("83e001ff2485") + (BASE + 0x90).to_bytes(4, "little")
+     + bytes.fromhex("40ebf348ebf0")
+     + (BASE + 0x8a).to_bytes(4, "little")
+     + (BASE + 0x8d).to_bytes(4, "little"), True),  # both table arms loop
+    (bytes.fromhex("85c074fceb7a"), False),  # one edge leaves the gap
+    (bytes.fromhex("85c074fc"), False),  # loop with a trap fallthrough
+])
 def test_immediate_callback_in_gap_is_recovered(code, recovered):
     # `push callback; call eax; ret`: the callback sits in a gap and has no
-    # table. Bytes without a ret before the next start are not a function.
+    # table. A closed task loop is valid; traps and escaping edges are not.
     callback = BASE + 0x80
     following = BASE + 0x100
     pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")

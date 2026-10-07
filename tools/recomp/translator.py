@@ -488,7 +488,39 @@ class FunctionTranslator:
             if not instructions or not (
                     falls_into_alias
                     or any(insn.is_ret for insn in instructions)):
-                continue
+                # Fiber/task callbacks may loop forever. Accept only a closed
+                # bounded CFG: every jump and fallthrough must reach a decoded
+                # instruction, including all arms of an indexed jump table.
+                recovered = self._recover_cfg(
+                    target, next_start, set(), set(), coalescing=True)
+                if not recovered:
+                    continue
+                decoded, tables, _ = recovered
+                starts = {insn.address for insn in decoded}
+                closed = bool(decoded)
+                backward = False
+                for insn in decoded:
+                    if insn.mnemonic in ("int3", "ud2", "hlt", "iret", "iretd"):
+                        closed = False
+                    edges = []
+                    if insn.is_jump:
+                        edges = ([insn.jump_target] if insn.jump_target is not None
+                                 else tables.get(insn.operands[0].mem_disp, [])
+                                 if insn.operands and insn.operands[0].type == "mem"
+                                 else [])
+                        if not edges:
+                            closed = False
+                    if insn.mnemonic != "jmp":
+                        edges = [*edges, insn.end_address]
+                    closed &= all(edge in starts for edge in edges)
+                    backward |= any(edge <= insn.address for edge in edges)
+                if not closed or not backward:
+                    continue
+                instructions = decoded
+                self._recovered_cfg[target] = {
+                    "end": next_start, "instructions": decoded,
+                    "jump_tables": tables,
+                }
 
             self.func_db[target] = {
                 "_addr": target,
