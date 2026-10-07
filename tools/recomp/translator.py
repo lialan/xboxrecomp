@@ -956,7 +956,11 @@ class FunctionTranslator:
                     addr for addr in weak_starts[weak_index:]
                     if addr < upper and addr in cfg_targets
                 }
-                if not owned:
+                # Every path into a hand-written entry must reach it, so an
+                # owner whose CFG branches or falls through to one stays split.
+                falls_into = {insn.end_address for insn in instructions
+                              if not insn.is_terminator}
+                if not owned or (owned | falls_into) & self.protected_function_starts:
                     continue
 
                 self.owned_function_starts.update(owned)
@@ -2982,6 +2986,13 @@ class BatchTranslator:
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
 
+        # A wrapped function's body is sub_X_gen; the hand-written sub_X is
+        # what callers and indirect dispatch must reach, so declare it like
+        # any hand-written function.
+        for addr, func_info in func_list:
+            if func_info.get("wrapper_name"):
+                manual_decls[addr] = func_info["wrapper_name"]
+
         # Any address called but never defined needs a stub, or the link fails.
         # These are almost all mid-function entry points the function detector
         # did not split out: a call lands a few bytes inside (or just past) a
@@ -3198,8 +3209,8 @@ class BatchTranslator:
         # Sorted by address: recomp_lookup binary-searches this array, so an
         # appended entry would silently break every lookup past it.
         dispatch_entries = sorted(
-            list(translations) + [(addr, name, None)
-                                  for addr, name in manual_decls.items()],
+            [entry for entry in translations if entry[0] not in manual_decls]
+            + [(addr, name, None) for addr, name in manual_decls.items()],
             key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
         self._write_dispatch_table(dispatch_entries, dispatch_path, header_name)
