@@ -567,7 +567,7 @@ class FunctionDetector:
             # An immediate alone cannot justify splitting an instruction the
             # sweep already decoded. It may be an integer constant that happens
             # to fall in an as-yet unclaimed code gap. Keep the same prologue
-            # exception as explicit seeds so an out-of-phase sweep can recover.
+            # exceptions for recognized entry shapes to recover a drifted sweep.
             if (self.engine.instruction_covering(target) is not None
                     and not (self.engine.probes_as_prologue(target)
                              or self.engine.probes_as_constant_stub(target)

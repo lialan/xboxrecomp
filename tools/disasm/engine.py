@@ -345,7 +345,8 @@ class DisasmEngine:
         return [self.image.read_u32_at_va(a) or 0
                 for a in range(tbl, end, 4)]
 
-    def decode_at(self, addr: int, max_insns: int = 4096) -> int:
+    def decode_at(self, addr: int, max_insns: int = 4096,
+                  replace_overlaps: bool = False) -> int:
         """
         Decode a stream starting exactly at `addr`, realigning the sweep.
 
@@ -372,7 +373,8 @@ class DisasmEngine:
         valid instruction streams really can share bytes, and the callers that
         matter walk forward by end_address from a known start, so each follows
         its own chain. Evicting the old one would corrupt whichever function
-        was already using it.
+        was already using it. With replace_overlaps, the caller has verified
+        that the old stream is unclaimed, so its overlapping instructions go.
 
         Returns the number of instructions newly decoded.
         """
@@ -388,9 +390,17 @@ class DisasmEngine:
             return 0
 
         added = 0
+        overlaps = set()
         for cs_insn in self._cs.disasm(data[offset:], addr):
             if cs_insn.address != addr and cs_insn.address in self.instructions:
                 break  # resynced with the existing stream
+            if replace_overlaps:
+                overlaps.update(old.address for old in
+                                self.get_instructions_in_range(
+                                    cs_insn.address - 15,
+                                    cs_insn.address + cs_insn.size)
+                                if old.address != cs_insn.address
+                                and old.end_address > cs_insn.address)
             if cs_insn.address not in self.instructions:
                 self.instructions[cs_insn.address] = \
                     self._classify_instruction(cs_insn)
@@ -401,7 +411,9 @@ class DisasmEngine:
             if added >= max_insns:
                 break
 
-        if added:
+        for old_addr in overlaps:
+            del self.instructions[old_addr]
+        if added or overlaps:
             self._sorted_addrs = None
         return added
 
