@@ -129,15 +129,7 @@ class FunctionDetector:
         # Needs the bodies from pass 5 to tell a tail jump from an ordinary
         # intra-function branch, so it runs after and rebuilds. Iterate: a newly
         # found function can itself tail-jump somewhere new.
-        for _round in range(8):
-            before = len(self._candidates)
-            if not self._pass_tail_jump_targets(sections):
-                break
-            print(f"  tail-jump pass {_round}: "
-                  f"+{len(self._candidates) - before} standalone, "
-                  f"{len(self._alias_entries)} aliases")
-            self.functions.clear()
-            self._build_functions(sections)
+        self._close_tail_jump_targets(sections)
 
         # Function addresses taken as an immediate. Runs once, after the
         # bodies exist: the test is whether the target lands in a gap, which
@@ -160,12 +152,27 @@ class FunctionDetector:
         # Seeds that landed inside a function rather than on its start.
         self._pass_seed_aliases()
 
-        self._build_alias_entries()
+        # Late discoveries can introduce new tail chains, including jumps
+        # from table/seed aliases that were absent from the earlier bodies.
+        self._close_tail_jump_targets(sections)
 
         # Populate call graph
         self._build_call_graph()
 
         return len(self.functions)
+
+    def _close_tail_jump_targets(self, sections: List[SectionInfo]) -> None:
+        """Follow tail jumps from every entry until no new entry is found."""
+        while True:
+            self._build_alias_entries()
+            before = len(self._candidates)
+            if not self._pass_tail_jump_targets(sections):
+                return
+            print(f"  tail-jump pass: "
+                  f"+{len(self._candidates) - before} standalone, "
+                  f"{len(self._alias_entries)} aliases")
+            self.functions.clear()
+            self._build_functions(sections)
 
     def _pass_gap_prologues(self, sections: List[SectionInfo]) -> bool:
         """A function that starts right after a ret, with no padding between.
@@ -609,7 +616,8 @@ class FunctionDetector:
             if not insn.is_jump or insn.is_cond_jump:
                 continue
             target = insn.jump_target
-            if target is None or target in self._candidates:
+            if (target is None or target in self._candidates
+                    or target in self._alias_entries):
                 continue
             if target not in self.engine.instructions:
                 continue
