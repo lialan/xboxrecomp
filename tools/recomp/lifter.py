@@ -3733,13 +3733,16 @@ class Lifter:
             dst = self._st_expr(i)
             return [f"{{ double _t = fp_top(); fp_top() = {dst}; {dst} = _t; }}"
                     f" /* fxch {insn.op_str} */"]
-        if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp"):
+        if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp",
+                 "ficom", "ficomp"):
             # Compare st0 against the operand, not always st1. `fcomp [mem]`
             # compares st0 with the memory value; only the no-operand form
             # compares st0 with st1. Getting this wrong made every float compare
             # against a constant read a garbage st1 -- Halo's camera FOV and
             # world_to_view checks both fed on it.
             rhs = self._fcom_rhs(ops)
+            if m.startswith("fi") and ops and ops[0].type == "mem":
+                rhs = f"(double){_smem_accessor(ops[0].mem_size)}({_fmt_mem(ops[0])})"
             # Pop count is in the mnemonic and was being ignored: fcom/fucom pop
             # nothing, fcomp/fucomp pop once, fcompp/fucompp pop twice. Emitting
             # zero pops for every form leaked a stack slot on each fcomp -- and

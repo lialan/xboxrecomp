@@ -22,6 +22,8 @@ CASES = (
     "fcomp_m32_sahf", "fcompp_sahf", "fucompp_sahf", "ftst_sahf",
     # fld/fstp tbyte, as the CRT loads its constants.
     "fld_m80",
+    # ficom/ficomp compare st0 with an integer and ficomp pops.
+    "ficom",
 )
 
 
