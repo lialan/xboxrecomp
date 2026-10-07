@@ -465,6 +465,13 @@ def main():
             for addr in wrap & known:
                 translator.func_db[addr]["name"] = f"sub_{addr:08X}_gen"
                 translator.func_db[addr]["wrapper_name"] = f"sub_{addr:08X}"
+            # The wrapper calls sub_X_gen, so emit that body even when
+            # --category or --max-funcs left it out.
+            listed = {addr for addr, _ in funcs}
+            funcs = funcs + [(addr, translator.func_db[addr])
+                             for addr in sorted(wrap & known)
+                             if addr not in listed
+                             and addr not in translator.translator.owned_function_starts]
 
             # skip - wrap: defined by hand and not wrapped -> declare-only, which
             # is exactly what membership in `manual` produces.

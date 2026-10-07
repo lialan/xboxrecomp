@@ -140,8 +140,8 @@ def test_wrapped_function_body_is_gen_and_calls_reach_wrapper():
 
     info = {"name": "sub_001E9100_gen", "wrapper_name": "sub_001E9100"}
     lifter = Lifter(func_db={TARGET: info})
-    assert "sub_001E9100_gen" not in "\n".join(
-        lifter.lift_instruction(_direct_call()))
+    generated = "\n".join(lifter.lift_instruction(_direct_call()))
+    assert "RECOMP_ABI_CALL(0x001E9100u, sub_001E9100);" in generated
 
     batch = BatchTranslator.__new__(BatchTranslator)
     batch.translator = FakeTranslator({TARGET: info})
