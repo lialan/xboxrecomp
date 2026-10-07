@@ -564,26 +564,21 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
                         "fucomip", "fcomi", "sahf"):
-        # g_fp_cmp is -1 less, 0 equal, 1 greater, 2 unordered. An
-        # unordered compare sets ZF, PF and CF all three, so it reads as
-        # below AND equal AND parity. Comparing g_fp_cmp against 0 made 2 look
-        # "greater": ja/jae went the wrong way on every NaN, and jp/jnp were
-        # constants.
+        # EFLAGS must survive later x87 status changes and AH writes.
+        # FCOMI clears SF/OF; SAHF loads SF from AH and preserves OF.
+        cf, zf, pf = "(_fa & 1u)", "(_fa & 0x40u)", "(_fa & 4u)"
+        sf, of = "((_fa >> 7) & 1u)", "((_fa >> 11) & 1u)"
         fpu_cmp_map = {
-            "ja": "(g_fp_cmp == 1)", "jnbe": "(g_fp_cmp == 1)",
-            "jae": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
-            "jnb": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
-            "jnc": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
-            "jb": "(g_fp_cmp < 0 || g_fp_cmp == 2)",
-            "jnae": "(g_fp_cmp < 0 || g_fp_cmp == 2)",
-            "jc": "(g_fp_cmp < 0 || g_fp_cmp == 2)",
-            "jbe": "(g_fp_cmp != 1)", "jna": "(g_fp_cmp != 1)",
-            "je": "(g_fp_cmp == 0 || g_fp_cmp == 2)",
-            "jz": "(g_fp_cmp == 0 || g_fp_cmp == 2)",
-            "jne": "(g_fp_cmp == -1 || g_fp_cmp == 1)",
-            "jnz": "(g_fp_cmp == -1 || g_fp_cmp == 1)",
-            "jp": "(g_fp_cmp == 2)", "jpe": "(g_fp_cmp == 2)",
-            "jnp": "(g_fp_cmp != 2)", "jpo": "(g_fp_cmp != 2)",
+            "ja": f"(!{cf} && !{zf})", "jnbe": f"(!{cf} && !{zf})",
+            "jae": f"!{cf}", "jnb": f"!{cf}", "jnc": f"!{cf}",
+            "jb": cf, "jnae": cf, "jc": cf,
+            "jbe": f"({cf} || {zf})", "jna": f"({cf} || {zf})",
+            "je": zf, "jz": zf, "jne": f"!{zf}", "jnz": f"!{zf}",
+            "jp": pf, "jpe": pf, "jnp": f"!{pf}", "jpo": f"!{pf}",
+            "js": sf, "jns": f"!{sf}", "jo": of, "jno": f"!{of}",
+            "jl": f"({sf} != {of})", "jge": f"({sf} == {of})",
+            "jle": f"({zf} || {sf} != {of})",
+            "jg": f"(!{zf} && {sf} == {of})",
         }
         expr = fpu_cmp_map.get(jcc)
         if expr:
@@ -636,6 +631,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return u, desc
         if jcc in ("jnp", "jpo"):
             return f"!{u}", desc
+        if jcc in ("js", "jo", "jl"):
+            return "0", desc
+        if jcc in ("jns", "jno", "jge"):
+            return "1", desc
+        if jcc == "jle":
+            return f"({a} == {b} || {u})", desc
+        if jcc == "jg":
+            return f"({a} != {b} && !{u})", desc
         return None
 
     # SF is the sign bit of the result at the OPERAND's width, not at 32 bits.
@@ -1568,7 +1571,10 @@ class Lifter:
         if m == "lahf":
             return ["/* lahf - load AH from flags (used in FPU compare idiom) */"]
         if m == "sahf":
-            return ["/* sahf - store AH to flags */"]
+            out = ["_fa = ((eax >> 8) & 0xD5u) | (_fb << 11); /* sahf */"]
+            if self.needs_cf:
+                out.append("_cf = _fa & 1u;")
+            return out
         if m == "shld":
             return self._lift_shld(insn, ops)
         if m == "shrd":
@@ -3740,8 +3746,11 @@ class Lifter:
             pops = m.endswith("pi") or m.endswith("ip")
             pop_code = " fp_pop();" if pops else ""
             rhs = self._fcom_rhs(ops)
-            return [f"g_fp_cmp = RECOMP_FCMP(fp_top(), {rhs});"
-                    f"{pop_code} /* {m} */"]
+            out = [f"_fa = RECOMP_FCMP_CC(RECOMP_FCMP(fp_top(), {rhs})) >> 8;"
+                   f"{pop_code} /* {m} */"]
+            if self.needs_cf:
+                out.append("_cf = _fa & 1u;")
+            return out
         if m == "fnstsw":
             # `fnstsw ax` after an FPU compare is half of the pre-SSE float
             # branch idiom `fcomp; fnstsw ax; test ah, mask; j(p/np/z/nz)`.
@@ -3914,7 +3923,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
         if (curr.mnemonic in ("sete", "setne", "setb", "setae", "setbe",
                               "seta", "setl", "setge", "setle", "setg",
-                              "sets", "setns")
+                              "sets", "setns", "setp", "setnp", "seto", "setno")
                 and last_flag_setter and len(curr.operands) >= 1):
             cond = _make_setcc_value(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
@@ -3928,7 +3937,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
         if (curr.mnemonic in ("cmove", "cmovne", "cmovb", "cmovae",
                               "cmovbe", "cmova", "cmovl", "cmovge",
-                              "cmovle", "cmovg", "cmovs", "cmovns")
+                              "cmovle", "cmovg", "cmovs", "cmovns",
+                              "cmovp", "cmovnp", "cmovo", "cmovno")
                 and last_flag_setter and len(curr.operands) >= 2):
             cond = _make_cmovcc_cond(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
@@ -3940,6 +3950,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
                     + f" /* {curr.mnemonic} */")
                 i += 1
                 continue
+
+        if curr.mnemonic == "sahf":
+            overflow = (_make_condition("jo", last_flag_setter, last_flag_ops)
+                        if last_flag_setter else None)
+            stmts.append(f"_fb = ({overflow[0] if overflow else '0'}) != 0; /* SAHF preserves OF */")
 
         # NEG sets CF when its operand is nonzero. Preserve that value when
         # a later SBB/ADC consumes it, skipping over EFLAGS-preserving

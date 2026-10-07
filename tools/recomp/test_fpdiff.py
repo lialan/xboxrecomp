@@ -17,6 +17,9 @@ CASES = (
     "fxch_st", "fcom_m32_t", "fcomp_st1_t", "seq_fs", "seq_fl", "seq_mov",
     "seq_and", "seq_two", "seq_sahf", "seq_wait",
     "mulps_", "addps_", "shufps_", "paddw_", "psraw_", "pextrw_",
+    # EFLAGS from sahf, fcomi and comiss, read by every jcc/setcc/cmovcc.
+    "fcomp_m32_t", "fcomi", "fucomi", "comiss", "ucomiss", "fcom_st1_sahf",
+    "fcomp_m32_sahf", "fcompp_sahf", "fucompp_sahf", "ftst_sahf",
 )
 
 
