@@ -629,7 +629,7 @@ class FunctionDetector:
             for sec in sections])
         added = False
 
-        for insn in self.engine.instructions.values():
+        for insn in list(self.engine.instructions.values()):
             if insn.address not in reachable:
                 continue
             if not insn.is_jump or insn.is_cond_jump:
@@ -637,8 +637,6 @@ class FunctionDetector:
             target = insn.jump_target
             if (target is None or target in self._candidates
                     or target in self._alias_entries):
-                continue
-            if target not in self.engine.instructions:
                 continue
 
             # The jump is a tail jump only if it leaves its own function.
@@ -663,10 +661,20 @@ class FunctionDetector:
             # an alias entry instead: same end address, translated separately.
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bodies[j][0] < target < bodies[j][1]:
+                if target not in self.engine.instructions:
+                    continue
                 if target not in self._alias_entries:
                     self._alias_entries[target] = bodies[j][1]
                     added = True
                 continue
+
+            # A reachable tail is strong evidence, but only unclaimed bytes
+            # may replace a drifted sweep. Never realign inside another body.
+            if target not in self.engine.instructions:
+                if not self.engine.probes_as_function_body(target):
+                    continue
+                if not self.engine.decode_at(target, replace_overlaps=True):
+                    continue
 
             self._add_candidate(target, config.CONFIDENCE_TAIL_JUMP,
                                 "tail_jump_target")
