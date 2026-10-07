@@ -779,6 +779,7 @@ class FunctionDetector:
         for entry, alias_end in self._alias_entries.items():
             tails.update(self.engine.recursive_descent(
                 [entry], [(entry, alias_end)]))
+        claimed = set()
         found = 0
         for target in sorted(targets):
             if target in self.functions or target in self._alias_entries:
@@ -786,9 +787,10 @@ class FunctionDetector:
             # A borrowed alias extent is not an entry boundary. Table words
             # can name valid instruction suffixes inside an already-reachable
             # callback; only disconnected bodies remain weak entry candidates.
-            if target in tails:
+            if target in claimed:
                 continue
             j = bisect.bisect_right(starts, target) - 1
+            in_gap = not (j >= 0 and bounds[j][0] < target < bounds[j][1])
             if j >= 0 and bounds[j][0] < target < bounds[j][1]:
                 # Inside a function, so the bytes are known to be code and the
                 # only real question is whether the address is an instruction
@@ -836,7 +838,10 @@ class FunctionDetector:
             if end <= target:
                 continue
             self._alias_entries[target] = end
-            tails.update(self.engine.recursive_descent([target], [(target, end)]))
+            reachable = self.engine.recursive_descent([target], [(target, end)])
+            tails.update(reachable)
+            if in_gap:
+                claimed.update(reachable)
             found += 1
 
         if found:
