@@ -481,10 +481,29 @@ class FunctionTranslator:
             next_start = original_starts[next_index]
             next_func = self.func_db[next_start]
             owner_index = bisect.bisect_right(owner_starts, target)
+            overlapping_owner = None
             if owner_index:
                 owner = self.func_db[owner_starts[owner_index - 1]]
                 if owner.get("end", owner["_addr"]) > target:
-                    continue
+                    # Linear decoding can run through a trailing switch table
+                    # into a separate callback. Only trim that overlap after
+                    # proving the owner's table-aware CFG ends before it.
+                    recovered_owner = self._recover_cfg(
+                        owner["_addr"], owner["end"], set(), set(), coalescing=True)
+                    if not recovered_owner:
+                        continue
+                    owned, tables, _ = recovered_owner
+                    if (not owned or not tables
+                            or any(insn.end_address > target for insn in owned)
+                            or any(table + len(arms) * 4 > target
+                                   for table, arms in tables.items())
+                            or any(insn.is_jump and insn.jump_target is None
+                                   and (not insn.operands
+                                        or insn.operands[0].type != "mem"
+                                        or insn.operands[0].mem_disp not in tables)
+                                   for insn in owned)):
+                        continue
+                    overlapping_owner = owner, owned, tables
             section = next_func.get("section", "")
             if section in (".rdata", ".data"):
                 continue
@@ -542,6 +561,13 @@ class FunctionTranslator:
                     "jump_tables": tables,
                 }
 
+            if overlapping_owner is not None:
+                owner, owned, tables = overlapping_owner
+                owner["end"] = target
+                owner["size"] = target - owner["_addr"]
+                self._recovered_cfg[owner["_addr"]] = {
+                    "end": target, "instructions": owned, "jump_tables": tables,
+                }
             self.func_db[target] = {
                 "_addr": target,
                 "start": f"0x{target:08X}",

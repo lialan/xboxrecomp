@@ -1342,3 +1342,29 @@ def test_recovered_callback_recovers_gap_callee(opcode):
     assert callback in subject.func_db
     assert callee in subject.func_db
     assert subject.func_db[callee]["called_by"] == [callback]
+
+
+@pytest.mark.parametrize("reachable", [False, True])
+def test_callback_after_switch_table_is_not_owned_by_linear_extent(reachable):
+    owner, callback, following = BASE + 0x40, BASE + 0x80, BASE + 0x100
+    registration = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(registration)] = registration
+    body = bytes.fromhex("31c0ff2485") + (BASE + 0x60).to_bytes(4, "little")
+    raw[0x40:0x40 + len(body)] = body
+    raw[0x50] = raw[0x51] = raw[0x80] = raw[0x100] = 0xc3
+    raw[0x60:0x64] = (callback if reachable else BASE + 0x50).to_bytes(4, "little")
+    raw[0x64:0x68] = (BASE + 0x51).to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(registration)),
+        owner: function(owner, callback + 1),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert (callback in subject.func_db) is not reachable
+    assert subject.func_db[owner]["end"] == (callback + 1 if reachable else callback)
+    if not reachable:
+        body = subject.translate_function(owner, subject.func_db[owner])
+        assert f"loc_{callback:08X}" not in body
