@@ -968,6 +968,33 @@ def test_callback_conditional_tail_target_is_a_dependency():
     assert subject.func_db[callee]["called_by"] == [callback]
 
 
+def test_callback_dependency_in_a_data_section_is_rejected(monkeypatch):
+    # .data1 is data even though its name is not .rdata or .data.
+    callback, stray, following = BASE + 0x80, BASE + 0x200, BASE + 0x100
+    table = BASE + 0x300
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", BASE, 0x200, 0, 0x200, True),
+        config.Section(".data1", stray, 0x200, 0x200, 0x200, False),
+    ])
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x86] = b"\xe9" + (stray - callback - 5).to_bytes(4, "little") + b"\xc3"
+    raw[0x100] = raw[0x200] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert stray not in subject.func_db
+
+
 @pytest.mark.parametrize("coalescing", [False, True])
 def test_callback_call_to_a_known_function_is_entry_evidence(coalescing):
     # A recovered callback calls an existing function directly. The callback

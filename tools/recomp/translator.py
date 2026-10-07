@@ -569,7 +569,7 @@ class FunctionTranslator:
                         continue
                     overlapping_owner = owner, owned, tables
             section = home.name
-            if section in (".rdata", ".data"):
+            if not home.is_code:
                 continue
 
             raw_bytes = self._read_func_bytes(target, bound)
