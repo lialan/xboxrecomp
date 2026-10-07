@@ -431,12 +431,15 @@ class FunctionTranslator:
                     continue
                 instructions = self.disasm.disassemble_function(
                     raw_bytes, caller, end)
-            if (caller in self.recovered_function_starts
-                    and not (recovered and recovered.get("instructions"))):
-                # A callback accepted for its linear ret decodes on past it;
-                # only the code it reaches names tables, callees and constants.
-                instructions = (self._recover_cfg(
+            # Linear decoding runs on through inline data and past exits;
+            # only reachable code names constants, and a callback accepted for
+            # its linear ret also takes its tables and callees from it.
+            reachable = instructions
+            if not (recovered and recovered.get("instructions")):
+                reachable = (self._recover_cfg(
                     caller, end, set(), set(), coalescing=True) or [[]])[0]
+            if caller in self.recovered_function_starts:
+                instructions = reachable
             for lower, upper in self._find_static_indirect_ranges(instructions):
                 targets = self._read_static_callback_table(
                     lower, upper, original_starts)
@@ -460,14 +463,15 @@ class FunctionTranslator:
                     strong.add(target)
             if caller in self.recovered_function_starts:
                 for insn in instructions:
-                    target = insn.call_target if insn.is_call else (
-                        insn.jump_target if insn.mnemonic == "jmp" else None)
-                    if target is None:
+                    # The lifter emits a jmp or jcc that leaves the body as a
+                    # tail call. A branch inside it is not entry evidence.
+                    target = insn.call_target if insn.is_call else insn.jump_target
+                    if target is None or (
+                            not insn.is_call and caller <= target < end):
                         continue
                     if target in self.func_db:
                         # A recovered callback is new to the function list,
                         # so its decoded edges are not in called_by yet.
-                        # A branch inside its own body is not entry evidence.
                         if not caller <= target < end:
                             self._add_caller(target, caller)
                         continue
@@ -478,7 +482,7 @@ class FunctionTranslator:
             # flags look the same, so the checks below hold an immediate to its
             # own section, keep it out of every existing range, and require
             # its reachable code to close.
-            for insn in instructions:
+            for insn in reachable:
                 operands = insn.operands
                 if insn.mnemonic == "push" and operands:
                     source = operands[0]

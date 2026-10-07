@@ -738,6 +738,23 @@ def test_immediate_inside_another_range_is_not_a_callback(cover):
     assert constant not in subject.func_db
 
 
+def test_unreachable_immediate_is_not_a_callback():
+    # The push decodes after the caller's ret, so it never runs.
+    callback, following = BASE + 0x80, BASE + 0x100
+    pattern = b"\xc3\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x80] = raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback not in subject.func_db
+
+
 def test_immediate_inside_a_callback_found_in_the_same_pass_is_rejected():
     # A table names the callback; a constant points at its second
     # instruction. Both are candidates in one pass, so original_starts cannot
@@ -923,6 +940,32 @@ def test_dependencies_come_only_from_reachable_callback_code():
     subject.discover_static_indirect_targets()
     assert callback in subject.func_db
     assert stray not in subject.func_db
+
+
+def test_callback_conditional_tail_target_is_a_dependency():
+    # The lifter emits a jcc that leaves the body as a tail call, so its
+    # target needs a body just like a jmp target.
+    callback, callee, following = BASE + 0x80, BASE + 0x40, BASE + 0x100
+    table = BASE + 0x300
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x89] = (bytes.fromhex("85c00f84")
+                      + (callee - callback - 8).to_bytes(4, "little", signed=True)
+                      + b"\xc3")
+    raw[0x40] = raw[0x100] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert subject.func_db[callee]["called_by"] == [callback]
 
 
 @pytest.mark.parametrize("coalescing", [False, True])
