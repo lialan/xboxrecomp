@@ -484,6 +484,13 @@ def test_default_ownership_does_not_follow_base_only_tables():
     assert subject.owned_function_starts == {BASE + 0x30}
 
 
+def test_ownership_keeps_protected_entries_standalone():
+    subject = ownership_subject()
+    subject.protected_function_starts.add(BASE + 0x30)
+    subject.discover_cfg_ownership()
+    assert not subject.owned_function_starts
+
+
 def test_explicit_coalesced_owner_stays_strong_during_ownership():
     subject = ownership_subject()
     owner = BASE + 0x30
