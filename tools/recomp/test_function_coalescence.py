@@ -689,17 +689,71 @@ def test_static_callback_may_fall_into_an_alias(inner, recovered):
     (bytes.fromhex("85c0747cebfa"), False),  # conditional exit is not a tail call
     (bytes.fromhex("85c074fc"), False),  # loop with a trap fallthrough
     (bytes.fromhex("85c074fce877000000"), True),  # loop, then no-return call
+    (bytes.fromhex("85c07402ebfac3"), True),  # loop that leaves through a ret
+    (bytes.fromhex("ffe0"), True),  # tail call through a register
+    (bytes.fromhex("ccc3"), False),  # a ret is decodable but not reachable
 ])
 def test_immediate_callback_in_gap_is_recovered(code, recovered):
     # `push callback; call eax; ret`: the callback sits in a gap and has no
-    # table. A closed task loop is valid; traps and escaping edges are not.
+    # table. A closed CFG that returns or loops is valid; traps and escaping
+    # edges are not, even when a ret decodes after them.
     callback = BASE + 0x80
     following = BASE + 0x100
     pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
     raw = bytearray(b"\xcc" * 0x200)
     raw[:len(pattern)] = pattern
     raw[0x80:0x80 + len(code)] = code
+    raw[0x100:0x102] = bytes.fromhex("ebfe")  # never returns, like ExitThread
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 2),
+    })
+    subject.discover_static_indirect_targets()
+    assert (callback in subject.func_db) is recovered
+    if recovered:
+        assert subject.func_db[callback]["called_by"] == [BASE]
+
+
+@pytest.mark.parametrize("cover", ["tail_jump_alias", "prologue"])
+def test_immediate_inside_another_range_is_not_a_callback(cover):
+    # A constant that lands in an alias's code decodes into its ret, but only
+    # a callback table may claim bytes inside an alias's range. A real owner
+    # keeps them unless its own CFG and tables provably end first.
+    alias, constant, following = BASE + 0x40, BASE + 0x42, BASE + 0x100
+    pattern = b"\x68" + constant.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x40:0x44] = bytes.fromhex("9090c3c3")
     raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        alias: {**function(alias, alias + 4), "detection_method": cover},
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert constant not in subject.func_db
+
+
+def test_immediate_inside_a_callback_found_in_the_same_pass_is_rejected():
+    # A table names the callback; a constant points at its second
+    # instruction. Both are candidates in one pass, so original_starts cannot
+    # show that the callback already owns those bytes.
+    callback, following = BASE + 0x80, BASE + 0x100
+    constant = callback + 1
+    table = BASE + 0x300
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0")
+               + b"\x68" + constant.to_bytes(4, "little") + b"\xc3")
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x83] = bytes.fromhex("9090c3")
+    raw[0x100] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
     subject = translator(bytes(raw), [])
     subject.func_db.clear()
     subject.func_db.update({
@@ -707,9 +761,8 @@ def test_immediate_callback_in_gap_is_recovered(code, recovered):
         following: function(following, following + 1),
     })
     subject.discover_static_indirect_targets()
-    assert (callback in subject.func_db) is recovered
-    if recovered:
-        assert subject.func_db[callback]["called_by"] == [BASE]
+    assert callback in subject.func_db
+    assert constant not in subject.func_db
 
 
 def test_jump_table_case_can_recover_register_continuation():

@@ -413,6 +413,9 @@ class FunctionTranslator:
             start for start in original_starts
             if self.func_db[start].get("detection_method") != "tail_jump_alias"]
         recovered_callers = {}
+        # Targets named by a callback table or a direct branch. Everything
+        # else came only from an immediate, which may be a plain constant.
+        strong = set()
 
         for caller, func_info in list(self.func_db.items()):
             if callers is not None and caller not in callers:
@@ -454,15 +457,19 @@ class FunctionTranslator:
                                     f"Static callback 0x{target:08X} lies inside "
                                     f"coalesced function 0x{owner:08X}")
                     recovered_callers.setdefault(target, set()).add(caller)
+                    strong.add(target)
             # A callback can also be passed or stored as an immediate:
-            # DOA3 registers 0x0016C0B0 with `push imm; call eax`. The gap and
-            # decode checks below reject immediates that are not code.
+            # DOA3 registers 0x0016C0B0 with `push imm; call eax`. Sizes and
+            # flags look the same, so the checks below hold an immediate to its
+            # own section, keep it out of every existing range, and require
+            # its reachable code to close.
             for insn in instructions:
                 if caller in self.recovered_function_starts:
                     target = insn.call_target if insn.is_call else (
                         insn.jump_target if insn.mnemonic == "jmp" else None)
                     if target is not None and target not in self.func_db:
                         recovered_callers.setdefault(target, set()).add(caller)
+                        strong.add(target)
                 operands = insn.operands
                 if insn.mnemonic == "push" and operands:
                     source = operands[0]
@@ -474,17 +481,38 @@ class FunctionTranslator:
                 if source.type == "imm" and source.imm not in self.func_db:
                     recovered_callers.setdefault(source.imm, set()).add(caller)
 
+        # End of the code claimed by entries accepted earlier in this pass;
+        # original_starts does not list them yet.
+        claimed_end = 0
         for target, callers in sorted(recovered_callers.items()):
             next_index = bisect.bisect_right(original_starts, target)
             if next_index == 0 or next_index >= len(original_starts):
                 continue
             next_start = original_starts[next_index]
             next_func = self.func_db[next_start]
+            weak = target not in strong
+            if weak:
+                if target < claimed_end or not is_code_address(target):
+                    continue
+                # An alias's range runs on to the next start, past its own
+                # code. A constant inside the code the alias reaches is part
+                # of that body; past it, the bytes can be a separate function.
+                previous = self.func_db[original_starts[next_index - 1]]
+                if (previous.get("detection_method") == "tail_jump_alias"
+                        and previous.get("end", previous["_addr"]) > target):
+                    body = self._recover_cfg(
+                        previous["_addr"], previous["end"], set(), set(),
+                        coalescing=True)
+                    if not body or any(insn.address <= target < insn.end_address
+                                       for insn in body[0]):
+                        continue
             owner_index = bisect.bisect_right(owner_starts, target)
             overlapping_owner = None
             if owner_index:
                 owner = self.func_db[owner_starts[owner_index - 1]]
                 if owner.get("end", owner["_addr"]) > target:
+                    if owner["_addr"] in self.coalesced_function_starts:
+                        continue
                     # Linear decoding can run through a trailing switch table
                     # into a separate callback. Only trim that overlap after
                     # proving the owner's table-aware CFG ends before it.
@@ -521,12 +549,17 @@ class FunctionTranslator:
                 next_func.get("detection_method") == "tail_jump_alias"
                 and instructions[-1].address + instructions[-1].size
                 == next_start)
-            if not instructions or not (
+            # A linear decode can reach a ret through data, so an immediate
+            # must also pass the reachable-CFG check.
+            if weak or not instructions or not (
                     falls_into_alias
                     or any(insn.is_ret for insn in instructions)):
                 # Fiber/task callbacks may loop forever. Accept only a closed
-                # bounded CFG: every edge must reach a decoded instruction or
-                # tail-call an existing function, including indexed table arms.
+                # bounded CFG that exits or loops: every edge must reach a
+                # decoded instruction, including indexed table arms. A jmp may
+                # leave as a tail call to an existing function, to code past
+                # this range (the next pass recovers it as a dependency), or
+                # through a register or plain memory pointer.
                 recovered = self._recover_cfg(
                     target, next_start, set(), set(), coalescing=True)
                 if not recovered:
@@ -537,11 +570,25 @@ class FunctionTranslator:
                 call_ends = {insn.end_address for insn in decoded if insn.is_call}
                 closed = bool(decoded)
                 backward = False
+                exits = False
                 for insn in decoded:
                     if insn.mnemonic == "int3" and insn.address in call_ends:
+                        exits = True
+                        continue
+                    if insn.is_ret:
+                        exits = True
                         continue
                     if insn.mnemonic in ("int3", "ud2", "hlt", "iret", "iretd"):
                         closed = False
+                    operand = insn.operands[0] if insn.operands else None
+                    if (insn.mnemonic == "jmp" and insn.jump_target is None
+                            and operand is not None
+                            and (operand.type == "reg"
+                                 or (operand.type == "mem"
+                                     and not operand.mem_index
+                                     and operand.mem_disp not in tables))):
+                        exits = True
+                        continue
                     edges = []
                     if insn.is_jump or insn.jump_target is not None:
                         edges = ([insn.jump_target] if insn.jump_target is not None
@@ -552,12 +599,18 @@ class FunctionTranslator:
                             closed = False
                     if insn.mnemonic != "jmp":
                         edges = [*edges, insn.end_address]
-                    closed &= all(
-                        edge in starts or (
-                            insn.mnemonic == "jmp" and edge in self.func_db)
-                        for edge in edges)
+                    for edge in edges:
+                        if edge in starts:
+                            continue
+                        if insn.mnemonic == "jmp" and (
+                                edge in self.func_db
+                                or (not target <= edge < next_start
+                                    and is_code_address(edge))):
+                            exits = True
+                            continue
+                        closed = False
                     backward |= any(edge <= insn.address for edge in edges)
-                if not closed or not backward:
+                if not closed or not (backward or exits):
                     continue
                 instructions = decoded
                 self._recovered_cfg[target] = {
@@ -569,6 +622,7 @@ class FunctionTranslator:
                 owner, owned, tables = overlapping_owner
                 owner["end"] = target
                 owner["size"] = target - owner["_addr"]
+                owner["num_instructions"] = len(owned)
                 self._recovered_cfg[owner["_addr"]] = {
                     "end": target, "instructions": owned, "jump_tables": tables,
                 }
@@ -587,6 +641,8 @@ class FunctionTranslator:
                 "called_by": sorted(callers),
             }
             self.recovered_function_starts.add(target)
+            claimed_end = max(claimed_end,
+                              max(insn.end_address for insn in instructions))
 
         return self.recovered_function_starts
 
