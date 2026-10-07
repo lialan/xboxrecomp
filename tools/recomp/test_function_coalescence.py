@@ -686,7 +686,9 @@ def test_static_callback_may_fall_into_an_alias(inner, recovered):
      + (BASE + 0x8d).to_bytes(4, "little"), True),  # both table arms loop
     (bytes.fromhex("85c074fceb7a"), True),  # loop can tail-call a known function
     (bytes.fromhex("85c074fceb79"), False),  # exit has no known entry
-    (bytes.fromhex("85c0747cebfa"), False),  # conditional exit is not a tail call
+    (bytes.fromhex("85c0747cebfa"), True),  # conditional tail call to a known function
+    (bytes.fromhex("85c0747bebfa"), False),  # conditional exit has no known entry
+    (bytes.fromhex("85c0747c"), False),  # conditional tail call, trap fallthrough
     (bytes.fromhex("85c074fc"), False),  # loop with a trap fallthrough
     (bytes.fromhex("85c074fce877000000"), True),  # loop, then no-return call
     (bytes.fromhex("85c07402ebfac3"), True),  # loop that leaves through a ret

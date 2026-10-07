@@ -592,10 +592,11 @@ class FunctionTranslator:
                     or any(insn.is_ret for insn in instructions)):
                 # Fiber/task callbacks may loop forever. Accept only a closed
                 # bounded CFG that exits or loops: every edge must reach a
-                # decoded instruction, including indexed table arms. A jmp may
-                # leave as a tail call to an existing function, to code past
-                # this range (the next pass recovers it as a dependency), or
-                # through a register or plain memory pointer.
+                # decoded instruction, including indexed table arms. A jmp, or
+                # the taken edge of a jcc, may leave as a tail call to an
+                # existing function or to code past this range (the next pass
+                # recovers it as a dependency); a jmp may also leave through a
+                # register or plain memory pointer.
                 recovered = self._recover_cfg(
                     target, bound, set(), set(), coalescing=True)
                 if not recovered:
@@ -632,7 +633,7 @@ class FunctionTranslator:
                     for edge in edges:
                         if edge in starts:
                             continue
-                        if insn.mnemonic == "jmp" and (
+                        if (insn.mnemonic == "jmp" or edge == insn.jump_target) and (
                                 edge in self.func_db
                                 or (not target <= edge < bound
                                     and is_code_address(edge))):
