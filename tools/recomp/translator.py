@@ -465,7 +465,10 @@ class FunctionTranslator:
                     if target is None:
                         continue
                     if target in self.func_db:
-                        if coalescing:
+                        # A recovered callback is new to the function list,
+                        # so its decoded edges are not in called_by yet.
+                        # A branch inside its own body is not entry evidence.
+                        if not caller <= target < end:
                             self._add_caller(target, caller)
                         continue
                     recovered_callers.setdefault(target, set()).add(caller)
@@ -492,10 +495,12 @@ class FunctionTranslator:
         claimed_end = 0
         for target, callers in sorted(recovered_callers.items()):
             next_index = bisect.bisect_right(original_starts, target)
-            if next_index == 0 or next_index >= len(original_starts):
+            if next_index == 0:
                 continue
-            next_start = original_starts[next_index]
-            next_func = self.func_db[next_start]
+            # Past the last start, the section end alone bounds the candidate.
+            next_start = (original_starts[next_index]
+                          if next_index < len(original_starts) else None)
+            next_func = self.func_db[next_start] if next_start is not None else {}
             # Decode no further than the target's own section: the next start
             # can sit in another section, and the bytes between are not
             # contiguous in the file.
@@ -503,7 +508,9 @@ class FunctionTranslator:
                          if s.va <= target < s.va + s.va_size), None)
             if home is None:
                 continue
-            bound = min(next_start, home.va + min(home.va_size, home.raw_size))
+            bound = home.va + min(home.va_size, home.raw_size)
+            if next_start is not None:
+                bound = min(bound, next_start)
             if bound <= target:
                 continue
             weak = target not in strong
@@ -663,11 +670,11 @@ class FunctionTranslator:
             # Claim only what the callback reaches: a linear decode accepted
             # for its ret runs on to the bound.
             claimed = instructions
+            tables = (self._recovered_cfg.get(target) or {}).get("jump_tables", {})
             if target not in self._recovered_cfg:
                 reach = self._recover_cfg(target, bound, set(), set(), coalescing=True)
                 if reach and reach[0]:
-                    claimed = reach[0]
-            tables = (self._recovered_cfg.get(target) or {}).get("jump_tables", {})
+                    claimed, tables = reach[0], reach[1]
             storage = [self._table_storage(table, arms) for table, arms in tables.items()]
             claimed_end = max(
                 claimed_end, *(insn.end_address for insn in claimed),

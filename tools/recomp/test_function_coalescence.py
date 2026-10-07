@@ -925,9 +925,11 @@ def test_dependencies_come_only_from_reachable_callback_code():
     assert stray not in subject.func_db
 
 
-def test_callback_call_to_a_known_function_is_entry_evidence():
-    # A recovered callback calls an existing function directly. During
-    # coalescence that call is evidence, as a callback table entry is.
+@pytest.mark.parametrize("coalescing", [False, True])
+def test_callback_call_to_a_known_function_is_entry_evidence(coalescing):
+    # A recovered callback calls an existing function directly. The callback
+    # is new to the function list, so that call is caller evidence the
+    # ownership pass and coalescence would otherwise lack.
     callback, known, following = BASE + 0x80, BASE + 0x40, BASE + 0x100
     pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
     raw = bytearray(b"\xcc" * 0x200)
@@ -941,9 +943,54 @@ def test_callback_call_to_a_known_function_is_entry_evidence():
         known: function(known, known + 1),
         following: function(following, following + 1),
     })
-    subject.discover_static_indirect_targets(coalescing=True)
+    subject.discover_static_indirect_targets(coalescing=coalescing)
     assert callback in subject.func_db
     assert f"0x{callback:08X}" in subject.func_db[known]["called_by"]
+
+
+def test_immediate_callback_after_the_last_start_is_bounded_by_its_section():
+    callback = BASE + 0x80
+    pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db[BASE] = function(BASE, BASE + len(pattern))
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert subject.func_db[callback]["end"] == BASE + 0x400
+
+
+def test_linear_callback_claims_its_embedded_table():
+    # A table callback is accepted for its linear ret, so it has no saved
+    # CFG. Its embedded switch table must still be claimed: the table bytes
+    # decode to a closed run ending in ret, and a constant points at them.
+    callback, table, following = BASE + 0x80, BASE + 0xa0, BASE + 0x100
+    walk = BASE + 0x300
+    pattern = (b"\xbe" + walk.to_bytes(4, "little")
+               + b"\xbf" + (walk + 4).to_bytes(4, "little")
+               + bytes.fromhex("39fe")
+               + b"\x68" + table.to_bytes(4, "little") + bytes.fromhex("ffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x8b] = (bytes.fromhex("83e001ff2485") + table.to_bytes(4, "little")
+                      + b"\xc3")
+    raw[0x8b] = 0xC3
+    raw[0xa0:0xa8] = ((BASE + 0x8a).to_bytes(4, "little")
+                      + (BASE + 0x8b).to_bytes(4, "little"))
+    raw[0xa8] = raw[0x100] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert callback not in subject._recovered_cfg
+    assert table not in subject.func_db
 
 
 def _table_callback_subject(callback_code, extra=()):
