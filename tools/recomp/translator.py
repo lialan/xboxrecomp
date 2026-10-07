@@ -442,6 +442,20 @@ class FunctionTranslator:
                                     f"Static callback 0x{target:08X} lies inside "
                                     f"coalesced function 0x{owner:08X}")
                     recovered_callers.setdefault(target, set()).add(caller)
+            # A callback can also be passed or stored as an immediate:
+            # DOA3 registers 0x0016C0B0 with `push imm; call eax`. The gap and
+            # decode checks below reject immediates that are not code.
+            for insn in instructions:
+                operands = insn.operands
+                if insn.mnemonic == "push" and operands:
+                    source = operands[0]
+                elif (insn.mnemonic == "mov" and len(operands) >= 2
+                        and operands[0].type == "mem"):
+                    source = operands[1]
+                else:
+                    continue
+                if source.type == "imm" and source.imm not in self.func_db:
+                    recovered_callers.setdefault(source.imm, set()).add(caller)
 
         for target, callers in sorted(recovered_callers.items()):
             next_index = bisect.bisect_right(original_starts, target)

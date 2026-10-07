@@ -677,6 +677,29 @@ def test_static_callback_may_fall_into_an_alias(inner, recovered):
         assert f"sub_{inner:08X}" in body, body
 
 
+@pytest.mark.parametrize("code, recovered", [(b"\xc3", True), (b"\xcc", False)])
+def test_immediate_callback_in_gap_is_recovered(code, recovered):
+    # `push callback; call eax; ret`: the callback sits in a gap and has no
+    # table. Bytes without a ret before the next start are not a function.
+    callback = BASE + 0x80
+    following = BASE + 0x100
+    pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x80 + len(code)] = code
+    raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert (callback in subject.func_db) is recovered
+    if recovered:
+        assert subject.func_db[callback]["called_by"] == [BASE]
+
+
 def test_jump_table_case_can_recover_register_continuation():
     case = BASE + 7
     continuation = case + 7
