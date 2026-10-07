@@ -970,6 +970,29 @@ def test_callback_conditional_tail_target_is_a_dependency():
     assert subject.func_db[callee]["called_by"] == [callback]
 
 
+def test_callback_dependency_before_the_first_start_is_recovered():
+    callee, register, callback, following = (
+        BASE, BASE + 0x20, BASE + 0x80, BASE + 0x100)
+    table = BASE + 0x300
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[0x20:0x20 + len(pattern)] = pattern
+    raw[0x80:0x86] = b"\xe8" + (callee - callback - 5).to_bytes(4, "little", signed=True) + b"\xc3"
+    raw[0] = raw[0x100] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        register: function(register, register + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert subject.func_db[callee]["called_by"] == [callback]
+
+
 def test_callback_dependency_in_a_data_section_is_rejected(monkeypatch):
     # .data1 is data even though its name is not .rdata or .data.
     callback, stray, following = BASE + 0x80, BASE + 0x200, BASE + 0x100

@@ -499,7 +499,8 @@ class FunctionTranslator:
         claimed_end = 0
         for target, callers in sorted(recovered_callers.items()):
             next_index = bisect.bisect_right(original_starts, target)
-            if next_index == 0:
+            # Before the first start, only a table or branch names code.
+            if next_index == 0 and target not in strong:
                 continue
             # Past the last start, the section end alone bounds the candidate.
             next_start = (original_starts[next_index]
