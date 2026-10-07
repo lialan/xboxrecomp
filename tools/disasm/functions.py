@@ -610,9 +610,19 @@ class FunctionDetector:
         """
         bodies = sorted((f.start, f.end) for f in self.functions.values())
         starts = [b[0] for b in bodies]
+        # Measured ranges can include padding and inline data. Only follow
+        # branches reachable from an entry or a decoded switch-table arm.
+        entries = list(self.functions)
+        for table in self.engine.jump_tables:
+            entries.extend(self.engine.jump_table_entries(table))
+        reachable = self.engine.recursive_descent(entries, [
+            (sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+            for sec in sections])
         added = False
 
         for insn in self.engine.instructions.values():
+            if insn.address not in reachable:
+                continue
             if not insn.is_jump or insn.is_cond_jump:
                 continue
             target = insn.jump_target
@@ -653,7 +663,7 @@ class FunctionDetector:
                                 "tail_jump_target")
             added = True
 
-        added = self._pass_cond_branch_orphans(bodies, starts) or added
+        added = self._pass_cond_branch_orphans(bodies, starts, reachable) or added
         return added
 
     def _pass_data_ptr_targets(self, sections: List[SectionInfo]) -> bool:
@@ -787,7 +797,7 @@ class FunctionDetector:
             print(f"  {found} function address(es) found in data tables")
         return found > 0
 
-    def _pass_cond_branch_orphans(self, bodies, starts) -> bool:
+    def _pass_cond_branch_orphans(self, bodies, starts, reachable) -> bool:
         """
         A conditional branch out of its function into unclaimed bytes.
 
@@ -817,6 +827,8 @@ class FunctionDetector:
         """
         added = False
         for insn in self.engine.instructions.values():
+            if insn.address not in reachable:
+                continue
             if not insn.is_cond_jump:
                 continue
             target = insn.jump_target

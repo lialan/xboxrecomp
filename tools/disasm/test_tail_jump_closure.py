@@ -27,6 +27,10 @@ def test_late_alias_tail_chain_reaches_an_interior_alias():
     for addr, target in zip(chain, chain[1:] + [interior]):
         put(addr, b"\x8b\x44\x24\x04")  # synthetic argument forwarder
         jump(addr + 4, target)
+    # Branch-shaped data after the first thunk lies in its borrowed range.
+    bogus = base + 0x60
+    jump(chain[0] + 9, bogus)
+    put(bogus, b"\xc3")
     table = struct.pack("<II", enclosing, chain[0])
     text = SectionInfo(".text", base, len(code), 0, len(code), False, True, "")
     data = SectionInfo(".data", base + 0x1000, len(table), len(code),
@@ -45,6 +49,7 @@ def test_late_alias_tail_chain_reaches_an_interior_alias():
     assert set(chain + [enclosing, interior]) <= detector.functions.keys()
     assert detector.functions[interior].detection_method == "tail_jump_alias"
     assert interior not in detector._candidates
+    assert bogus not in detector.functions
     assert detector.functions[enclosing].end == base + 0x100
     for addr in (base, base + 0x100, base + 0x400):
         assert detector.functions[addr].end == addr + 1
