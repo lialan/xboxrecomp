@@ -84,6 +84,7 @@ class FunctionDetector:
         # function's end. Kept out of self._candidates so they cannot truncate
         # the function they land in.
         self._alias_entries: Dict[int, int] = {}
+        self._callback_code: Set[int] = set()
 
     def detect_all(self, sections: Optional[List[SectionInfo]] = None) -> int:
         """
@@ -130,6 +131,10 @@ class FunctionDetector:
         # intra-function branch, so it runs after and rebuilds. Iterate: a newly
         # found function can itself tail-jump somewhere new.
         self._close_tail_jump_targets(sections)
+
+        # Establish table callback ownership before weak immediates can split
+        # a long body at a constant that happens to name an instruction suffix.
+        self._pass_data_ptr_targets(sections)
 
         # Function addresses taken as an immediate. Runs once, after the
         # bodies exist: the test is whether the target lands in a gap, which
@@ -533,6 +538,9 @@ class FunctionDetector:
         """
         bounds = sorted((f.start, f.end) for f in self.functions.values())
         starts = [b[0] for b in bounds]
+        claimed = set(self._callback_code)
+        for entry, end in self._alias_entries.items():
+            claimed.update(self.engine.recursive_descent([entry], [(entry, end)]))
 
         def inside_a_function(addr: int) -> bool:
             i = bisect.bisect_right(starts, addr) - 1
@@ -558,7 +566,8 @@ class FunctionDetector:
             target = insn.imm_ref
             if target is None or target in self.functions:
                 continue
-            if inside_a_function(target) or not in_code_section(target):
+            if (target in claimed or target in self._alias_entries
+                    or inside_a_function(target) or not in_code_section(target)):
                 continue
             targets.add(target)
 
@@ -779,7 +788,7 @@ class FunctionDetector:
         for entry, alias_end in self._alias_entries.items():
             tails.update(self.engine.recursive_descent(
                 [entry], [(entry, alias_end)]))
-        claimed = set()
+        claimed = self._callback_code
         found = 0
         for target in sorted(targets):
             if target in self.functions or target in self._alias_entries:
@@ -790,7 +799,6 @@ class FunctionDetector:
             if target in claimed:
                 continue
             j = bisect.bisect_right(starts, target) - 1
-            in_gap = not (j >= 0 and bounds[j][0] < target < bounds[j][1])
             if j >= 0 and bounds[j][0] < target < bounds[j][1]:
                 # Inside a function, so the bytes are known to be code and the
                 # only real question is whether the address is an instruction
@@ -840,8 +848,7 @@ class FunctionDetector:
             self._alias_entries[target] = end
             reachable = self.engine.recursive_descent([target], [(target, end)])
             tails.update(reachable)
-            if in_gap:
-                claimed.update(reachable)
+            claimed.update(reachable)
             found += 1
 
         if found:

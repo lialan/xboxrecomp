@@ -70,6 +70,8 @@ def test_table_word_inside_a_recovered_callback_is_not_a_new_entry():
     assert detector._pass_data_ptr_targets([text])
     assert BASE + 16 in detector._alias_entries
     assert BASE + 17 not in detector._alias_entries
+    detector._pass_data_ptr_targets([text])
+    assert BASE + 17 not in detector._alias_entries
 
 
 def test_existing_shared_body_still_allows_an_explicit_table_alias():
@@ -86,3 +88,23 @@ def test_existing_shared_body_still_allows_an_explicit_table_alias():
     detector._alias_entries[BASE] = BASE + 2
     assert detector._pass_data_ptr_targets([text])
     assert detector._alias_entries[BASE + 1] == BASE + 2
+
+
+def test_immediate_suffix_cannot_split_a_long_table_callback():
+    from tools.disasm.engine import DisasmEngine
+    callback = BASE + 16
+    suffix = callback + 80
+    body = b"\xb8" + struct.pack('<I', suffix) + b"\xc3" + b"\x90" * 10
+    body += b"\x53" + b"\x40" * 200 + b"\x5b\xc3"
+    table = struct.pack('<I', callback)
+    text = SectionInfo('.text', BASE, len(body), 0, len(body), False, True, '')
+    data = SectionInfo('.data', BASE + 0x1000, len(table), len(body), len(table), False, False, '')
+    image = BinaryImage('synthetic', body + table, 0, 0x20000, BASE, 0, [text, data])
+    engine = DisasmEngine(image)
+    engine.linear_sweep(text)
+    detector = FunctionDetector(engine, image, None, LabelManager())
+    detector.detect_all([text])
+    assert callback in detector.functions
+    assert suffix not in detector._candidates
+    assert suffix not in detector.functions
+    assert detector.functions[callback].end >= callback + 203
