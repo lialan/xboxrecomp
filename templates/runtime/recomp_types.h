@@ -352,6 +352,53 @@ static inline uint16_t recomp_f80_store(double v, uint64_t *mant) {
     return (uint16_t)(sign | (e + 16382));
 }
 
+/* Trig range failure leaves both value and stack depth unchanged. */
+static inline int recomp_fp_trig_in_range(double value) {
+    if (isfinite(value) && fabs(value) >= 0x1p63) {
+        g_fp_cc |= 0x0400u;
+        return 0;
+    }
+    g_fp_cc &= (uint16_t)~0x0400u;
+    return 1;
+}
+
+static inline double recomp_fscale(double value, double scale) {
+    if (isnan(value) || isnan(scale)) return value + scale;
+    if (scale == INFINITY)
+        return value == 0.0 ? NAN : copysign(INFINITY, value);
+    if (scale == -INFINITY)
+        return isinf(value) ? NAN : copysign(0.0, value);
+    /* Finite exponents beyond this clamp already overflow/underflow double.
+     * Avoid an undefined float-to-int cast for the much larger x87 inputs. */
+    return scalbn(value, scale > 4096 ? 4096 : scale < -4096 ? -4096 : (int)scale);
+}
+
+static inline double recomp_fprem(double a, double b, int nearest) {
+    int quotient = 0, ea = 0, eb = 0;
+    unsigned q;
+    double result;
+    if (isfinite(a) && isfinite(b) && a != 0.0 && b != 0.0) {
+        frexp(a, &ea); frexp(b, &eb);
+        if (ea - eb >= 64) {
+            /* Intel permits 32..63 bits of quotient per partial reduction.
+             * Keep C2 set; the guest repeats until a complete reduction. */
+            g_fp_cc |= 0x0400u;
+            return fmod(a, scalbn(b, ea - eb - 32));
+        }
+    }
+    result = remquo(a, b, &quotient);
+    /* remquo's quotient is round-to-nearest; FPREM chops. Step back one in
+     * magnitude, on the low bits remquo returns, before reading C0/C3/C1. */
+    q = (unsigned)(quotient < 0 ? -quotient : quotient);
+    if (!nearest && result != 0.0 && isfinite(result) && signbit(result) != signbit(a)) {
+        result += copysign(fabs(b), a);
+        q -= 1u;
+    }
+    /* C0/C3/C1 contain quotient bits 2/1/0; C2 says complete. */
+    g_fp_cc = (uint16_t)(((q & 4u) << 6) | ((q & 2u) << 13) | ((q & 1u) << 9));
+    return result;
+}
+
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
  * ================================================================ */

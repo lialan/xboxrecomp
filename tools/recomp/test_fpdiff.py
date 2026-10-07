@@ -24,6 +24,9 @@ CASES = (
     "fld_m80",
     # ficom/ficomp compare st0 with an integer and ficomp pops.
     "ficom",
+    # Trig range, remainder, scale and exp/log edge cases; fisttp chops.
+    "fsin", "fcos", "fptan", "f2xm1", "fyl2xp1", "fprem", "fscale", "fisttp",
+    "seq_fptan",
 )
 
 

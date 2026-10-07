@@ -3562,15 +3562,16 @@ class Lifter:
                 return [f"fp_push((double){smem}({_fmt_mem(ops[0])})); /* fild */"]
             return [f"/* fild {insn.op_str} */"]
 
-        if m in ("fist", "fistp"):
+        if m in ("fist", "fistp", "fisttp"):
             if len(ops) >= 1 and ops[0].type == "mem":
                 size = ops[0].mem_size
                 mem_acc = _smem_accessor(size)
                 int_type = {2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
                     size, "int32_t")
-                pop = " fp_pop();" if m == "fistp" else ""
+                pop = " fp_pop();" if m != "fist" else ""
+                control = "0x0C00u" if m == "fisttp" else "g_fp_control_word"
                 return [f"{mem_acc}({_fmt_mem(ops[0])}) = "
-                        f"({int_type})recomp_fist(fp_top(), g_fp_control_word, {size * 8});{pop} /* {m} */"]
+                        f"({int_type})recomp_fist(fp_top(), {control}, {size * 8});{pop} /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m in ("fadd", "faddp", "fsub", "fsubp", "fsubr", "fsubrp",
@@ -3661,18 +3662,20 @@ class Lifter:
         # real x87 are not reproduced -- fp_stack is double -- which is the same
         # approximation every other op here already makes.
         if m == "fsin":
-            return [f"fp_top() = sin(fp_top()); /* fsin */"]
+            return ["if (recomp_fp_trig_in_range(fp_top())) fp_top() = sin(fp_top()); /* fsin */"]
         if m == "fcos":
-            return [f"fp_top() = cos(fp_top()); /* fcos */"]
+            return ["if (recomp_fp_trig_in_range(fp_top())) fp_top() = cos(fp_top()); /* fcos */"]
         if m == "fsincos":
             # Replaces st0 with sin, then pushes cos. Order matters: the push
             # must see the sine already stored.
-            return [f"{{ double _a = fp_top(); fp_top() = sin(_a);"
+            return [f"if (recomp_fp_trig_in_range(fp_top())) {{ double _a = fp_top(); fp_top() = sin(_a);"
                     f" fp_push(cos(_a)); }} /* fsincos */"]
         if m == "fptan":
             # st0 = tan(st0), then push 1.0. The constant push is not decoration:
             # callers use it as the denominator of a subsequent fdiv.
-            return [f"{{ fp_top() = tan(fp_top()); fp_push(1.0); }} /* fptan */"]
+            # An infinite or NaN operand pushes a NaN, not 1.0.
+            return ["if (recomp_fp_trig_in_range(fp_top())) { double _a = fp_top();"
+                    " fp_top() = tan(_a); fp_push(isfinite(_a) ? 1.0 : _a - _a); } /* fptan */"]
         if m == "fpatan":
             # st1 = atan2(st1, st0), pop. Argument order is st1 over st0.
             return [f"{{ fp_st1() = atan2(fp_st1(), fp_top()); fp_pop(); }}"
@@ -3682,18 +3685,14 @@ class Lifter:
             return [f"{{ fp_st1() = fp_st1() * log2(fp_top()); fp_pop(); }}"
                     f" /* fyl2x */"]
         if m == "fyl2xp1":
-            return [f"{{ fp_st1() = fp_st1() * log2(fp_top() + 1.0); fp_pop(); }}"
+            return [f"{{ fp_st1() = fp_st1() * (log1p(fp_top()) / 0.69314718055994530942); fp_pop(); }}"
                     f" /* fyl2xp1 */"]
         if m == "f2xm1":
-            return [f"fp_top() = exp2(fp_top()) - 1.0; /* f2xm1 */"]
+            return ["fp_top() = expm1(fp_top() * 0.69314718055994530942); /* f2xm1 */"]
         if m in ("fprem", "fprem1"):
-            # Both leave the remainder in st0 and clear C2 to say "complete".
-            # fprem truncates toward zero, fprem1 rounds to nearest (IEEE), which
-            # is the difference between fmod and remainder.
-            fn = "fmod" if m == "fprem" else "remainder"
-            return [f"fp_top() = {fn}(fp_top(), fp_st1()); /* {m} */"]
+            return [f"fp_top() = recomp_fprem(fp_top(), fp_st1(), {int(m == 'fprem1')}); /* {m} */"]
         if m == "fscale":
-            return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
+            return ["fp_top() = recomp_fscale(fp_top(), fp_st1()); /* fscale */"]
         if m == "frndint":
             # Rounds under the guest's x87 RC bits, like FIST. rint() used the
             # host's rounding mode, which the guest's fldcw never reaches, so
