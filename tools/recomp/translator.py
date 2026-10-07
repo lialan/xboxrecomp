@@ -431,6 +431,12 @@ class FunctionTranslator:
                     continue
                 instructions = self.disasm.disassemble_function(
                     raw_bytes, caller, end)
+            if (caller in self.recovered_function_starts
+                    and not (recovered and recovered.get("instructions"))):
+                # A callback accepted for its linear ret decodes on past it;
+                # only the code it reaches names tables, callees and constants.
+                instructions = (self._recover_cfg(
+                    caller, end, set(), set(), coalescing=True) or [[]])[0]
             for lower, upper in self._find_static_indirect_ranges(instructions):
                 targets = self._read_static_callback_table(
                     lower, upper, original_starts)
@@ -453,13 +459,7 @@ class FunctionTranslator:
                     recovered_callers.setdefault(target, set()).add(caller)
                     strong.add(target)
             if caller in self.recovered_function_starts:
-                # Only code the callback reaches names its dependencies; a
-                # callback accepted for its linear ret decodes on past it.
-                reachable = instructions
-                if not (recovered and recovered.get("instructions")):
-                    reachable = (self._recover_cfg(
-                        caller, end, set(), set(), coalescing=True) or [[]])[0]
-                for insn in reachable:
+                for insn in instructions:
                     target = insn.call_target if insn.is_call else (
                         insn.jump_target if insn.mnemonic == "jmp" else None)
                     if target is None:
@@ -544,9 +544,10 @@ class FunctionTranslator:
                             or any(insn.end_address > target for insn in owned)
                             # Tables in .rdata live elsewhere; only embedded
                             # storage can overlap the callback.
-                            or any(table + len(arms) * 4 > target
-                                   for table, arms in tables.items()
-                                   if owner["_addr"] <= table < owner["end"])
+                            or any(hi > target
+                                   for lo, hi in (self._table_storage(table, arms)
+                                                  for table, arms in tables.items())
+                                   if owner["_addr"] <= lo < owner["end"])
                             or any(insn.is_jump and insn.jump_target is None
                                    and not (insn.operands
                                             and insn.operands[0].type == "mem"
@@ -659,13 +660,38 @@ class FunctionTranslator:
                 "called_by": sorted(callers),
             }
             self.recovered_function_starts.add(target)
+            # Claim only what the callback reaches: a linear decode accepted
+            # for its ret runs on to the bound.
+            claimed = instructions
+            if target not in self._recovered_cfg:
+                reach = self._recover_cfg(target, bound, set(), set(), coalescing=True)
+                if reach and reach[0]:
+                    claimed = reach[0]
             tables = (self._recovered_cfg.get(target) or {}).get("jump_tables", {})
+            storage = [self._table_storage(table, arms) for table, arms in tables.items()]
             claimed_end = max(
-                claimed_end, *(insn.end_address for insn in instructions),
-                *(table + len(arms) * 4 for table, arms in tables.items()
-                  if target <= table < bound))
+                claimed_end, *(insn.end_address for insn in claimed),
+                *(hi for lo, hi in storage if target <= lo < bound))
 
         return self.recovered_function_starts
+
+    def _table_storage(self, table_va, arms):
+        """Return the [start, end) bytes that hold a recovered table's arms.
+
+        _read_local_jump_table can scan backward from the base or start at
+        slot one, so the base and entry count alone do not give the span.
+        Find the arms in the image; if they are not there, assume the widest
+        span the reader could have used.
+        """
+        size = 4 * len(arms)
+        starts = [table_va - 4 * back for back in range(len(arms) + 1)]
+        for start in starts + [table_va + 4]:
+            offset = va_to_file_offset(start)
+            if offset is None or offset + size > len(self.xbe_data):
+                continue
+            if list(struct.unpack_from(f"<{len(arms)}I", self.xbe_data, offset)) == list(arms):
+                return start, start + size
+        return table_va - size, table_va + size + 4
 
     @staticmethod
     def _is_pointer_tail_jump(insn, tables):

@@ -946,6 +946,82 @@ def test_callback_call_to_a_known_function_is_entry_evidence():
     assert f"0x{callback:08X}" in subject.func_db[known]["called_by"]
 
 
+def _table_callback_subject(callback_code, extra=()):
+    # An _initterm-style table names one callback at BASE+0x80; `extra`
+    # places (address, bytes) elsewhere. A function at BASE+0x200 closes the
+    # second gap.
+    table = BASE + 0x300
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x80 + len(callback_code)] = callback_code
+    for address, code in extra:
+        raw[address - BASE:address - BASE + len(code)] = code
+    raw[0x100] = raw[0x200] = 0xC3
+    raw[0x300:0x304] = (BASE + 0x80).to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        BASE + 0x100: function(BASE + 0x100, BASE + 0x101),
+        BASE + 0x200: function(BASE + 0x200, BASE + 0x201),
+    })
+    return subject
+
+
+def test_constants_come_only_from_reachable_callback_code():
+    # A push decoded after the callback's ret cannot run, so the code it
+    # names in the next gap is not a callback.
+    stray = BASE + 0x180
+    subject = _table_callback_subject(
+        b"\xc3\x68" + stray.to_bytes(4, "little"), [(stray, b"\xc3")])
+    subject.discover_static_indirect_targets()
+    assert BASE + 0x80 in subject.func_db
+    assert stray not in subject.func_db
+
+
+def test_callback_claims_only_the_code_it_reaches():
+    # The table callback returns at once; a constant in the registration
+    # names a separate function later in the same gap. Linear decoding of
+    # the callback runs over it, but the callback does not reach it.
+    later = BASE + 0xa0
+    table = BASE + 0x300
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39fe")
+               + b"\x68" + later.to_bytes(4, "little") + bytes.fromhex("ffd0c3"))
+    raw = bytearray(b"\x90" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80] = raw[0xa0] = raw[0x100] = 0xC3
+    raw[0x300:0x304] = (BASE + 0x80).to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        BASE + 0x100: function(BASE + 0x100, BASE + 0x101),
+    })
+    subject.discover_static_indirect_targets()
+    assert BASE + 0x80 in subject.func_db
+    assert later in subject.func_db
+
+
+@pytest.mark.parametrize("arms, base, expected", [
+    ([BASE + 0x50, BASE + 0x51], BASE + 0x300, (BASE + 0x300, BASE + 0x308)),
+    # slot 0 is not an arm: the base points one dword before the entries
+    ([BASE + 0x50, BASE + 0x51], BASE + 0x2fc, (BASE + 0x300, BASE + 0x308)),
+    # the reader scanned backward from the base
+    ([BASE + 0x50, BASE + 0x51], BASE + 0x304, (BASE + 0x300, BASE + 0x308)),
+])
+def test_table_storage_finds_the_entries(arms, base, expected):
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[0x2f8:0x2fc] = b"\x00" * 4
+    raw[0x300:0x308] = b"".join(arm.to_bytes(4, "little") for arm in arms)
+    subject = translator(bytes(raw), [])
+    assert subject._table_storage(base, arms) == expected
+
+
 def test_jump_table_case_can_recover_register_continuation():
     case = BASE + 7
     continuation = case + 7
