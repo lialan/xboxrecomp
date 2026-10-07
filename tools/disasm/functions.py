@@ -829,10 +829,9 @@ class FunctionDetector:
         Registering an alias rather than a candidate is what makes this safe:
         aliases are built after the bodies are measured, so they cannot clamp
         anyone's end, which is precisely the failure the jcc exclusion was
-        protecting against. The target must also land in a gap -- inside
-        another function is the alias case the pass above already handles --
-        and must decode to a ret, so a mis-measured body's interior does not
-        qualify on the strength of one branch.
+        protecting against. A target inside another function shares its end.
+        A target in a gap must decode to a ret or a tail jump before it can
+        become an alias.
         """
         added = False
         for insn in self.engine.instructions.values():
@@ -857,7 +856,12 @@ class FunctionDetector:
 
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bodies[j][0] <= target < bodies[j][1]:
-                continue                    # inside a function: handled above
+                # A conditional tail can share another body's return just as
+                # an unconditional tail can. Keep the enclosing body intact.
+                if target in self.engine.instructions:
+                    self._alias_entries[target] = bodies[j][1]
+                    added = True
+                continue
 
             section = self.image.get_section_at_va(target)
             if section is None or not section.executable:

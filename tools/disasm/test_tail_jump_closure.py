@@ -1,13 +1,16 @@
 """Late table aliases must expose their complete tail chain without splits."""
 import struct
 
+import pytest
+
 from tools.disasm.engine import DisasmEngine
 from tools.disasm.functions import FunctionDetector
 from tools.disasm.labels import LabelManager
 from tools.disasm.loader import BinaryImage, SectionInfo
 
 
-def test_late_alias_tail_chain_reaches_an_interior_alias():
+@pytest.mark.parametrize("conditional", [False, True])
+def test_late_alias_tail_chain_reaches_an_interior_alias(conditional):
     base = 0x10000
     code = bytearray(b"\x90" * 0x410)
     chain = list(range(base + 0x300, base + 0x1C0 - 1, -0x20))
@@ -26,7 +29,11 @@ def test_late_alias_tail_chain_reaches_an_interior_alias():
     put(interior, b"\xb8\x01\x00\x00\x00\xc3")
     for addr, target in zip(chain, chain[1:] + [interior]):
         put(addr, b"\x8b\x44\x24\x04")  # synthetic argument forwarder
-        jump(addr + 4, target)
+        if conditional and target == interior:
+            put(addr + 4, b"\x0f\x85" + struct.pack("<i", target - addr - 10)
+                + b"\xc3")
+        else:
+            jump(addr + 4, target)
     # Branch-shaped data after the first thunk lies in its borrowed range.
     bogus = base + 0x60
     jump(chain[0] + 9, bogus)
