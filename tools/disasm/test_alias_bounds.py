@@ -34,12 +34,19 @@ class _Section:
     name = "TEXT"
     virtual_addr = SEC_LO
     virtual_size = SEC_HI - SEC_LO
+    raw_size = SEC_HI - SEC_LO
     executable = True
 
 
+class _ShortSection(_Section):
+    raw_size = 0xC0                     # the rest is an unbacked virtual tail
+
+
 class _Image:
+    section = _Section
+
     def get_section_at_va(self, addr):
-        return _Section() if SEC_LO <= addr < SEC_HI else None
+        return self.section() if SEC_LO <= addr < SEC_HI else None
 
 
 class _Engine:
@@ -63,10 +70,11 @@ class _Labels:
         pass
 
 
-def _built(insns, functions, aliases):
+def _built(insns, functions, aliases, section=_Section):
     det = FunctionDetector.__new__(FunctionDetector)
     det.engine = _Engine(insns)
     det.image = _Image()
+    det.image.section = section
     det.labels = _Labels()
     det.functions = {s: Function(start=s, end=e, name=f"sub_{s:08X}")
                      for s, e in functions}
@@ -103,6 +111,12 @@ class AliasBoundsTest(unittest.TestCase):
         insns = _code(0x10F0, 0x1120)       # decodes on into the next section
         ends = _built(insns, [(0x1000, 0x1010)], {0x10F0: 0x1200})
         self.assertEqual(ends, {0x10F0: SEC_HI})
+
+    def test_gap_alias_stops_at_its_sections_backed_bytes(self):
+        insns = _code(0x10A0, 0x1120)
+        ends = _built(insns, [(0x1000, 0x1010)], {0x10A0: 0x1200},
+                      section=_ShortSection)
+        self.assertEqual(ends, {0x10A0: SEC_LO + 0xC0})
 
     def test_alias_inside_a_function_shares_its_end(self):
         insns = _code(0x1000, 0x1080, rets={0x1024, 0x1044})

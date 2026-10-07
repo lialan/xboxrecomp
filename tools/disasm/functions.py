@@ -899,7 +899,10 @@ class FunctionDetector:
             section = self.image.get_section_at_va(addr)
             i = bisect.bisect_right(body_starts, addr) - 1
             if not (i >= 0 and addr < bodies[i][1]) and section is not None:
-                end = min(end, section.virtual_addr + section.virtual_size)
+                # Only the backed bytes are code; a virtual tail past them
+                # is zero-filled, and reading on reaches the next section.
+                end = min(end, section.virtual_addr
+                          + min(section.virtual_size, section.raw_size))
                 body_end = self._find_function_end(addr, end, end)
                 k = bisect.bisect_left(starts, max(body_end, addr + 1))
                 if k < len(starts):
