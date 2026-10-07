@@ -26,6 +26,7 @@
  */
 
 #include "kernel.h"
+#include "guest_vmem.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
@@ -368,7 +369,11 @@ static ULONG g_slot_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE];
 /* Calls per ordinal, for the ranking in the periodic summary. 378 counters
  * is smaller than one of the strings this file prints. */
 static unsigned long long g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
-static int g_kernel_call_count = 0;
+/* 64-bit: a title that polls the clock through the kernel passes 2^31 calls
+ * within minutes (X-Men Legends does). As a 32-bit int it wrapped negative,
+ * "count <= log budget" turned true, and every kernel call then wrote two log
+ * lines through the shared stderr lock -- the frame rate fell to ~1 FPS. */
+static long long g_kernel_call_count = 0;
 
 /* How many kernel calls get logged before the log goes quiet.
  *
@@ -467,6 +472,9 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
     g_esp += 12;
 }
 
+void guest_cpu_join(void);
+void guest_cpu_part(void);
+
 static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
@@ -492,7 +500,9 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     }
     free(s);
 
+    guest_cpu_join();
     bridge_run_thread_inline(fn, ctx1, ctx2);
+    guest_cpu_part();
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
@@ -672,8 +682,12 @@ static void bridge_NtClose(void)
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
-        if (h && h != INVALID_HANDLE_VALUE)
+        if (h && h != INVALID_HANDLE_VALUE) {
+#ifdef _WIN32
+            xbox_dir_context_drop(h);
+#endif
             CloseHandle(h);
+        }
     }
     g_eax = 0; /* STATUS_SUCCESS */
 }
@@ -803,8 +817,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
  */
 static void bridge_MmFreeContiguousMemory(void)
 {
+    extern int xbox_ContiguousFree(uint32_t addr);
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+    /* Contiguous blocks come from their own arena, not the heap: passing
+     * them to xbox_HeapFree found nothing, so none ever came back. */
+    if (!xbox_ContiguousFree(addr))
+        xbox_HeapFree(addr);
     g_eax = 0;
 }
 
@@ -829,6 +847,33 @@ static void bridge_NtAllocateVirtualMemory(void)
         fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: base=0x%08X size=%u type=0x%X prot=0x%X\n",
                 base_hint, size, alloc_type, protect);
         fflush(stderr);
+    }
+
+    /* RECOMP_EXT_VMA: a request for a specific address above the RAM mirrors
+     * gets exactly that address, or a failure the caller can act on. The heap
+     * path below never honours a base; it substitutes whatever its cursor is
+     * at, which breaks any title that checks what it got against what it asked
+     * for. Everything else (base = 0, or an address in mapped RAM) carries on
+     * below. */
+    if (base_ptr && size_ptr) {
+        uint32_t vm_base = base_hint;
+        uint32_t vm_size = size;
+        uint32_t vm_status;
+
+        if (guest_vmem_allocate(&vm_base, &vm_size, alloc_type, protect, &vm_status)) {
+            if (KERNEL_LOG_ON()) {
+                fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory (extended VMA): "
+                                "base=0x%08X size=%u status=0x%08X\n",
+                        vm_base, vm_size, vm_status);
+                fflush(stderr);
+            }
+            if (vm_status == 0) {
+                BRIDGE_MEM32(base_ptr) = vm_base;
+                BRIDGE_MEM32(size_ptr) = vm_size;
+            }
+            g_eax = vm_status;
+            return;
+        }
     }
 
     if (size == 0) {
@@ -1007,6 +1052,26 @@ static void bridge_NtQueryVirtualMemory(void)
         return;
     }
 
+    /* Anything the extended-VMA tracker owns is answered from its own records.
+     * The generic answer below calls everything above RAM free, so a caller
+     * walking its address space for a free range would be handed one that is
+     * live. */
+    {
+        uint32_t vm_info[7];
+
+        if (guest_vmem_query(base_va, vm_info)) {
+            BRIDGE_MEM32(info_va + 0x00) = vm_info[0]; /* BaseAddress */
+            BRIDGE_MEM32(info_va + 0x04) = vm_info[1]; /* AllocationBase */
+            BRIDGE_MEM32(info_va + 0x08) = vm_info[2]; /* AllocationProtect */
+            BRIDGE_MEM32(info_va + 0x0C) = vm_info[3]; /* RegionSize */
+            BRIDGE_MEM32(info_va + 0x10) = vm_info[4]; /* State */
+            BRIDGE_MEM32(info_va + 0x14) = vm_info[5]; /* Protect */
+            BRIDGE_MEM32(info_va + 0x18) = vm_info[6]; /* Type */
+            g_eax = 0;
+            return;
+        }
+    }
+
     BRIDGE_MEM32(info_va + 0x00) = page_base;          /* BaseAddress */
     BRIDGE_MEM32(info_va + 0x04) = page_base;          /* AllocationBase */
     BRIDGE_MEM32(info_va + 0x08) = 0x04;               /* PAGE_READWRITE */
@@ -1017,7 +1082,27 @@ static void bridge_NtQueryVirtualMemory(void)
         BRIDGE_MEM32(info_va + 0x0C) = XBOX_TOTAL_RAM - page_base; /* RegionSize */
         BRIDGE_MEM32(info_va + 0x10) = 0x1000;         /* MEM_COMMIT */
     } else {
-        BRIDGE_MEM32(info_va + 0x0C) = 0x1000;
+        /* Free to the next boundary, not one page. A caller enumerating free
+         * memory then steps across the range instead of crawling it 4 KB at a
+         * time; past the user range that is 0x80000 queries per lap, and on the
+         * title this came from the walk wrapped at 0xFFFFFFFF and never ended.
+         * Only with RECOMP_EXT_VMA, since it changes what every query above
+         * the image answers. */
+        uint32_t region = 0x1000;
+
+        if (guest_vmem_active()) {
+            /* Only where nothing else owns the answer: below the image, and
+             * above the tracker's range. */
+            uint32_t end = 0;
+
+            if (page_base < g_xbox_code_lo)
+                end = g_xbox_code_lo;
+            else if (page_base >= GUEST_VMEM_TOP)
+                end = 0xFFFFFFFFu;
+            if (end > page_base)
+                region = end - page_base;
+        }
+        BRIDGE_MEM32(info_va + 0x0C) = region;
         BRIDGE_MEM32(info_va + 0x10) = 0x10000;        /* MEM_FREE */
         BRIDGE_MEM32(info_va + 0x08) = 0;
         BRIDGE_MEM32(info_va + 0x18) = 0;
@@ -1038,6 +1123,47 @@ static void bridge_NtFreeVirtualMemory(void)
     uint32_t base_ptr = STACK_ARG(0);
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
+
+    if (base_ptr && size_ptr) {
+        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
+        uint32_t vm_size = BRIDGE_MEM32(size_ptr);
+        uint32_t vm_status;
+
+        if (guest_vmem_free(&vm_base, &vm_size, free_type, &vm_status)) {
+            if (vm_status == 0) {
+                BRIDGE_MEM32(base_ptr) = vm_base;
+                BRIDGE_MEM32(size_ptr) = vm_size;
+            }
+            g_eax = vm_status;
+            return;
+        }
+    }
+
+    /* Memory NtAllocateVirtualMemory took from the guest heap. The call below
+     * reads the 32-bit guest slots as host pointers and hands them to
+     * VirtualFree, which fails, so none of it ever came back. Under
+     * RECOMP_HEAP_RECLAIM a release returns the block to the heap and a
+     * decommit zeroes the pages it names, since heap memory stays committed. */
+    if (xbox_HeapReclaimEnabled() && base_ptr && size_ptr) {
+        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
+        uint32_t left = xbox_HeapBlockSize(vm_base);
+
+        if (left) {
+            if (free_type & 0x8000) {              /* MEM_RELEASE */
+                xbox_HeapFree(vm_base);
+                BRIDGE_MEM32(size_ptr) = 0;
+            } else {
+                /* MEM_DECOMMIT keeps the block, but on the console the pages
+                 * are gone and a later MEM_COMMIT (a no-op here) brings them
+                 * back zeroed. Zero them now so it does. */
+                uint32_t vm_size = BRIDGE_MEM32(size_ptr);
+                uint32_t n = (vm_size && vm_size < left) ? vm_size : left;
+                memset(XBOX_TO_NATIVE(vm_base), 0, n);
+            }
+            g_eax = 0;
+            return;
+        }
+    }
 
     g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
         XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
@@ -1385,6 +1511,7 @@ static void bridge_NtCreateEvent(void)
 static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
+static HANDLE ke_guest_event(uint32_t guest_va, int *type);
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
@@ -1397,6 +1524,16 @@ static void bridge_KeSetEvent(void)
     (void)increment;
     (void)wait;
 
+    {   /* An event the title built itself (see ke_guest_event). */
+        int type;
+        HANDLE ge = ke_guest_event(guest_va, &type);
+        if (ge) {
+            g_eax = BRIDGE_MEM32(guest_va + 4) != 0;   /* previous state */
+            BRIDGE_MEM32(guest_va + 4) = 1;
+            SetEvent(ge);
+            return;
+        }
+    }
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = bridge_resolve_handle(guest_va);
@@ -1417,6 +1554,28 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
+
+    {   /* An event the title built itself (see ke_guest_event). Its
+         * SignalState in guest memory is the truth -- XDK code resets it by
+         * writing 0 there -- so bring the host event in line first. */
+        int type;
+        HANDLE ge = ke_guest_event(object, &type);
+        if (ge) {
+            if (BRIDGE_MEM32(object + 4) == 0) {
+                ResetEvent(ge);
+                if (BRIDGE_MEM32(object + 4) != 0)     /* set meanwhile */
+                    SetEvent(ge);
+            } else {
+                SetEvent(ge);                          /* set by a header write */
+            }
+            g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+                ge, wait_reason, wait_mode,
+                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+            if (g_eax == 0 && type == 1)               /* synchronization: consumed */
+                BRIDGE_MEM32(object + 4) = 0;
+            return;
+        }
+    }
 
     h = ke_shadow_lookup(object);
     if (!h)
@@ -2574,6 +2733,9 @@ static void bridge_RtlNtStatusToDosError(void)
     case 0xC0000023: g_eax = 122; break;        /* STATUS_BUFFER_TOO_SMALL → ERROR_INSUFFICIENT_BUFFER */
     case 0xC0000035: g_eax = 183; break;        /* STATUS_OBJECT_NAME_COLLISION → ERROR_ALREADY_EXISTS */
     case 0xC00000BB: g_eax = 50; break;         /* STATUS_NOT_SUPPORTED → ERROR_NOT_SUPPORTED */
+    /* The CRT heap-grow path retries at a new address only on
+     * ERROR_INVALID_ADDRESS; any other answer makes it give up. */
+    case 0xC0000018: g_eax = 487; break;        /* STATUS_CONFLICTING_ADDRESSES → ERROR_INVALID_ADDRESS */
 
     default:         g_eax = 317; break;         /* ERROR_MR_MID_NOT_FOUND (generic) */
     }
@@ -2701,6 +2863,12 @@ static HANDLE bridge_resolve_handle(uint32_t token)
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
     }
+    /* Pseudo-handles (NtCurrentProcess() = -1, NtCurrentThread() = -2) are
+     * negative. Zero-extending them on a 64-bit host yields 0x00000000FFFFFFFE,
+     * which Win32 rejects: X-Men Legends' CRT duplicates NtCurrentThread()
+     * and spun forever on the STATUS_UNSUCCESSFUL that came back. */
+    if (token >= 0xFFFFFFF0u)
+        return (HANDLE)(intptr_t)(int32_t)token;
     /* Untagged: synthetic/dummy handle -- pass through unchanged. */
     return (HANDLE)(uintptr_t)token;
 }
@@ -4019,7 +4187,10 @@ static void bridge_MmLockUnlockBufferPages(void)
  */
 static void bridge_MmQueryAllocationSize(void)
 {
-    g_eax = xbox_HeapBlockSize(STACK_ARG(0));
+    extern uint32_t xbox_ContiguousBlockSize(uint32_t addr);
+    uint32_t va = STACK_ARG(0);
+    uint32_t n = xbox_ContiguousBlockSize(va);   /* XPhysicalSize asks this too */
+    g_eax = n ? n : xbox_HeapBlockSize(va);
 }
 
 /* ── NtCreateMutant (ordinal 192, 3 args) */
@@ -4939,6 +5110,13 @@ static void bridge_NtDuplicateObject(void)
 
     if (!DuplicateHandle(GetCurrentProcess(), src, GetCurrentProcess(),
                          &dup, 0, FALSE, opts)) {
+        static int logged = 0;
+        if (logged++ < 8) {
+            fprintf(stderr, "  [KERNEL] NtDuplicateObject: token=0x%08X "
+                    "handle=%p failed (error %lu)\n",
+                    STACK_ARG(0), src, (unsigned long)GetLastError());
+            fflush(stderr);
+        }
         g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */
         return;
     }
@@ -6012,6 +6190,77 @@ static void ke_shadow_remove(uint32_t guest_va)
     LeaveCriticalSection(&g_ke_shadow_cs);
 }
 
+/* Events a title initialises itself (RECOMP_TITLE_KEVENTS=1, off by default).
+ *
+ * Shadows are made by KeInitializeEvent, but XDK code can build a KEVENT by
+ * writing its header directly: one title (T()NY) does not even import
+ * KeInitializeEvent, and its D3D waits on the event at miniport + 0x1A4, which
+ * the graphics interrupt sets for software method 5. With no shadow, the guest
+ * address itself went to Win32 as a HANDLE: SetEvent failed silently, and every
+ * wait failed at once with STATUS_UNSUCCESSFUL, which BlockOnTime's
+ * "while (KeWaitForSingleObject(...))" retried forever -- the menu froze.
+ *
+ * So on first use, an object whose header reads as an event (Type 0 notification
+ * or 1 synchronization, Size 4 dwords) gets a host event with the same type and
+ * state, marked in_use = 2. For those the bridges keep SignalState in guest
+ * memory up to date, because XDK code resets it by writing 0 there.
+ * Returns NULL for anything else (the old paths apply).
+ *
+ * Opt-in because it changes what every such wait does: a wait that failed at
+ * once now blocks until the event is set, and on a title whose setter the
+ * runtime does not model yet (a GPU interrupt, say) that turns a spin into a
+ * hang. Turn it on for a title that waits on events it built itself. */
+static HANDLE ke_guest_event(uint32_t guest_va, int *type)
+{
+    static int enabled = -1;
+    uint32_t hdr, i;
+    HANDLE h = NULL;
+
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_TITLE_KEVENTS");
+        enabled = e && *e == '1';
+    }
+    if (!enabled)
+        return NULL;
+    if (guest_va < 0x10000u || (guest_va & 3u))
+        return NULL;
+    if (guest_va >= 0x04000000u && (guest_va < 0x80000000u || guest_va >= 0x84000000u))
+        return NULL;                               /* RAM or the contiguous window */
+    hdr = BRIDGE_MEM32(guest_va);
+    if (((hdr & 0xFFu) != 0 && (hdr & 0xFFu) != 1) || ((hdr >> 16) & 0xFFu) != 4)
+        return NULL;
+    *type = (int)(hdr & 0xFFu);
+
+    ke_shadow_init();
+    EnterCriticalSection(&g_ke_shadow_cs);
+    for (i = 0; i < KE_SHADOW_SIZE; i++) {
+        if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
+            h = g_ke_shadow[i].in_use == 2 ? g_ke_shadow[i].host_handle : NULL;
+            LeaveCriticalSection(&g_ke_shadow_cs);
+            return h;                              /* a KeInitializeEvent shadow: old path */
+        }
+    }
+    for (i = 0; i < KE_SHADOW_SIZE; i++) {
+        if (!g_ke_shadow[i].in_use) {
+            h = CreateEventA(NULL, *type == 0, BRIDGE_MEM32(guest_va + 4) != 0, NULL);
+            if (h) {
+                g_ke_shadow[i].in_use      = 2;
+                g_ke_shadow[i].guest_va    = guest_va;
+                g_ke_shadow[i].host_handle = h;
+            }
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_ke_shadow_cs);
+    if (h) {
+        static int shown;
+        if (shown++ < 16)
+            fprintf(stderr, "  [KERNEL] event 0x%08X built by the title: host event created "
+                            "(%s)\n", guest_va, *type ? "synchronization" : "notification");
+    }
+    return h;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Data Exports (102, 120, 154, 240, 245, 249)
  *
@@ -6770,6 +7019,16 @@ static void bridge_KePulseEvent(void)
     (void)increment;
     (void)wait;
 
+    {
+        int type;
+        HANDLE ge = ke_guest_event(guest_va, &type);
+        if (ge) {
+            PulseEvent(ge);
+            BRIDGE_MEM32(guest_va + 4) = 0;
+            g_eax = 0;
+            return;
+        }
+    }
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
@@ -6828,6 +7087,16 @@ static void bridge_KeResetEvent(void)
     uint32_t guest_va = STACK_ARG(0);
     HANDLE h;
 
+    {
+        int type;
+        HANDLE ge = ke_guest_event(guest_va, &type);
+        if (ge) {
+            BRIDGE_MEM32(guest_va + 4) = 0;
+            ResetEvent(ge);
+            g_eax = 0;
+            return;
+        }
+    }
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
@@ -9064,7 +9333,87 @@ static void kernel_watch_arm_once(void)
 /* Current dispatching slot */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
+static void kernel_thunk_dispatch_body(void);
+
+/* The guest CPU lock (RECOMP_GUEST_LOCK=1).
+ *
+ * The Xbox has one CPU: two guest threads never run guest code at the same
+ * instant, and titles lean on that without knowing it -- a worker fills a
+ * buffer and sets a flag with plain stores, and the reader trusts the order.
+ * Here every guest thread runs on its own host core, and the lifted C gives
+ * no ordering either. T()NY crashes somewhere different on every run
+ * once its loader workers start.
+ *
+ * With the lock on, a guest thread holds it while it runs guest code and
+ * lets go for the length of every kernel call -- the waits, sleeps and I/O
+ * where the console's scheduler would switch threads anyway. Host threads
+ * that only run a guest callback (vblank, interrupts) never take it.
+ *
+ * ponytail: a guest thread that spins in guest code on a flag another guest
+ * thread sets, with no kernel call in the loop, deadlocks here. The console
+ * would preempt it on its quantum; the upgrade is a periodic yield point in
+ * the lifted code's backward branches. */
+static CRITICAL_SECTION g_guest_cpu;
+static int g_guest_cpu_on = -1;
+static RECOMP_TLS int t_guest_thread;     /* this host thread runs a guest thread */
+static RECOMP_TLS int t_guest_held;       /* and holds the guest CPU */
+static RECOMP_TLS int t_dispatch_depth;
+
+static int guest_cpu_enabled(void)
+{
+    if (g_guest_cpu_on < 0) {
+        const char *e = getenv("RECOMP_GUEST_LOCK");
+        InitializeCriticalSection(&g_guest_cpu);
+        g_guest_cpu_on = e && *e == '1';
+        if (g_guest_cpu_on)
+            fprintf(stderr, "  [KERNEL] guest CPU lock on: one guest thread runs at a time\n");
+    }
+    return g_guest_cpu_on;
+}
+
+/* Called once on each host thread that runs a guest thread, before its first
+ * guest instruction. */
+void guest_cpu_join(void)
+{
+    t_guest_thread = 1;
+    if (guest_cpu_enabled() && !t_guest_held) {
+        EnterCriticalSection(&g_guest_cpu);
+        t_guest_held = 1;
+    }
+}
+
+void guest_cpu_part(void)
+{
+    if (t_guest_held) {
+        t_guest_held = 0;
+        LeaveCriticalSection(&g_guest_cpu);
+    }
+    t_guest_thread = 0;
+}
+
+/* A guest thread lets go of the guest CPU for the length of every kernel
+ * call. */
 static void kernel_thunk_dispatch(void)
+{
+    int held = t_guest_held;
+    if (held) {                        /* let other guest threads run meanwhile */
+        t_guest_held = 0;
+        LeaveCriticalSection(&g_guest_cpu);
+    }
+    t_dispatch_depth++;
+    kernel_thunk_dispatch_body();
+    t_dispatch_depth--;
+    /* Back to guest code: take the CPU again. Only at the outermost call --
+     * a guest callback a bridge runs (an APC) returns into the bridge, not to
+     * the thread's own code -- and only if the thread still exists as one. */
+    if (t_guest_thread && t_dispatch_depth == 0 && guest_cpu_enabled()) {
+        EnterCriticalSection(&g_guest_cpu);
+        t_guest_held = 1;
+    }
+    (void)held;
+}
+
+static void kernel_thunk_dispatch_body(void)
 {
     int slot = g_kernel_dispatch_slot;
     bridge_func_t bridge;
@@ -9090,7 +9439,7 @@ static void kernel_thunk_dispatch(void)
          * function is calling this" into "this call site is", which is the
          * difference between guessing and knowing when a title recurses. */
         fprintf(stderr,
-                "  [KERNEL] #%d: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
+                "  [KERNEL] #%lld: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
                 g_kernel_call_count, ordinal, slot, g_esp,
                 g_esp ? BRIDGE_MEM32(g_esp) : 0);
         fflush(stderr);
@@ -9101,7 +9450,7 @@ static void kernel_thunk_dispatch(void)
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
-            fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
+            fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             /* And which ones, ranked. "Latest" names whatever the sample
              * happened to land on; the question behind this line is what a
@@ -9162,7 +9511,7 @@ static void kernel_thunk_dispatch(void)
             if (_watch_before != seen) {
                 seen = _watch_before;
                 fprintf(stderr, "  [KWATCH] 0x%08X = %08X before ordinal %u"
-                                " (call #%d)\n",
+                                " (call #%lld)\n",
                         g_kernel_watch_va, _watch_before, ordinal,
                         g_kernel_call_count);
                 fflush(stderr);
@@ -9315,6 +9664,7 @@ void xbox_kernel_bridge_init(void)
     int unbridged = 0;
     DWORD old_protect;
 
+    guest_cpu_join();          /* the caller goes on to run the title's entry point */
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
             g_thunk_table_count, g_thunk_table_base);
 

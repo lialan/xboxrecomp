@@ -106,6 +106,9 @@ enum {
 #ifndef STATUS_NO_MEMORY
 #define STATUS_NO_MEMORY                ((NTSTATUS)0xC0000017L)
 #endif
+#ifndef STATUS_CONFLICTING_ADDRESSES
+#define STATUS_CONFLICTING_ADDRESSES    ((NTSTATUS)0xC0000018L)
+#endif
 #ifndef STATUS_ALREADY_COMMITTED
 #define STATUS_ALREADY_COMMITTED        ((NTSTATUS)0xC0000021L)
 #endif
@@ -556,6 +559,13 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
+/* Optional: a project sets this to see the guest paths the kernel translates
+ * (for example to print who opened a file). NULL by default; called before the
+ * path is translated, on the calling guest thread. Only paths a drive or
+ * device rule matches reach it: partition images and unrecognised paths
+ * do not. */
+extern void (*g_xbox_path_hook)(const char *xbox_path);
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */
@@ -662,6 +672,9 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     PLARGE_INTEGER ByteOffset);
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
+#ifdef _WIN32
+void xbox_dir_context_drop(HANDLE FileHandle);
+#endif
 
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes);
 

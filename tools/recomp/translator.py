@@ -28,6 +28,16 @@ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
 
+# Float compares snapshot at the compare as well, and their conditions read
+# nothing else: comiss/ucomiss/comisd/ucomisd store both operands into the
+# doubles _fca/_fcb (a float widens to double exactly, and the ordered and
+# unordered forms set identical flags), and the fcomi family stores the
+# ordering into g_fp_cmp. So a join of any two members of one family is the
+# same state whatever the operands were.
+_SSE_COMPARES = frozenset({"comiss", "ucomiss", "comisd", "ucomisd"})
+_FPU_COMPARES = frozenset({"fcomi", "fcomip", "fcompi", "fucomi", "fucomip", "fucompi"})
+
+
 def _merge_flag_states(states):
     """Merge comparable snapshots without requiring identical source operands.
 
@@ -35,12 +45,20 @@ def _merge_flag_states(states):
     runtime. A shared consumer can use whichever predecessor executed. Keep
     operation and width equal because sign/parity handling depends on them;
     arithmetic states still reconstruct operands and cannot use this merge.
+
+    Float compares join the same way (see _SSE_COMPARES). Without that, a jbe
+    after "comiss xmm3, xmm0" on one edge and "comiss xmm0, xmm3" on the other
+    -- MSVC's shape for a clamp whose direction depends on a sign -- fell back
+    to the never-assigned _flags, and the clamp always fired. T()NY zeroed its driven wheels' torque that way; the car crawled.
     """
     if not states or any(not state or not state[0] for state in states):
         return None
     first = states[0]
     if all(state == first for state in states[1:]):
         return first
+    for family in (_SSE_COMPARES, _FPU_COMPARES):
+        if all(state[0] in family for state in states):
+            return first
     if first[0] in ("cmp", "test") and len(first[1]) == 2:
         width = _operand_width(first[1][0]) or _operand_width(first[1][1])
         for kind, ops in states[1:]:
@@ -96,6 +114,71 @@ def _incoming_flag_state(sources, known, is_entry):
     return _merge_flag_states([known[p] for p in sources])
 
 
+_REG_TOKEN = None
+
+
+def _edge_flag_plan(bb, sources, known):
+    """Evaluate a join's flag condition on each incoming edge instead.
+
+    When the predecessors reach a join with states that do not merge -- a
+    `test eax, eax` on one edge and a `cmp eax, 1` on the other -- no single
+    condition at the join is right, and the jcc there lifted to the _flags
+    fallback, which nothing assigns: the branch was never taken. But each
+    predecessor knows its own state, so each can compute the join's
+    condition itself just before it transfers control, into a variable the
+    join then tests.
+
+    Returns (consumer mnemonic, {predecessor: condition}) or None. Only the
+    first flag reader of the join counts, and only when every predecessor's
+    condition is known. Instructions between the join's label and that reader
+    must leave the flags alone, and when there are any, a condition that reads
+    a live register (rather than a compare snapshot) is refused, because those
+    instructions may have changed it.
+    """
+    import re
+    from .lifter import (_EFLAGS_PRESERVE, _make_condition, _make_setcc_value,
+                         _make_cmovcc_cond)
+    global _REG_TOKEN
+    if _REG_TOKEN is None:
+        _REG_TOKEN = re.compile(
+            r"\b(e?[abcd]x|[abcd][lh]|e?[sd]il?|e?[sb]pl?|xmm\d|MEM\w*|LO8|HI8)\b")
+    if not sources or not all(known.get(p) for p in sources):
+        return None
+    consumer, before = None, 0
+    for insn in bb.instructions:
+        m = insn.mnemonic
+        if insn.is_cond_jump:
+            if m in ("jecxz", "jcxz", "loop", "loope", "loopne", "loopz", "loopnz"):
+                return None
+            consumer = insn
+            break
+        if m.startswith("set") or m.startswith("cmov"):
+            consumer = insn
+            break
+        if (m in _EFLAGS_PRESERVE and not insn.is_branch and not insn.is_call
+                and not insn.is_ret):
+            before += 1
+            continue
+        return None
+    if consumer is None:
+        return None
+    m = consumer.mnemonic
+    conds = {}
+    for p in sources:
+        setter, ops = known[p]
+        if consumer.is_cond_jump:
+            r = _make_condition(m, setter, ops)
+            c = r[0] if r else None
+        elif m.startswith("set"):
+            c = _make_setcc_value(m, setter, ops)
+        else:
+            c = _make_cmovcc_cond(m, setter, ops)
+        if not c or (before and _REG_TOKEN.search(c)):
+            return None
+        conds[p] = c
+    return m, conds
+
+
 def write_if_changed(path, text):
     """Write text to path only when it differs from what is already there.
 
@@ -115,6 +198,16 @@ def write_if_changed(path, text):
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return True
+
+
+# Hooked starts are protected before boundary repair by the CLI.
+ENTRY_HOOKS = set()
+
+
+def _is_safe_icall(line):
+    return any(name + "(" in line for name in (
+        "RECOMP_ICALL_SAFE", "RECOMP_ICALL_SAFE_AT",
+        "RECOMP_ICALL_SAFE_CC", "RECOMP_ICALL_SAFE_AT_CC"))
 
 
 def _fixup_icall_esp_save(lines):
@@ -156,7 +249,7 @@ def _fixup_icall_esp_save(lines):
     # Find indices of all ICALL_SAFE lines
     icall_indices = []
     for i, line in enumerate(lines):
-        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
+        if _is_safe_icall(line):
             icall_indices.append(i)
 
     if not icall_indices:
@@ -216,7 +309,7 @@ def _fixup_icall_esp_save(lines):
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
         result.append(line)
-        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
+        if _is_safe_icall(line):
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}}}")
 
@@ -1114,7 +1207,11 @@ class FunctionTranslator:
                     addr for addr in weak_starts[weak_index:]
                     if addr < upper and addr in cfg_targets
                 }
-                if not owned:
+                # Every path into a hand-written entry must reach it, so an
+                # owner whose CFG branches or falls through to one stays split.
+                falls_into = {insn.end_address for insn in instructions
+                              if not insn.is_terminator}
+                if not owned or (owned | falls_into) & self.protected_function_starts:
                     continue
 
                 self.owned_function_starts.update(owned)
@@ -1137,6 +1234,7 @@ class FunctionTranslator:
 
         Run after discover_cfg_ownership, which settles translated bounds.
         """
+        self._extend_over_trailing_tables()
         sites = []
         for start, info in self.func_db.items():
             if start in self.owned_function_starts:
@@ -1145,18 +1243,22 @@ class FunctionTranslator:
             if recovered:
                 end = recovered["end"]
                 instructions = recovered["instructions"]
+                known = recovered["jump_tables"]
             else:
                 end = info.get("end", start)
                 raw_bytes = self._read_func_bytes(start, end)
                 instructions = (
                     self.disasm.disassemble_function(raw_bytes, start, end)
                     if raw_bytes else [])
+                known = {}
             for insn in instructions:
                 if (insn.mnemonic != "jmp" or insn.jump_target
                         or not insn.operands
                         or insn.operands[0].type != "mem"):
                     continue
                 operand = insn.operands[0]
+                if operand.mem_disp in known:
+                    continue  # recovered as an in-function switch
                 if operand.mem_index and not operand.mem_base:
                     sites.append((start, end, operand.mem_disp))
 
@@ -1212,6 +1314,61 @@ class FunctionTranslator:
             self.jump_table_entry_starts.add(target)
 
         return self.jump_table_entry_starts
+
+    def _extend_over_trailing_tables(self):
+        """Extend a function cut at its own inline jump tables.
+
+        Hand-written CRT routines (MSVC's memcpy) interleave dword tables with
+        the arms they index, tables first. The function list ends such a
+        function where decoding meets its first table, leaving the arms in an
+        unowned gap. The arms branch back into the body, so they cannot run as
+        functions of their own. Recover the CFG through the gap, up to the next
+        function start, and keep it when every path stays inside it.
+
+        A tail_jump_alias entry is a second entry into another body, so it
+        does not bound the gap.
+        """
+        bounds = sorted(
+            addr for addr, info in self.func_db.items()
+            if info.get("detection_method") != "tail_jump_alias")
+        for start in bounds:
+            info = self.func_db[start]
+            if (start in self.owned_function_starts
+                    or start in self._recovered_cfg):
+                continue
+            end = info.get("end", start)
+            following = bisect.bisect_right(bounds, start)
+            if following >= len(bounds) or bounds[following] <= end:
+                continue
+            upper = bounds[following]
+            raw_bytes = self._read_func_bytes(start, end)
+            if not raw_bytes or not any(
+                    insn.mnemonic == "jmp" and insn.jump_target is None
+                    and insn.operands and insn.operands[0].type == "mem"
+                    and insn.operands[0].mem_index
+                    and not insn.operands[0].mem_base
+                    and start <= insn.operands[0].mem_disp < upper
+                    for insn in self.disasm.disassemble_function(
+                        raw_bytes, start, end)):
+                continue
+            recovered = self._recover_cfg(start, upper, set(), set())
+            if recovered is None or not recovered[1]:
+                continue
+            instructions, jump_tables, _ = recovered
+            new_end = max(insn.end_address for insn in instructions)
+            if new_end <= end or not self._arm_is_whole(start, instructions):
+                continue
+            info["end"] = new_end
+            info["size"] = new_end - start
+            info["num_instructions"] = len(instructions)
+            self._recovered_cfg[start] = {
+                "end": new_end,
+                "instructions": instructions,
+                "jump_tables": jump_tables,
+            }
+            print(f"Extended 0x{start:08X} from 0x{end:08X} to "
+                  f"0x{new_end:08X} over its inline jump tables",
+                  file=sys.stderr)
 
     def _arm_is_whole(self, target, instructions):
         """Return whether a recovered arm can run as a function of its own.
@@ -1610,6 +1767,7 @@ class FunctionTranslator:
             "cmpsb": {"esi", "edi"}, "cmpsw": {"esi", "edi"},
             "loop": {"ecx"}, "loope": {"ecx"}, "loopne": {"ecx"},
             "leave": {"esp", "ebp"}, "popad": set(full_registers),
+            "popal": set(full_registers), "pushal": {"esp"}, "pushad": {"esp"},
             "xlat": {"eax"}, "xlatb": {"eax"},
         }
 
@@ -2167,6 +2325,17 @@ class FunctionTranslator:
         name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
         size = end - start
         instructions, blocks = self.decode_function(start, end)
+        # Classify the actual immediately following guest instruction;
+        # generated ADD snapshots must not hide caller cleanup.
+        self.lifter.caller_cleanup_sites = {
+            call.address for call, following in zip(instructions, instructions[1:])
+            if call.is_call and call.end_address == following.address
+            and following.mnemonic == "add" and len(following.operands) == 2
+            and following.operands[0].type == "reg"
+            and following.operands[0].reg == "esp"
+            and following.operands[1].type == "imm"
+            and following.operands[1].imm > 0
+        }
         if not blocks:
             return None
 
@@ -2198,6 +2367,11 @@ class FunctionTranslator:
         # Ensure ebp tracked if function uses 'leave' (implicit ebp)
         if any(insn.mnemonic == "leave" for insn in instructions):
             used_regs.add("ebp")
+
+        # PUSHAD/POPAD implicitly read or restore every register.
+        if any(i.mnemonic in ("pushal", "pushad", "popal", "popad")
+               for i in instructions):
+            used_regs.update(("ebx", "esi", "edi", "ebp"))
 
         # Guest control leaves the bottom of this function when its last
         # instruction neither returns, jumps, nor traps. A function the lifter
@@ -2290,6 +2464,9 @@ class FunctionTranslator:
         # Function signature
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
+        if func_addr in ENTRY_HOOKS:
+            lines.append(f"    extern void sub_{func_addr:08X}_enter(void);")
+            lines.append(f"    sub_{func_addr:08X}_enter();")
 
         # Optional entry trace. Bring-up is mostly "which of these ten init
         # calls does it not come back from", and answering that by overriding
@@ -2554,6 +2731,12 @@ class FunctionTranslator:
             settled_state = out_state
             out_state = {}
 
+        unseen_entries = set(self.lifter.imm_code_refs)
+        for insn in instructions:
+            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
+                unseen_entries.update(self.lifter._analyze_switch_table(insn.operands))
+        edge_vars, edge_sets, block_lines = [], [], {}
+
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -2574,8 +2757,31 @@ class FunctionTranslator:
 
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
+
+            # A join whose predecessors disagree: let each edge evaluate the
+            # condition (see _edge_flag_plan). Blocks that may be entered
+            # from somewhere the edge list does not know -- a switch table, a
+            # code address taken as an immediate, the function entry -- keep
+            # the fallback, since an unseen edge would leave the variable
+            # holding another edge's answer.
+            if incoming is None and bb.start != start and bb.start not in unseen_entries:
+                plan = _edge_flag_plan(bb, preds[bb.start], settled_state)
+                if plan:
+                    m, conds = plan
+                    var = f"_jf_{bb.start:08X}"
+                    for k, stmt in enumerate(stmts):
+                        if f"_flags /* {m}" in stmt:
+                            stmts[k] = stmt.replace(f"_flags /* {m}", f"{var} /* {m}", 1)
+                            edge_vars.append(var)
+                            edge_sets.extend((p, var, c) for p, c in conds.items())
+                            break
+
+            first = len(lines)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
+            last = bb.instructions[-1] if bb.instructions else None
+            block_lines[bb.start] = (first, len(lines),
+                                     bool(last and (last.is_branch or last.is_ret)))
             bypass = debug_slide_bypasses.get(bb.last_insn.address)
             if bypass is not None:
                 lines.append(
@@ -2587,6 +2793,23 @@ class FunctionTranslator:
                 lines.append("    return; /* trap ends recovered control flow */")
 
             lines.append(f"")
+
+        # Each predecessor of such a join sets the join's variable as its last
+        # act before the jump (or at its end when it falls through). Inserted
+        # back to front so the recorded line numbers stay valid.
+        inserts = []
+        for p, var, cond in edge_sets:
+            first, stop, transfers = block_lines.get(p, (0, 0, False))
+            if stop > first:
+                inserts.append((stop - 1 if transfers else stop,
+                                f"    {var} = ({cond}) ? 1 : 0; /* flags of this edge */"))
+        for at, text in sorted(inserts, key=lambda t: -t[0]):
+            lines.insert(at, text)
+        if edge_vars:
+            decl = next((k for k, ln in enumerate(lines) if "fallback flag var" in ln), None)
+            if decl is not None:
+                lines.insert(decl + 1, "    int " + ", ".join(f"{v} = 0" for v in edge_vars)
+                             + "; /* per-edge flags of joins */")
 
         # Continue into the next function when control runs off the bottom.
         if fallthrough_target is not None:
@@ -3014,6 +3237,13 @@ class BatchTranslator:
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
 
+        # A wrapped function's body is sub_X_gen; the hand-written sub_X is
+        # what callers and indirect dispatch must reach, so declare it like
+        # any hand-written function.
+        for addr, func_info in func_list:
+            if func_info.get("wrapper_name"):
+                manual_decls[addr] = func_info["wrapper_name"]
+
         # Any address called but never defined needs a stub, or the link fails.
         # These are almost all mid-function entry points the function detector
         # did not split out: a call lands a few bytes inside (or just past) a
@@ -3230,8 +3460,8 @@ class BatchTranslator:
         # Sorted by address: recomp_lookup binary-searches this array, so an
         # appended entry would silently break every lookup past it.
         dispatch_entries = sorted(
-            list(translations) + [(addr, name, None)
-                                  for addr, name in manual_decls.items()],
+            [entry for entry in translations if entry[0] not in manual_decls]
+            + [(addr, name, None) for addr, name in manual_decls.items()],
             key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
         self._write_dispatch_table(dispatch_entries, dispatch_path, header_name)

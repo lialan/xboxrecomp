@@ -434,7 +434,7 @@ _EFLAGS_PRESERVE = frozenset({
     "loop", "loope", "loopne",
     # pushfd READS the flags and leaves them alone, so it belongs here.
     # popfd does NOT -- see _FLAGS_UNDEFINED.
-    "pushfd", "pushal",
+    "pushfd", "pushal", "pushad", "popal", "popad",
     "sgdt", "ljmp", "sfence",
     # SSE scalar float
     "movss", "movsd",
@@ -1338,6 +1338,7 @@ class Lifter:
         # generic dispatch stays as the fallback, so an unseen target is
         # slow, never wrong. See _lift_call.
         self.icall_site_targets = {}
+        self.caller_cleanup_sites = set()
         # Addresses loaded as immediates into a register inside the current
         # function, used to resolve `jmp <reg>`. See _lift_jmp.
         self.imm_code_refs = set()
@@ -1353,7 +1354,9 @@ class Lifter:
         that are not known function starts.
         """
         if addr in self.func_db:
-            name = self.func_db[addr].get("name", f"sub_{addr:08X}")
+            info = self.func_db[addr]
+            # A wrapped body is named sub_X_gen; calls go to the wrapper.
+            name = info.get("wrapper_name") or info.get("name", f"sub_{addr:08X}")
         elif addr in self.label_db:
             name = self.label_db[addr]
         else:
@@ -1395,6 +1398,16 @@ class Lifter:
             return self._lift_push(insn, ops)
         if m == "pop":
             return self._lift_pop(insn, ops)
+
+        # Save the pre-push ESP in the fifth slot; POPAD discards that
+        # slot rather than restoring ESP from memory. Neither changes flags.
+        if m in ("pushal", "pushad"):
+            return ["{ uint32_t _pa_esp = esp; PUSH32(esp, eax); PUSH32(esp, ecx); "
+                    "PUSH32(esp, edx); PUSH32(esp, ebx); PUSH32(esp, _pa_esp); "
+                    "PUSH32(esp, ebp); PUSH32(esp, esi); PUSH32(esp, edi); } /* pushal */"]
+        if m in ("popal", "popad"):
+            return ["POP32(esp, edi); POP32(esp, esi); POP32(esp, ebp); esp += 4; "
+                    "POP32(esp, ebx); POP32(esp, edx); POP32(esp, ecx); POP32(esp, eax); /* popal */"]
 
         # ── Arithmetic ──
         if m in ("add", "sub", "and", "or", "xor"):
@@ -2297,6 +2310,9 @@ class Lifter:
     LONGJMP_FN = None
 
     def _lift_call(self, insn, ops):
+        caller_cleans = insn.address in self.caller_cleanup_sites
+        safe_macro = "RECOMP_ICALL_SAFE_CC" if caller_cleans else "RECOMP_ICALL_SAFE"
+        safe_at_macro = "RECOMP_ICALL_SAFE_AT_CC" if caller_cleans else "RECOMP_ICALL_SAFE_AT"
         # x86 'call' pushes the address of the following instruction, then jumps.
         # Push that real guest address, not a placeholder: the value is visible
         # to the callee, and plenty of x86 code reads it. __SEH_prolog locates
@@ -2358,7 +2374,7 @@ class Lifter:
                 # replacement silently. Contributed in #15.
                 lines.append(
                     f"PUSH32(esp, 0x{ret_va:08X}u); "
-                    f"RECOMP_ICALL_SAFE(0x{insn.call_target:08X}u, "
+                    f"{safe_macro}(0x{insn.call_target:08X}u, "
                     "_icall_esp); "
                     f"/* manual call 0x{insn.call_target:08X} */")
             else:
@@ -2410,7 +2426,7 @@ class Lifter:
             site = insn.address
             head = (f"{{ uint32_t _icall_target = {target}; "
                     f"PUSH32(esp, 0x{ret_va:08X}u); ")
-            fallback = (f"RECOMP_ICALL_SAFE_AT(_icall_target, _icall_esp, "
+            fallback = (f"{safe_at_macro}(_icall_target, _icall_esp, "
                         f"0x{site:08X}u); }}")
             recorded = self.icall_site_targets.get(site)
             guards = [t for t in (recorded or [])
@@ -2558,7 +2574,10 @@ class Lifter:
         skipped = self._leading_arms(self._read_jump_table(table_va + 4))
         if len(skipped) >= 2:
             return skipped
-        below = self._leading_arms(self._read_jump_table_backward(table_va - 4))
+        # A table counted down from its last slot (`jmp [ecx*4 + LAST]`) has
+        # that one slot at the displacement itself, already in `inside`.
+        below = inside + self._leading_arms(
+            self._read_jump_table_backward(table_va - 4))
         if len(below) >= 2:
             return below
         return []
@@ -2737,6 +2756,28 @@ class Lifter:
 
     # ── String operations ──
 
+    def _lift_rep_movs(self, size, m):
+        """Keep forward non-overlap memcpy; MMIO/overlap/DF use volatile elements.
+
+        Validate the entire guest range in 64 bits before the host fast path,
+        including a range crossing into MMIO or wrapping the 32-bit address.
+        """
+        mem = f"MEM{size*8}"
+        return [
+            "{ uint64_t _n = (uint64_t)ecx * %du;" % size,
+            "if (!g_df && esi < 0xFD000000u && edi < 0xFD000000u"
+            " && (uint64_t)esi + _n <= 0xFD000000u"
+            " && (uint64_t)edi + _n <= 0xFD000000u) {",
+            "  uint8_t *_d = (uint8_t*)XBOX_PTR(edi), *_s = (uint8_t*)XBOX_PTR(esi);",
+            "  if ((uint64_t)edi + _n <= esi || (uint64_t)esi + _n <= edi) memcpy(_d, _s, (size_t)_n);",
+            f"  else {{ uint32_t _i; for (_i = 0; _i < ecx; _i++) {mem}(edi + _i*{size}u) = {mem}(esi + _i*{size}u); }}",
+            f"  esi += ecx * {size}u; edi += ecx * {size}u; }}",
+            f"else {{ uint32_t _i; int32_t _st = RECOMP_DF_STEP({size});",
+            f"  for (_i = 0; _i < ecx; _i++) {mem}(edi + _i*_st) = {mem}(esi + _i*_st);",
+            "  esi += ecx * _st; edi += ecx * _st; }",
+            f"ecx = 0; }} /* {m} */",
+        ]
+
     def _lift_rep_string(self, insn, m):
         # Every one of these steps by RECOMP_DF_STEP(size) rather than a
         # literal, because EFLAGS.DF decides the direction and the block
@@ -2760,34 +2801,11 @@ class Lifter:
         # memcpy is still used when the ranges provably do not overlap, which
         # is the overwhelming majority of calls.
         if "movsb" in m:
-            return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
-                    " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
-                    "  else { uint32_t _i; for (_i = 0; _i < _n; _i++) _d[_i] = _s[_i]; }",
-                    "  esi += ecx; edi += ecx; }",
-                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
-                    " MEM8(edi - _i) = MEM8(esi - _i); esi -= ecx; edi -= ecx; }",
-                    "ecx = 0; /* rep movsb */"]
+            return self._lift_rep_movs(1, m)
         if "movsd" in m:
-            return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
-                    " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 4;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
-                    "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
-                    " MEM32(edi + _i*4) = MEM32(esi + _i*4); }",
-                    "  esi += ecx * 4; edi += ecx * 4; }",
-                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
-                    " MEM32(edi - _i*4) = MEM32(esi - _i*4); esi -= ecx * 4; edi -= ecx * 4; }",
-                    "ecx = 0; /* rep movsd */"]
+            return self._lift_rep_movs(4, m)
         if "movsw" in m:
-            return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
-                    " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 2;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
-                    "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
-                    " MEM16(edi + _i*2) = MEM16(esi + _i*2); }",
-                    "  esi += ecx * 2; edi += ecx * 2; }",
-                    "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
-                    " MEM16(edi - _i*2) = MEM16(esi - _i*2); esi -= ecx * 2; edi -= ecx * 2; }",
-                    "ecx = 0; /* rep movsw */"]
+            return self._lift_rep_movs(2, m)
         if "stosb" in m:
             return ["if (!g_df) { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
