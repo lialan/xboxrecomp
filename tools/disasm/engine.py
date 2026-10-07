@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CsInsn
-from capstone import CS_OP_IMM, CS_OP_MEM, CS_OP_REG
+from capstone import (CS_OP_IMM, CS_OP_MEM, CS_OP_REG,
+                      CS_GRP_INT, CS_GRP_IRET, CS_GRP_PRIVILEGE)
 
 from . import config
 from .loader import BinaryImage, SectionInfo
@@ -530,6 +531,92 @@ class DisasmEngine:
                 if count >= max_insns:
                     return False
         return False
+
+    def probes_as_callback_body(self, addr: int, upper: int,
+                                lower: Optional[int] = None,
+                                tail_targets=()) -> bool:
+        """Read-only proof of a closed callback CFG inside an unclaimed gap.
+
+        Calls may return from other functions; branches and fallthrough must
+        stay on decoded instruction boundaries. Reuse the translator's CFG
+        decoder and the sweep's measured switch tables, without a size cap.
+        """
+        from ..recomp.disasm import Disassembler
+
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        lower = addr if lower is None else max(lower, section.virtual_addr)
+        upper = min(upper, section.virtual_addr + len(data))
+        raw = data[lower - section.virtual_addr:upper - section.virtual_addr]
+        decoder = Disassembler()
+        entries = {addr}
+        tables = {}
+        while True:
+            decoded = decoder.disassemble_cfg(
+                raw, lower, upper, entries,
+                stop_mnemonics=("int3", "int", "ud2", "hlt", "iret", "iretd"))
+            arms = set()
+            for insn in decoded:
+                if not insn.is_jump or insn.jump_target is not None:
+                    continue
+                if not insn.operands:
+                    return False
+                op = insn.operands[0]
+                if (op.type != "mem" or not op.mem_index or op.mem_base
+                        or op.mem_scale != 4 or op.mem_seg):
+                    return False
+                targets = self.jump_table_entries(op.mem_disp)
+                if not targets or any(not lower <= t < upper for t in targets):
+                    return False
+                tables[insn.address] = targets
+                arms.update(targets)
+            if arms <= entries:
+                break
+            entries.update(arms)
+
+        starts = {insn.address for insn in decoded}
+        call_ends = {insn.end_address for insn in decoded if insn.is_call}
+        branch_targets = {insn.jump_target for insn in decoded if insn.is_branch}
+        branch_targets.update(arms)
+        end = lower
+        exits = backward = False
+        for insn in decoded:
+            if insn.address < end or insn.end_address > upper:
+                return False  # two reachable streams overlap
+            end = insn.end_address
+            # Same no-return shape as static callback recovery. A branch into
+            # the padding is a trap, not evidence that the call never returns.
+            if (insn.mnemonic == "int3" and insn.address in call_ends
+                    and insn.address not in branch_targets):
+                exits = True
+                continue
+            if (set(insn.groups) & {CS_GRP_INT, CS_GRP_IRET, CS_GRP_PRIVILEGE}
+                    or insn.mnemonic.split()[-1] in (
+                        "ud2", "ud0", "ud1", "retf", "in", "out",
+                        "insb", "insw", "insd", "outsb", "outsw", "outsd")):
+                return False
+            if insn.is_ret:
+                exits = True
+                continue
+            edges = []
+            if insn.is_branch:
+                edges = ([insn.jump_target] if insn.jump_target is not None
+                         else tables.get(insn.address, []))
+                if not edges:
+                    return False
+            if not insn.is_jump:
+                edges = [*edges, insn.end_address]
+            for edge in edges:
+                if edge in starts:
+                    continue
+                if edge == insn.jump_target and edge in tail_targets:
+                    exits = True  # preserve proven tails to existing bodies
+                    continue
+                return False
+            backward |= any(edge <= insn.address for edge in edges)
+        return bool(decoded) and (exits or backward)
 
     def _first_arm_after(self, table: int, site: int) -> Optional[int]:
         """The lowest entry of a measured jump table that lies past `site`,

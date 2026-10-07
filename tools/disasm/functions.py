@@ -573,22 +573,35 @@ class FunctionDetector:
                              or self.engine.probes_as_constant_stub(target)
                              or self.engine.probes_as_vcall_thunk(target))):
                 continue
-            # A ret, not merely a terminator: an immediate is weak evidence,
-            # so the probe has to reject data that happens to disassemble. The
-            # cap also keeps a wrong guess from walking the rest of the section.
+            # Weak references must close their CFG within the unclaimed gap.
             # ...or a virtual-call thunk, which never reaches a ret: it
             # dispatches through the vtable and is gone. Those are taken by
             # address and passed around as values, so an immediate is exactly
             # how they show up.
             first = self.engine.get_instruction(target)
+            destination = first.jump_target if first and first.is_jump else None
+            destination_end = (self.image.get_section_at_va(destination)
+                               if destination is not None else None)
+            if destination_end is not None:
+                k = bisect.bisect_right(starts, destination)
+                destination_end = (destination_end.virtual_addr
+                                   + destination_end.virtual_size)
+                if k < len(starts):
+                    destination_end = min(destination_end, starts[k])
             direct_thunk = (first is not None and first.is_jump
                             and first.jump_target is not None
                             and in_code_section(first.jump_target)
-                            and self.engine.probes_as_returning_body(
-                                first.jump_target))
+                            and destination_end is not None
+                            and self.engine.probes_as_callback_body(
+                                first.jump_target, destination_end))
             # An address-taken direct thunk is also callable when its
             # destination supplies the return; tail closure finds that body.
-            if not (self.engine.probes_as_returning_body(target)
+            section = self.image.get_section_at_va(target)
+            i = bisect.bisect_right(starts, target)
+            upper = section.virtual_addr + section.virtual_size
+            if i < len(starts):
+                upper = min(upper, starts[i])
+            if not (self.engine.probes_as_callback_body(target, upper)
                     or self.engine.probes_as_vcall_thunk(target)
                     or direct_thunk):
                 continue
@@ -760,9 +773,20 @@ class FunctionDetector:
         for sec in sections:
             section_end[sec.name] = sec.virtual_addr + sec.virtual_size
 
+        # Preserve shared tails into already-proven callback aliases. Only
+        # reachable instruction boundaries count as destinations.
+        tails = set(self.functions)
+        for entry, alias_end in self._alias_entries.items():
+            tails.update(self.engine.recursive_descent(
+                [entry], [(entry, alias_end)]))
         found = 0
         for target in sorted(targets):
             if target in self.functions or target in self._alias_entries:
+                continue
+            # A borrowed alias extent is not an entry boundary. Table words
+            # can name valid instruction suffixes inside an already-reachable
+            # callback; only disconnected bodies remain weak entry candidates.
+            if target in tails:
                 continue
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bounds[j][0] < target < bounds[j][1]:
@@ -798,16 +822,21 @@ class FunctionDetector:
                 first = self.engine.instructions[target]
                 if first.mnemonic.lower() in ("int3", "nop"):
                     continue
-                if not self.engine.probes_as_function_body(target,
-                                                           max_insns=64):
-                    continue
                 i = bisect.bisect_right(starts, target)
                 sec = self.image.get_section_at_va(target)
-                end = starts[i] if i < len(starts) else section_end.get(
+                end = section_end.get(
                     sec.name if sec else "", target + 4)
+                if i < len(starts):
+                    end = min(end, starts[i])
+                lower = bounds[j][1] if j >= 0 else sec.virtual_addr
+                if not (self.engine.probes_as_callback_body(
+                            target, end, lower, tail_targets=tails)
+                        or self.engine.probes_as_vcall_thunk(target)):
+                    continue
             if end <= target:
                 continue
             self._alias_entries[target] = end
+            tails.update(self.engine.recursive_descent([target], [(target, end)]))
             found += 1
 
         if found:
