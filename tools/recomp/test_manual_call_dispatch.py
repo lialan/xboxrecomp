@@ -1,5 +1,6 @@
 """Tests for calls to functions replaced through manual dispatch."""
 
+import os
 import tempfile
 
 from tools.recomp.disasm import BasicBlock, Instruction, Operand
@@ -124,3 +125,32 @@ def test_split_translation_passes_manual_set_to_lifter():
             functions, output_dir, manual={TARGET})
 
     assert batch.translator.seen_manual == {TARGET}
+
+
+def test_wrapped_function_body_is_gen_and_calls_reach_wrapper():
+    # --exclude-manual wrap: the body is emitted as sub_X_gen, while direct
+    # calls, the header and the dispatch table all name the wrapper sub_X.
+    class FakeTranslator:
+        def __init__(self, func_db):
+            self.owned_function_starts = set()
+            self.lifter = Lifter(func_db=func_db)
+
+        def translate_function(self, addr, func_info):
+            return f"void {func_info['name']}(void) {{}}"
+
+    info = {"name": "sub_001E9100_gen", "wrapper_name": "sub_001E9100"}
+    lifter = Lifter(func_db={TARGET: info})
+    assert "sub_001E9100_gen" not in "\n".join(
+        lifter.lift_instruction(_direct_call()))
+
+    batch = BatchTranslator.__new__(BatchTranslator)
+    batch.translator = FakeTranslator({TARGET: info})
+    with tempfile.TemporaryDirectory() as output_dir:
+        batch.translate_batch_split([(TARGET, info)], output_dir)
+        header = open(os.path.join(output_dir, "recomp_funcs.h")).read()
+        dispatch = open(os.path.join(output_dir, "recomp_dispatch.c")).read()
+
+    assert "void sub_001E9100_gen(void)" in header
+    assert "void sub_001E9100(void);" in header
+    assert "(recomp_func_t)sub_001E9100 }" in dispatch
+    assert "(recomp_func_t)sub_001E9100_gen" not in dispatch

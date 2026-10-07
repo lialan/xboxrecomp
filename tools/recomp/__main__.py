@@ -460,9 +460,11 @@ def main():
 
             # wrap: recomp_manual.c defines sub_X itself and calls the generated
             # body as sub_X_gen. So do NOT add these to `manual` (the body is
-            # still needed) -- just rename them so the emitted body is sub_X_gen.
+            # still needed) -- rename the emitted body to sub_X_gen, and keep
+            # sub_X as the name every call and dispatch entry uses.
             for addr in wrap & known:
                 translator.func_db[addr]["name"] = f"sub_{addr:08X}_gen"
+                translator.func_db[addr]["wrapper_name"] = f"sub_{addr:08X}"
 
             # skip - wrap: defined by hand and not wrapped -> declare-only, which
             # is exactly what membership in `manual` produces.
