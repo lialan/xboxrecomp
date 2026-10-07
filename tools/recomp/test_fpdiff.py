@@ -27,6 +27,9 @@ CASES = (
     # Trig range, remainder, scale and exp/log edge cases; fisttp chops.
     "fsin", "fcos", "fptan", "f2xm1", "fyl2xp1", "fprem", "fscale", "fisttp",
     "seq_fptan",
+    # SSE conversions under MXCSR, rcp/rsqrt estimates, SSE2 scalar doubles.
+    "cvts", "cvtt", "cvtps", "cvtpi", "rcp", "rsqrt", "addsd", "subsd",
+    "mulsd", "divsd", "minsd", "maxsd", "sqrtsd", "comisd", "ucomisd",
 )
 
 

@@ -62,6 +62,7 @@
 #include <math.h>
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
 #include <xmmintrin.h>
+#include <emmintrin.h>
 #endif
 
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
@@ -657,8 +658,24 @@ static inline RecompXmm XMM_CMP_PRED(RecompXmm a, RecompXmm b, int p) {
 }
 /* Packed unary ops; the first argument is unused, as for the binary forms. */
 RECOMP_XMM_LANEWISE(XMM_SQRT,  sqrtf(b.f[i]))
-RECOMP_XMM_LANEWISE(XMM_RSQRT, 1.0f / sqrtf(b.f[i]))
-RECOMP_XMM_LANEWISE(XMM_RCP,   1.0f / b.f[i])
+/* These instructions deliberately approximate and treat denormals as zero.
+ * Exact division changes Newton refinement and zero-mask idioms. */
+static inline float recomp_rcpss(float x) {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return _mm_cvtss_f32(_mm_rcp_ss(_mm_set_ss(x)));
+#else
+    return 1.0f / (fpclassify(x) == FP_SUBNORMAL ? copysignf(0.0f, x) : x);
+#endif
+}
+static inline float recomp_rsqrtss(float x) {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(x)));
+#else
+    return 1.0f / sqrtf(fpclassify(x) == FP_SUBNORMAL ? copysignf(0.0f, x) : x);
+#endif
+}
+RECOMP_XMM_LANEWISE(XMM_RSQRT, recomp_rsqrtss(b.f[i]))
+RECOMP_XMM_LANEWISE(XMM_RCP, recomp_rcpss(b.f[i]))
 
 /** movmskps: the four lane sign bits, packed into the low nibble. */
 static inline uint32_t XMM_MOVEMASK(RecompXmm a) {
@@ -1255,6 +1272,22 @@ static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
     RecompMmx r;
     r.d[0] = MMX_CVT_F2I(lo, truncate);
     r.d[1] = MMX_CVT_F2I(hi, truncate);
+    return r;
+}
+
+static inline int32_t recomp_sse_d2i(double v, int truncate) {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return truncate ? _mm_cvttsd_si32(_mm_set_sd(v))
+                    : _mm_cvtsd_si32(_mm_set_sd(v));
+#else
+    double rounded = truncate ? trunc(v) : nearbyint(v);
+    return rounded >= -2147483648.0 && rounded < 2147483648.0
+        ? (int32_t)rounded : INT32_MIN;
+#endif
+}
+static inline RecompXmm XMM_CVT_PS2DQ(RecompXmm v, int truncate) {
+    RecompXmm r; int i;
+    for (i = 0; i < 4; ++i) r.i[i] = MMX_CVT_F2I(v.f[i], truncate);
     return r;
 }
 

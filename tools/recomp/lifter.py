@@ -444,7 +444,7 @@ _EFLAGS_PRESERVE = frozenset({
     "minsd", "maxsd", "sqrtsd",
     "cvtsi2ss", "cvtss2si", "cvttss2si",
     "cvtsi2sd", "cvtsd2si", "cvttsd2si",
-    "cvtss2sd", "cvtsd2ss",
+    "cvtss2sd", "cvtsd2ss", "cvtps2dq", "cvttps2dq",
     "cmpss", "cmpsd",
     "cmpltss", "cmpeqss", "cmpleps", "cmpneqss",
     # SSE packed float
@@ -1634,7 +1634,7 @@ class Lifter:
                  "comiss", "comisd", "ucomiss", "ucomisd",
                  "cvtsi2ss", "cvtss2si", "cvttss2si",
                  "cvtsi2sd", "cvtsd2si", "cvttsd2si",
-                 "cvtss2sd", "cvtsd2ss",
+                 "cvtss2sd", "cvtsd2ss", "cvtps2dq", "cvttps2dq",
                  "xorps", "xorpd", "andps", "orps", "andnps",
                  "movd", "movq",
                  "shufps", "unpcklps", "unpckhps",
@@ -3137,7 +3137,8 @@ class Lifter:
         # and write lane 0 explicitly rather than the whole register.
         def _sse_read(op):
             if _is_xmm(op):
-                return f"{op.reg}.f[0]"
+                lane = "d" if (m.endswith("sd") and m != "cvtss2sd") or m in ("cvtsd2si", "cvttsd2si", "cvtsd2ss") else "f"
+                return f"{op.reg}.{lane}[0]"
             elif op.type == "reg":
                 return op.reg
             elif op.type == "mem":
@@ -3150,7 +3151,8 @@ class Lifter:
 
         def _sse_write(op, val):
             if _is_xmm(op):
-                return f"{op.reg}.f[0] = {val};"
+                lane = "d" if m.endswith("sd") else "f"
+                return f"{op.reg}.{lane}[0] = {val};"
             elif op.type == "reg":
                 return f"{op.reg} = {val};"
             elif op.type == "mem":
@@ -3271,7 +3273,8 @@ class Lifter:
                 return [_sse_write(ops[0], f"{_sse_read(ops[0])} / {_sse_read(ops[1])}") + f" /* {m} */"]
         if m in ("sqrtss", "sqrtsd"):
             if nops >= 2:
-                return [_sse_write(ops[0], f"sqrtf({_sse_read(ops[1])})") + f" /* {m} */"]
+                fn = "sqrt" if m == "sqrtsd" else "sqrtf"
+                return [_sse_write(ops[0], f"{fn}({_sse_read(ops[1])})") + f" /* {m} */"]
         if m in ("minss", "minsd"):
             if nops >= 2:
                 a, b = _sse_read(ops[0]), _sse_read(ops[1])
@@ -3299,14 +3302,19 @@ class Lifter:
                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
         if m in ("cvtss2si", "cvttss2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                trunc = int(m == "cvttss2si")
+                return [_fmt_operand_write(ops[0], f"MMX_CVT_F2I({_sse_read(ops[1])}, {trunc})") + f" /* {m} */"]
         if m == "cvtsi2sd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(double)(int32_t){src}") + " /* cvtsi2sd */"]
         if m in ("cvtsd2si", "cvttsd2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                trunc = int(m == "cvttsd2si")
+                return [_fmt_operand_write(ops[0], f"recomp_sse_d2i({_sse_read(ops[1])}, {trunc})") + f" /* {m} */"]
+        if m in ("cvtps2dq", "cvttps2dq") and nops >= 2:
+            src = _packed_read(ops[1])
+            return [_packed_write(ops[0], f"XMM_CVT_PS2DQ({src}, {int(m == 'cvttps2dq')})") + f" /* {m} */"]
         if m == "cvtss2sd":
             if nops >= 2:
                 return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]
@@ -3355,10 +3363,10 @@ class Lifter:
         # ── Reciprocal / rsqrt ──
         if m == "rsqrtss":
             if nops >= 2:
-                return [_sse_write(ops[0], f"1.0f / sqrtf({_sse_read(ops[1])})") + " /* rsqrtss */"]
+                return [_sse_write(ops[0], f"recomp_rsqrtss({_sse_read(ops[1])})") + " /* rsqrtss */"]
         if m == "rcpss":
             if nops >= 2:
-                return [_sse_write(ops[0], f"1.0f / {_sse_read(ops[1])}") + " /* rcpss */"]
+                return [_sse_write(ops[0], f"recomp_rcpss({_sse_read(ops[1])})") + " /* rcpss */"]
 
         # ── Packed sqrt / reciprocal / rsqrt ──
         # The SSE model here tracks only the low lane as a single float, so
