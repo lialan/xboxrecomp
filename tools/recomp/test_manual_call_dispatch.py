@@ -154,3 +154,24 @@ def test_wrapped_function_body_is_gen_and_calls_reach_wrapper():
     assert "void sub_001E9100(void);" in header
     assert "(recomp_func_t)sub_001E9100 }" in dispatch
     assert "(recomp_func_t)sub_001E9100_gen" not in dispatch
+
+
+def test_wrapped_body_is_translated_even_when_filtered_or_manual():
+    # The hand-written wrapper calls sub_X_gen, so neither a category filter
+    # nor a --manual-functions entry may drop that body.
+    from types import SimpleNamespace
+
+    from .__main__ import _wrap_generated_bodies
+
+    other = 0x00120000
+    func_db = {TARGET: {"name": "sub_001E9100"}, other: {"name": "sub_00120000"}}
+    batch = SimpleNamespace(
+        func_db=func_db,
+        translator=SimpleNamespace(owned_function_starts=set()))
+    funcs, manual = _wrap_generated_bodies(
+        batch, [(other, func_db[other])], {TARGET, other}, {TARGET})
+
+    assert [addr for addr, _ in funcs] == [other, TARGET]
+    assert manual == {other}
+    assert func_db[TARGET]["name"] == "sub_001E9100_gen"
+    assert func_db[TARGET]["wrapper_name"] == "sub_001E9100"
