@@ -498,3 +498,6 @@ for _op in (
             "MMX preserves the comparison/carry consumed afterward",
             ["pxor mm0, mm0", "pxor mm1, mm1", "xorps xmm0, xmm0"]
             + _before + [_op] + _after + ["emms"], [(0, 7), (1, 7)]))
+
+CASES.append(Case("pushad_popad", "POPAD restores registers and skips saved ESP",
+    ["pushad", "mov eax, 0", "mov ecx, 0", "popad", "add eax, ecx"], _PAIRS))
