@@ -580,8 +580,17 @@ class FunctionDetector:
             # dispatches through the vtable and is gone. Those are taken by
             # address and passed around as values, so an immediate is exactly
             # how they show up.
+            first = self.engine.get_instruction(target)
+            direct_thunk = (first is not None and first.is_jump
+                            and first.jump_target is not None
+                            and in_code_section(first.jump_target)
+                            and self.engine.probes_as_returning_body(
+                                first.jump_target))
+            # An address-taken direct thunk is also callable when its
+            # destination supplies the return; tail closure finds that body.
             if not (self.engine.probes_as_returning_body(target)
-                    or self.engine.probes_as_vcall_thunk(target)):
+                    or self.engine.probes_as_vcall_thunk(target)
+                    or direct_thunk):
                 continue
             if target not in self.engine.instructions:
                 if not self.engine.decode_at(target):
