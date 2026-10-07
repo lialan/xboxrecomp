@@ -506,6 +506,40 @@ class FunctionDetector:
             print(f"  {found} function address(es) installed into"
                   f" indirect-call slots")
 
+    def _probes_as_direct_thunk(self, target, starts, sections) -> bool:
+        """Prove a direct thunk's tail dependencies in their own bounded gaps."""
+        first = self.engine.get_instruction(target)
+        if first is None or not first.is_jump or first.jump_target is None:
+            return False
+        proven = set(self.functions) | self._alias_entries.keys()
+        pending = [target]
+        visiting = set()
+        while pending:
+            entry = pending[-1]
+            if entry in proven:
+                pending.pop()
+                continue
+            section = next((sec for sec in sections if sec.virtual_addr <= entry
+                            < sec.virtual_addr + sec.virtual_size), None)
+            if section is None:
+                return False
+            upper = section.virtual_addr + section.virtual_size
+            index = bisect.bisect_right(starts, entry)
+            if index < len(starts):
+                upper = min(upper, starts[index])
+            if self.engine.probes_as_callback_body(entry, upper, tail_targets=proven):
+                proven.add(entry)
+                pending.pop()
+                continue
+            if entry in visiting:
+                return False
+            visiting.add(entry)
+            tail = self.engine.block_tail_jump(entry, max_insns=upper - entry)
+            if tail is None or tail in visiting or tail in proven:
+                return False
+            pending.append(tail)
+        return target in proven
+
     def _pass_imm_ref_targets(self, sections: List[SectionInfo]) -> bool:
         """
         An immediate that points into unclaimed executable bytes and decodes as
@@ -587,22 +621,6 @@ class FunctionDetector:
             # dispatches through the vtable and is gone. Those are taken by
             # address and passed around as values, so an immediate is exactly
             # how they show up.
-            first = self.engine.get_instruction(target)
-            destination = first.jump_target if first and first.is_jump else None
-            destination_end = (self.image.get_section_at_va(destination)
-                               if destination is not None else None)
-            if destination_end is not None:
-                k = bisect.bisect_right(starts, destination)
-                destination_end = (destination_end.virtual_addr
-                                   + destination_end.virtual_size)
-                if k < len(starts):
-                    destination_end = min(destination_end, starts[k])
-            direct_thunk = (first is not None and first.is_jump
-                            and first.jump_target is not None
-                            and in_code_section(first.jump_target)
-                            and destination_end is not None
-                            and self.engine.probes_as_callback_body(
-                                first.jump_target, destination_end))
             # An address-taken direct thunk is also callable when its
             # destination supplies the return; tail closure finds that body.
             section = self.image.get_section_at_va(target)
@@ -612,7 +630,7 @@ class FunctionDetector:
                 upper = min(upper, starts[i])
             if not (self.engine.probes_as_callback_body(target, upper)
                     or self.engine.probes_as_vcall_thunk(target)
-                    or direct_thunk):
+                    or self._probes_as_direct_thunk(target, starts, sections)):
                 continue
             if target not in self.engine.instructions:
                 if not self.engine.decode_at(target):
@@ -842,7 +860,8 @@ class FunctionDetector:
                 if not (self.engine.probes_as_callback_body(
                             target, end, lower, tail_targets=tails)
                         or self.engine.probes_as_vcall_thunk(target)):
-                    continue
+                    if not self._probes_as_direct_thunk(target, starts, sections):
+                        continue
             if end <= target:
                 continue
             self._alias_entries[target] = end

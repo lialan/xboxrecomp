@@ -108,3 +108,28 @@ def test_immediate_suffix_cannot_split_a_long_table_callback():
     assert suffix not in detector._candidates
     assert suffix not in detector.functions
     assert detector.functions[callback].end >= callback + 203
+
+
+@pytest.mark.parametrize('valid', [True, False])
+def test_table_thunk_chain_requires_a_proven_destination(valid):
+    from tools.disasm.engine import DisasmEngine
+    body = bytearray(b'\xcc' * 460)
+    for off in (0, 32, 96):
+        body[off] = 0xc3
+    for source, target in ((16, 64), (64, 128)):
+        body[source:source + 5] = b'\xe9' + struct.pack('<i', target - source - 5)
+    body[128:449] = b'\x40' * 320 + b'\xc3'
+    if not valid:
+        body[128] = 0xf4
+    table = struct.pack('<I', BASE + 16)
+    text = SectionInfo('.text', BASE, len(body), 0, len(body), False, True, '')
+    data = SectionInfo('.data', BASE + 0x1000, len(table), len(body), len(table), False, False, '')
+    image = BinaryImage('synthetic', bytes(body) + table, 0, 0x20000, BASE, 0, [text, data])
+    engine = DisasmEngine(image)
+    engine.linear_sweep(text)
+    detector = FunctionDetector(engine, image, None, LabelManager())
+    for off in (0, 32, 96):
+        detector.functions[BASE + off] = Function(BASE + off, BASE + off + 1, 'known')
+    assert not engine.probes_as_callback_body(BASE + 16, BASE + 32)
+    detector._pass_data_ptr_targets([text])
+    assert (BASE + 16 in detector._alias_entries) == valid
