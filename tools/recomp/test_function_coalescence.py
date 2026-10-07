@@ -489,6 +489,7 @@ def test_ownership_keeps_protected_entries_standalone():
     subject.protected_function_starts.add(BASE + 0x30)
     subject.discover_cfg_ownership()
     assert not subject.owned_function_starts
+    assert not subject._recovered_cfg
 
 
 def test_explicit_coalesced_owner_stays_strong_during_ownership():

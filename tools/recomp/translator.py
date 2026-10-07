@@ -861,12 +861,11 @@ class FunctionTranslator:
                 instructions, jump_tables, cfg_targets = recovered
                 owned = {
                     addr for addr in weak_starts[weak_index:]
-                    # A hand-written wrapper calls the entry's own generated
-                    # body, so a protected entry keeps it.
                     if addr < upper and addr in cfg_targets
-                    and addr not in self.protected_function_starts
                 }
-                if not owned:
+                # Every path into a hand-written entry must reach it, so an
+                # owner whose CFG runs through one stays split.
+                if not owned or owned & self.protected_function_starts:
                     continue
 
                 self.owned_function_starts.update(owned)
