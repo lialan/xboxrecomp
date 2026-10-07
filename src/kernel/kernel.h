@@ -559,9 +559,11 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
-/* Optional: a project sets this to see every guest path the kernel translates
+/* Optional: a project sets this to see the guest paths the kernel translates
  * (for example to print who opened a file). NULL by default; called before the
- * path is translated, on the calling guest thread. */
+ * path is translated, on the calling guest thread. Only paths a drive or
+ * device rule matches reach it: partition images and unrecognised paths
+ * do not. */
 extern void (*g_xbox_path_hook)(const char *xbox_path);
 
 /* ============================================================================
