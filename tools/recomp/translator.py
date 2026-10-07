@@ -864,8 +864,10 @@ class FunctionTranslator:
                     if addr < upper and addr in cfg_targets
                 }
                 # Every path into a hand-written entry must reach it, so an
-                # owner whose CFG runs through one stays split.
-                if not owned or owned & self.protected_function_starts:
+                # owner whose CFG branches or falls through to one stays split.
+                falls_into = {insn.end_address for insn in instructions
+                              if not insn.is_terminator}
+                if not owned or (owned | falls_into) & self.protected_function_starts:
                     continue
 
                 self.owned_function_starts.update(owned)
