@@ -863,11 +863,87 @@ def test_callback_in_a_sections_last_gap_stops_at_its_section(monkeypatch):
     raw[0x100] = 0xC3
     subject = FunctionTranslator(bytes(raw), {
         BASE: function(BASE, BASE + len(pattern)),
-        second: function(second, second + 1),
+        second: {**function(second, second + 1), "section": "LIB"},
     })
     subject.discover_static_indirect_targets()
     assert callback in subject.func_db
     assert subject.func_db[callback]["end"] == BASE + 0x100
+    assert subject.func_db[callback]["section"] == ".text"
+
+
+def test_owner_with_a_data_switch_table_still_yields_a_later_callback(monkeypatch):
+    # The owner indexes a table in .data, far above the callback. Only
+    # embedded table storage can overlap the callback, so the owner is
+    # trimmed and the callback gets a body.
+    owner, callback, following = BASE + 0x40, BASE + 0x80, BASE + 0x100
+    table = BASE + 0x300
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", BASE, 0x280, 0, 0x280, True),
+        config.Section(".data", BASE + 0x280, 0x180, 0x280, 0x180, False),
+    ])
+    registration = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(registration)] = registration
+    body = bytes.fromhex("31c0ff2485") + table.to_bytes(4, "little")
+    raw[0x40:0x40 + len(body)] = body
+    raw[0x50] = raw[0x51] = raw[0x80] = raw[0x100] = 0xC3
+    raw[0x300:0x308] = ((BASE + 0x50).to_bytes(4, "little")
+                        + (BASE + 0x51).to_bytes(4, "little"))
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(registration)),
+        owner: function(owner, callback + 1),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert subject.func_db[owner]["end"] == callback
+
+
+def test_dependencies_come_only_from_reachable_callback_code():
+    # A table callback returns at once; a call decoded after its ret cannot
+    # run, so its target is not a dependency.
+    callback, stray, following = BASE + 0x80, BASE + 0xc0, BASE + 0x100
+    table = BASE + 0x300
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x86] = b"\xc3\xe8" + (stray - callback - 6).to_bytes(4, "little")
+    raw[0xc0] = raw[0x100] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert stray not in subject.func_db
+
+
+def test_callback_call_to_a_known_function_is_entry_evidence():
+    # A recovered callback calls an existing function directly. During
+    # coalescence that call is evidence, as a callback table entry is.
+    callback, known, following = BASE + 0x80, BASE + 0x40, BASE + 0x100
+    pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x40] = raw[0x100] = 0xC3
+    raw[0x80:0x86] = b"\xe8" + (known - callback - 5).to_bytes(4, "little", signed=True) + b"\xc3"
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        known: function(known, known + 1),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets(coalescing=True)
+    assert callback in subject.func_db
+    assert f"0x{callback:08X}" in subject.func_db[known]["called_by"]
 
 
 def test_jump_table_case_can_recover_register_continuation():

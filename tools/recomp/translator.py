@@ -439,13 +439,7 @@ class FunctionTranslator:
                 for target in targets:
                     if target in self.func_db:
                         if coalescing:
-                            known_callers = {
-                                int(value, 16) if isinstance(value, str) else value
-                                for value in self.func_db[target].get("called_by") or []
-                            }
-                            known_callers.add(caller)
-                            self.func_db[target]["called_by"] = [
-                                f"0x{value:08X}" for value in sorted(known_callers)]
+                            self._add_caller(target, caller)
                         continue
                     if coalescing:
                         index = bisect.bisect_right(original_starts, target)
@@ -458,18 +452,30 @@ class FunctionTranslator:
                                     f"coalesced function 0x{owner:08X}")
                     recovered_callers.setdefault(target, set()).add(caller)
                     strong.add(target)
+            if caller in self.recovered_function_starts:
+                # Only code the callback reaches names its dependencies; a
+                # callback accepted for its linear ret decodes on past it.
+                reachable = instructions
+                if not (recovered and recovered.get("instructions")):
+                    reachable = (self._recover_cfg(
+                        caller, end, set(), set(), coalescing=True) or [[]])[0]
+                for insn in reachable:
+                    target = insn.call_target if insn.is_call else (
+                        insn.jump_target if insn.mnemonic == "jmp" else None)
+                    if target is None:
+                        continue
+                    if target in self.func_db:
+                        if coalescing:
+                            self._add_caller(target, caller)
+                        continue
+                    recovered_callers.setdefault(target, set()).add(caller)
+                    strong.add(target)
             # A callback can also be passed or stored as an immediate:
             # DOA3 registers 0x0016C0B0 with `push imm; call eax`. Sizes and
             # flags look the same, so the checks below hold an immediate to its
             # own section, keep it out of every existing range, and require
             # its reachable code to close.
             for insn in instructions:
-                if caller in self.recovered_function_starts:
-                    target = insn.call_target if insn.is_call else (
-                        insn.jump_target if insn.mnemonic == "jmp" else None)
-                    if target is not None and target not in self.func_db:
-                        recovered_callers.setdefault(target, set()).add(caller)
-                        strong.add(target)
                 operands = insn.operands
                 if insn.mnemonic == "push" and operands:
                     source = operands[0]
@@ -493,10 +499,11 @@ class FunctionTranslator:
             # Decode no further than the target's own section: the next start
             # can sit in another section, and the bytes between are not
             # contiguous in the file.
-            section_end = next(
-                (s.va + min(s.va_size, s.raw_size) for s in _config._SECTIONS
-                 if s.va <= target < s.va + s.va_size), target)
-            bound = min(next_start, section_end)
+            home = next((s for s in _config._SECTIONS
+                         if s.va <= target < s.va + s.va_size), None)
+            if home is None:
+                continue
+            bound = min(next_start, home.va + min(home.va_size, home.raw_size))
             if bound <= target:
                 continue
             weak = target not in strong
@@ -535,8 +542,11 @@ class FunctionTranslator:
                     owned, tables, _ = recovered_owner
                     if (not owned or (not tables and not guessed)
                             or any(insn.end_address > target for insn in owned)
+                            # Tables in .rdata live elsewhere; only embedded
+                            # storage can overlap the callback.
                             or any(table + len(arms) * 4 > target
-                                   for table, arms in tables.items())
+                                   for table, arms in tables.items()
+                                   if owner["_addr"] <= table < owner["end"])
                             or any(insn.is_jump and insn.jump_target is None
                                    and not (insn.operands
                                             and insn.operands[0].type == "mem"
@@ -546,7 +556,7 @@ class FunctionTranslator:
                                    for insn in owned)):
                         continue
                     overlapping_owner = owner, owned, tables
-            section = next_func.get("section", "")
+            section = home.name
             if section in (".rdata", ".data"):
                 continue
 
@@ -666,6 +676,15 @@ class FunctionTranslator:
                 and (operand.type == "reg"
                      or (operand.type == "mem" and not operand.mem_index
                          and operand.mem_disp not in tables)))
+
+    def _add_caller(self, target, caller):
+        """Record caller as independent entry evidence for target."""
+        known = {
+            int(value, 16) if isinstance(value, str) else value
+            for value in self.func_db[target].get("called_by") or []}
+        known.add(caller)
+        self.func_db[target]["called_by"] = [
+            f"0x{value:08X}" for value in sorted(known)]
 
     def coalesce_function(self, target, end, expected_starts):
         """Merge an explicitly named set of false interior function starts.
