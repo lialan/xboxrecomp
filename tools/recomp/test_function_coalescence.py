@@ -681,7 +681,7 @@ def test_static_callback_inside_alias_range_is_recovered(cover, recovered):
     subject, callback = static_callback_subject(cover, b"\xc3")
     assert (callback in subject.func_db) is recovered
     if recovered:
-        assert subject.func_db[callback]["end"] == BASE + 0x100
+        assert subject.func_db[callback]["end"] == callback + 1
         assert subject.func_db[callback]["detection_method"] == (
             "static_indirect_table")
 
@@ -763,6 +763,56 @@ def test_immediate_inside_another_range_is_not_a_callback(cover):
     assert constant not in subject.func_db
 
 
+# Unlisted code in the gap: push ebp; mov ebp, esp; mov eax, 0x41414141;
+# pop ebp; ret. From +3 or +4 the bytes still decode to a closed ret.
+UNLISTED = bytes.fromhex("558bec b841414141 5dc3".replace(" ", ""))
+
+
+@pytest.mark.parametrize("offset, recovered", [
+    (0, True),  # after int3 padding
+    (3, False),  # an instruction boundary inside the function
+    (4, False),  # mid-instruction
+])
+def test_immediate_inside_unlisted_code_is_not_a_callback(offset, recovered):
+    unlisted, following = BASE + 0x20, BASE + 0x100
+    constant = unlisted + offset
+    pattern = b"\x68" + constant.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x20:0x20 + len(UNLISTED)] = UNLISTED
+    raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert (constant in subject.func_db) is recovered
+
+
+def test_branch_from_a_weak_callback_stays_weak():
+    # A callback found only through an immediate calls into the middle of
+    # unlisted code. That edge must pass the same checks as an immediate.
+    unlisted, callback, following = BASE + 0x40, BASE + 0x80, BASE + 0x100
+    pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x40:0x40 + len(UNLISTED)] = UNLISTED
+    raw[0x80:0x86] = (b"\xe8" + (unlisted + 4 - callback - 5).to_bytes(
+        4, "little", signed=True) + b"\xc3")
+    raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert unlisted + 4 not in subject.func_db
+
+
 def test_unreachable_immediate_is_not_a_callback():
     # The push decodes after the caller's ret, so it never runs.
     callback, following = BASE + 0x80, BASE + 0x100
@@ -837,9 +887,8 @@ def test_immediate_inside_a_same_pass_callback_table_is_rejected():
 
 
 def test_recovered_callback_exposes_a_later_helper():
-    # The callback calls a helper later in the same gap. The callback's end
-    # was a guess, so its proven CFG may end before the helper, which then
-    # needs a body of its own.
+    # The callback calls a helper later in the same gap. The callback's range
+    # ends with the code it reaches, so the helper gets a body of its own.
     callback, helper, following = BASE + 0x80, BASE + 0xa0, BASE + 0x100
     pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
     raw = bytearray(b"\xcc" * 0x200)
@@ -854,7 +903,7 @@ def test_recovered_callback_exposes_a_later_helper():
     })
     subject.discover_static_indirect_targets()
     assert helper in subject.func_db
-    assert subject.func_db[callback]["end"] == helper
+    assert subject.func_db[callback]["end"] == callback + 6
 
 
 def test_callback_table_outside_its_range_claims_nothing_after_it(monkeypatch):
@@ -909,7 +958,7 @@ def test_callback_in_a_sections_last_gap_stops_at_its_section(monkeypatch):
     })
     subject.discover_static_indirect_targets()
     assert callback in subject.func_db
-    assert subject.func_db[callback]["end"] == BASE + 0x100
+    assert subject.func_db[callback]["end"] == callback + 1
     assert subject.func_db[callback]["section"] == ".text"
 
 
@@ -1066,7 +1115,7 @@ def test_callback_call_to_a_known_function_is_entry_evidence(coalescing):
     assert f"0x{callback:08X}" in subject.func_db[known]["called_by"]
 
 
-def test_immediate_callback_after_the_last_start_is_bounded_by_its_section():
+def test_immediate_callback_after_the_last_start_is_recovered():
     callback = BASE + 0x80
     pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
     raw = bytearray(b"\xcc" * 0x400)
@@ -1077,7 +1126,7 @@ def test_immediate_callback_after_the_last_start_is_bounded_by_its_section():
     subject.func_db[BASE] = function(BASE, BASE + len(pattern))
     subject.discover_static_indirect_targets()
     assert callback in subject.func_db
-    assert subject.func_db[callback]["end"] == BASE + 0x400
+    assert subject.func_db[callback]["end"] == callback + 1
 
 
 def test_linear_callback_claims_its_embedded_table():
