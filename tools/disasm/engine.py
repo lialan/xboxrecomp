@@ -13,6 +13,11 @@ from typing import Dict, List, Optional, Set, Tuple
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CsInsn
 from capstone import (CS_OP_IMM, CS_OP_MEM, CS_OP_REG,
                       CS_GRP_INT, CS_GRP_IRET, CS_GRP_PRIVILEGE)
+from capstone.x86_const import (
+    X86_REG_EFLAGS, X86_EFLAGS_TEST_AF, X86_EFLAGS_TEST_CF,
+    X86_EFLAGS_TEST_OF, X86_EFLAGS_TEST_PF, X86_EFLAGS_TEST_SF,
+    X86_EFLAGS_TEST_ZF,
+)
 
 from . import config
 from .loader import BinaryImage, SectionInfo
@@ -550,6 +555,20 @@ class DisasmEngine:
         lower = addr if lower is None else max(lower, section.virtual_addr)
         upper = min(upper, section.virtual_addr + len(data))
         raw = data[lower - section.virtual_addr:upper - section.virtual_addr]
+        if require_entry_frame:
+            # A weak table word may name a suffix after its owner's cmp.
+            # Reject an entry prefix that reads arithmetic flags before
+            # producing them. String operations may read the ABI's DF.
+            flag_tests = (X86_EFLAGS_TEST_AF | X86_EFLAGS_TEST_CF
+                          | X86_EFLAGS_TEST_OF | X86_EFLAGS_TEST_PF
+                          | X86_EFLAGS_TEST_SF | X86_EFLAGS_TEST_ZF)
+            for insn in self._cs.disasm(raw[addr - lower:], addr):
+                if (X86_REG_EFLAGS in insn.regs_read
+                        and (insn.eflags & flag_tests or not insn.eflags)):
+                    return False
+                if (X86_REG_EFLAGS in insn.regs_write
+                        or insn.mnemonic in ("call", "jmp", "ret", "retn")):
+                    break
         decoder = Disassembler()
         entries = {addr}
         tables = {}

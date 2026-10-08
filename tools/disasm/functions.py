@@ -224,6 +224,9 @@ class FunctionDetector:
                 continue
             if not in_a_gap(nxt):
                 continue                    # an out-of-line tail, not a start
+            first = self.engine.get_instruction(nxt)
+            if first and first.end_address in self.engine.jump_tables:
+                continue                    # alignment before a table, not a prologue
             # A prologue, or a whole small function.
             #
             # MSVC packs runs of constant-returning accessors -- "mov eax,
@@ -812,21 +815,17 @@ class FunctionDetector:
         for target in sorted(targets):
             if target in self.functions or target in self._alias_entries:
                 continue
-            # A borrowed alias extent is not an entry boundary. Table words
-            # can name valid instruction suffixes inside an already-reachable
-            # callback; only disconnected bodies remain weak entry candidates.
-            if (target in claimed and not self._probes_as_tail_body(
+            # A table word can name an instruction suffix in any known body.
+            # Require the same callable-entry proof as for recovered callbacks;
+            # an instruction boundary alone does not establish an entry.
+            if ((target in claimed or inside_a_function(target))
+                    and not self._probes_as_tail_body(
                     target, starts, sections, entry_frame=True)):
                 continue
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bounds[j][0] < target < bounds[j][1]:
-                # Inside a function, so the bytes are known to be code and the
-                # only real question is whether the address is an instruction
-                # boundary rather than the middle of one. Requiring a ret here
-                # would be wrong: MSVC's constructor thunks are
-                # `mov ecx, <this>; jmp <ctor>` and end in a tail jump, which
-                # is exactly what the strict probe rejects. Share the enclosing
-                # end, as the tail-jump pass does.
+                # The entry proof above permits shared bodies and constructor
+                # tail thunks. Keep the enclosing function's extent intact.
                 if target not in self.engine.instructions:
                     continue
                 end = bounds[j][1]

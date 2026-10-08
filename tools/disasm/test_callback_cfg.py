@@ -176,3 +176,26 @@ def test_shared_callback_with_its_own_frame_remains_callable():
     detector.functions[BASE] = Function(BASE, BASE + 1, 'known')
     detector._pass_data_ptr_targets([text])
     assert {BASE + 16, BASE + 24} <= detector._alias_entries.keys()
+
+
+@pytest.mark.parametrize("prefix, accepted", [
+    (b"", False), (b"\x53\x89\xc1", False), (b"\x53\x85\xc0", True),
+    (b"\x53\xf3\xa5\x85\xc0", True),  # DF is not a caller condition code
+])
+def test_table_suffix_cannot_borrow_flags_from_an_existing_body(prefix, accepted):
+    from tools.disasm.engine import DisasmEngine
+    # A table word names the suffix after the owner's cmp. The suffix has
+    # a balanced frame (or none), but its entry branch needs the owner's ZF.
+    suffix = BASE + 3
+    restore = b"\x5b" if prefix else b""
+    body = b"\x83\xf8\x01" + prefix + b"\x74\x01\x40" + restore + b"\xc3"
+    table = struct.pack("<I", suffix)
+    text = SectionInfo('.text', BASE, len(body), 0, len(body), False, True, '')
+    data = SectionInfo('.data', BASE + 0x1000, 4, len(body), 4, False, False, '')
+    image = BinaryImage('synthetic', body + table, 0, 0x20000, BASE, 0, [text, data])
+    engine = DisasmEngine(image)
+    engine.linear_sweep(text)
+    detector = FunctionDetector(engine, image, None, LabelManager())
+    detector.detect_all([text])
+    assert (suffix in detector.functions) is accepted
+    assert detector.functions[BASE].end == BASE + len(body)
