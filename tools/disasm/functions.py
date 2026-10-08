@@ -614,6 +614,8 @@ class FunctionDetector:
 
         found = 0
         for target in sorted(targets):
+            if target in claimed:
+                continue
             # An immediate alone cannot justify splitting an instruction the
             # sweep already decoded. It may be an integer constant that happens
             # to fall in an as-yet unclaimed code gap. Keep the same prologue
@@ -646,6 +648,12 @@ class FunctionDetector:
                     continue
             self._add_candidate(target, config.CONFIDENCE_IMM_REF,
                                 "imm_ref_target")
+            # Later immediates in this same pass must not split this body,
+            # including at operand bytes that also decode as a prologue.
+            for address in self.engine.recursive_descent(
+                    [target], [(target, upper)]):
+                insn = self.engine.get_instruction(address)
+                claimed.update(range(address, insn.end_address))
             found += 1
 
         if found:
