@@ -47,6 +47,9 @@
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+extern void xbox_FramebufferWindowSetAA(uint32_t sy);
+extern uint32_t xbox_Nv2aFenceWordVa(void);
+extern int nv2a_pb_dma_walk(void);   /* nv2a_pb_scan.c: RECOMP_PB_WALK=dma */
 extern void xbox_FramebufferWindowStart(void);
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
@@ -67,9 +70,22 @@ extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
  * nothing is strictly better than writing over the guest, and a title that
  * cannot draw is easier to debug than one that has been overwritten.
  */
+static int guest_span_ok(uint64_t addr, uint32_t bytes);
+
 static int surface_hits_image(uint32_t base, uint32_t bytes)
 {
-    if (!g_xbox_image_hi || !bytes)
+    if (!bytes)
+        return 0;
+    /* The thread stacks sit just above the image. No surface lives there, so
+     * a DMA offset that reads as a VA in that range is just as wrong as one
+     * that lands on the image. */
+    if (base < XBOX_HEAP_BASE && (uint64_t)base + bytes > XBOX_STACK_BASE)
+        return 1;
+    /* And anything that is not guest memory at all: a clear wrote to
+     * 0xC532311B, an offset that names no memory the guest owns. */
+    if (!guest_span_ok(base, bytes))
+        return 1;
+    if (!g_xbox_image_hi)
         return 0;
     return base < g_xbox_image_hi && base + bytes > g_xbox_image_lo;
 }
@@ -132,7 +148,8 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
         said = 1;
         fprintf(stderr,
                 "  [GPU] REFUSING to %s surface 0x%08X..0x%08X: that overlaps "
-                "the loaded image (0x%08X..0x%08X).\n"
+                "the loaded image (0x%08X..0x%08X), a thread stack, or is "
+                "outside guest memory.\n"
                 "  [GPU]   SET_SURFACE_COLOR_OFFSET is a DMA-object offset, not "
                 "a guest VA, and this executor treats it as one. Writing here "
                 "would destroy the title's own code and globals.\n",
@@ -489,6 +506,33 @@ static void note_unhandled(uint32_t method, uint32_t param)
     }
 }
 
+/* Is [addr, addr + bytes) inside memory the guest owns? That is ordinary RAM
+ * from 0, and the contiguous window at XBOX_CONTIG_BASE. The index of a vertex
+ * comes from the title's pushbuffer, 32 bits of it, so after a desync it can
+ * be anything; this is the one place every vertex read passes through. */
+static int guest_span_ok(uint64_t addr, uint32_t bytes)
+{
+    uint64_t end = addr + bytes;
+
+    if (end <= (uint64_t)XBOX_CONTIG_SIZE)
+        return 1;
+    return addr >= XBOX_CONTIG_BASE
+        && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+}
+
+/* Bytes one element of attribute `a` occupies, as fetch_attr reads it. */
+static uint32_t attr_elem_bytes(const VertexAttr *a)
+{
+    uint32_t n = a->size < 4 ? a->size : 4;
+
+    switch (a->type) {
+    case 0: case 6: return 4;
+    case 1: case 5: return 2u * n;
+    case 4:         return n;
+    default:        return 4u * n;
+    }
+}
+
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
@@ -512,9 +556,11 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
             return 0;
         p = (const uint8_t *)s_gpu.inline_buf + at;
     } else {
-        if (!a->offset)
+        uint64_t at = (uint64_t)a->offset + (uint64_t)index * a->stride;
+
+        if (!a->offset || !guest_span_ok(at, attr_elem_bytes(a)))
             return 0;
-        p = mem + a->offset + (size_t)index * a->stride;
+        p = mem + at;
     }
 
     switch (a->type) {
@@ -917,8 +963,10 @@ static void clear_surface(uint32_t param)
     /* Only until the title flips. Following the draw surface on every scan
      * shows the buffer being written right now, half a frame at a time; past
      * the first flip the window is repointed at the finished one instead. */
-    if (s_gpu.flips == 0)
+    if (s_gpu.flips == 0) {
         xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+        xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
+    }
 
     /* And open the window, rather than waiting for AvSetDisplayMode to do it.
      *
@@ -1765,6 +1813,11 @@ static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
  */
 #define OBJECT_SPACE_SPAN 8.0f
 
+/* The surface's anti-aliasing scale, never below 1, for positions that arrive
+ * in logical pixels (pre-transformed vertices) and must land in real ones. */
+static float aa_scale_x(void) { return s_gpu.aa_sx > 1.0f ? s_gpu.aa_sx : 1.0f; }
+static float aa_scale_y(void) { return s_gpu.aa_sy > 1.0f ? s_gpu.aa_sy : 1.0f; }
+
 static int batch_is_screen_space(void)
 {
     float p[4], lo_x, hi_x, lo_y, hi_y;
@@ -1785,11 +1838,12 @@ static int batch_is_screen_space(void)
         if (p[1] > hi_y) hi_y = p[1];
     }
 
-    /* Entirely off the surface: nothing to draw under either reading. */
-    if (hi_x < (float)s_gpu.clip_x
-     || lo_x > (float)(s_gpu.clip_x + s_gpu.clip_w)
-     || hi_y < (float)s_gpu.clip_y
-     || lo_y > (float)(s_gpu.clip_y + s_gpu.clip_h))
+    /* Entirely off the surface: nothing to draw under either reading. The
+     * positions are in logical pixels and the clip rect is in real ones. */
+    if (hi_x * aa_scale_x() < (float)s_gpu.clip_x
+     || lo_x * aa_scale_x() > (float)(s_gpu.clip_x + s_gpu.clip_w)
+     || hi_y * aa_scale_y() < (float)s_gpu.clip_y
+     || lo_y * aa_scale_y() > (float)(s_gpu.clip_y + s_gpu.clip_h))
         return 0;
 
     /* Small enough to be model units rather than pixels. */
@@ -1838,11 +1892,14 @@ static int s_xf_no_tex;
  * end only ever sees surface pixels. Past the cap the rest of the batch is
  * dropped. */
 #define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
-static Nv2aVertex s_bverts[NV_BACKEND_MAX_VERTS];
+static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
 static uint32_t   s_bcount;
 
 static Nv2aVertex *backend_slot(void)
 {
+    if (!s_bverts
+        && !(s_bverts = (Nv2aVertex *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bverts)))
+        return NULL;
     if (s_bcount + 3 > NV_BACKEND_MAX_VERTS)
         return NULL;
     return &s_bverts[s_bcount];
@@ -1908,12 +1965,16 @@ static void backend_flush(int textured)
 static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 {
     float p[3][4], uv[3][2];
-    int textured;
+    int textured, j;
 
     if (!fetch_attr(&s_gpu.attr[0], i0, p[0])
      || !fetch_attr(&s_gpu.attr[0], i1, p[1])
      || !fetch_attr(&s_gpu.attr[0], i2, p[2]))
         return;
+    for (j = 0; j < 3; j++) {                        /* logical -> real pixels */
+        p[j][0] *= aa_scale_x();
+        p[j][1] *= aa_scale_y();
+    }
 
     textured = fetch_texcoord(i0, uv[0])
             && fetch_texcoord(i1, uv[1])
@@ -2601,7 +2662,9 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         raster_xf_triangle(&poly[0], &poly[i], &poly[i + 1]);
 }
 
-static Nv2aVshOutput s_xf[NV_MAX_INDICES];
+/* About 7 MB, so allocated by the first batch that transforms rather than
+ * carried in every build that never turns the executor on. */
+static Nv2aVshOutput *s_xf;
 
 /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
  * interpreter off (the batch then falls to the screen-space heuristics). */
@@ -2655,6 +2718,8 @@ static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
+    if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
+        return;
     for (i = 0; i < n; i++)
         if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
             return;                                    /* no program loaded */
@@ -2970,7 +3035,7 @@ static void draw_primitive(void)
                     s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                     s_gpu.tris_drawn - t0,
                     (unsigned long long)(s_gpu.pixels - p0));
-            if ((s_gpu.xf_mode & 3) == 2)
+            if ((s_gpu.xf_mode & 3) == 2 && s_xf)
                 fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
                         s_xf[0].pos[3], s_xf[1].pos[0], s_xf[1].pos[1],
@@ -3452,12 +3517,34 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * when the semaphore happened to be a multiple of 32. (DMA_GET, which D3D
      * reads next, is published by the walk itself; see nv2a_pb_scan.c. The
      * marker's own address is behind the executor's read position, so it is
-     * not used for that.) */
-    if (method == 0x0310 && subch == 5) {
+     * not used for that.)
+     *
+     * D3D compares the latch's fence bits with the semaphore, so the two have
+     * to tell the same story. When a back end names the semaphore the
+     * executor writes it from the title's own releases, and the marker agrees
+     * with it. A project that mirrors the title's fence instead (the runtime
+     * writes "everything submitted is consumed" into the word,
+     * xbox_Nv2aMirrorFence) holds D3D's own submitted counter there, which
+     * the marker's fence bits do not match, and D3D's wait then lasts for
+     * ever: the title froze at the first screen whose walk was long enough to
+     * enter it. So for a mirrored fence the latch carries the mirror's fence
+     * bits and the marker's address, which is what a GPU that had consumed
+     * everything would report. */
+    if (method == 0x0310 && subch == 5 && nv2a_pb_dma_walk()) {
         volatile uint32_t *r = xbox_Nv2aRegPtr(0x400B10);
 
-        if (r)
-            *r = param;
+        if (!r)
+            return;
+        if (!s_sem_va) {
+            uint32_t va = xbox_Nv2aFenceWordVa();
+
+            if (va) {
+                uint32_t sem = *(volatile uint32_t *)
+                               ((uint8_t *)xbox_GetMemoryOffset() + va);
+                param = (param & ~0x7Cu) | ((sem & 0x1Fu) << 2);
+            }
+        }
+        *r = param;
         return;
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
@@ -3678,6 +3765,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.pitch;
             if (done) {
                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
+                xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
                 xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
             }
         }

@@ -31,6 +31,10 @@ ptrdiff_t xbox_GetMemoryOffset(void) { return (ptrdiff_t)s_mem; }
 uint32_t g_xbox_image_lo, g_xbox_image_hi;
 uint32_t xbox_ContiguousAllocatedBytes(void) { return 0; }
 void xbox_FramebufferWindowSet(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
+void xbox_FramebufferWindowSetAA(uint32_t sy) { (void)sy; }
+static uint32_t s_fence_va;                           /* the mirrored fence word, if any */
+uint32_t xbox_Nv2aFenceWordVa(void) { return s_fence_va; }
+int nv2a_pb_dma_walk(void) { return 1; }             /* RECOMP_PB_WALK=dma: 0x0310 is latched */
 void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
@@ -169,22 +173,38 @@ int main(void)
     CHECK(s_be.rs.stencil_enable == 1 && s_be.rs.stencil_func == 0x206);
     CHECK(s_be.rs.stencil_ref == 5 && s_be.rs.stencil_zpass == 0x1E02);
 
-    /* Lighting: one infinite light along +z, red; ambient 0.1 red; the
-     * triangle's normal is +z and the model-view matrix is the identity, so
-     * N.L = 1 and the colour is min(0.1 + 1, 1) red, alpha from the material. */
+    /* Lighting. The triangle's normal is +z and the model-view matrix is the
+     * identity, so vertex 0, at (-1, -1, 0), sees both lights head on (N.L = 1).
+     * Every term stays below 1, so none of them hides in the clamp:
+     *   light 0, infinite, diffuse r 0.5, with scene ambient r 0.1: r = 0.6;
+     *   light 1, local at (-1, -1, 2), distance 2, diffuse g 0.8, attenuation
+     *   1 / (1 + 0.25 d^2) = 1/2: g = 0.4;
+     * alpha comes from the material. */
     {
         const float I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
         for (i = 0; i < 16; i++)
             mf(0x0480 + 4 * i, I[i]);                 /* model-view */
     }
     m(0x0314, 1);                                     /* SET_LIGHTING_ENABLE */
-    m(0x03BC, 1);                                     /* light 0: infinite */
-    mf(0x1000 + 0x0C, 1.0f);                          /* light 0 diffuse r */
+    m(0x03BC, 1 | (2u << 2));                         /* light 0 infinite, light 1 local */
+    mf(0x1000 + 0x0C, 0.5f);                          /* light 0 diffuse r */
     mf(0x1000 + 0x34 + 8, 1.0f);                      /* light 0 direction z */
+    mf(0x1080 + 0x0C + 4, 0.8f);                      /* light 1 diffuse g */
+    mf(0x1080 + 0x24, 10.0f);                         /* light 1 range */
+    mf(0x1080 + 0x5C, -1.0f); mf(0x1080 + 0x60, -1.0f); mf(0x1080 + 0x64, 2.0f);
+    mf(0x1080 + 0x68, 1.0f);                          /* constant attenuation */
+    mf(0x1080 + 0x6C, 0.0f);                          /* linear */
+    mf(0x1080 + 0x70, 0.25f);                         /* quadratic */
     mf(0x0A10, 0.1f);                                 /* scene ambient r */
     mf(0x03B4, 1.0f);                                 /* material alpha */
     m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
-    CHECK(s_be.v[0].diffuse == 0xFFFF0000u);
+    CHECK(s_be.v[0].diffuse == 0xFF996600u);          /* (153, 102, 0) = (0.6, 0.4, 0) */
+    mf(0x0A10, 0.0f);                                 /* without the ambient ... */
+    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+    CHECK(s_be.v[0].diffuse != 0xFF996600u);         /* ... the colour moves */
+    mf(0x1080 + 0x24, 1.0f);                          /* light 1 out of range: only light 0 */
+    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+    CHECK((s_be.v[0].diffuse & 0x0000FF00u) == 0);
     m(0x0314, 0);
 
     /* Anti-aliasing off: the same transform lands unscaled. */
@@ -192,6 +212,17 @@ int main(void)
     m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
     CHECK(s_be.surf.aa_sx == 1 && s_be.surf.width == 640);
     CHECK(near_(s_be.v[1].x, 640.0f) && near_(s_be.v[1].y, 480.0f));
+
+    /* A garbage index (the walk is 32 bits wide now) must not reach outside
+     * guest memory: start 0xFFFFFF at a 12-byte stride is 200 MB past the
+     * array, and the batch is dropped instead of read. The test buffer is
+     * 64 KB, so reading it would fault. */
+    {
+        int draws = s_be.draws;
+
+        m(0x17FC, 5); m(0x1810, 0xFFFFFFu | (2u << 24)); m(0x17FC, 0);
+        CHECK(s_be.draws == draws);
+    }
 
     /* The semaphore release lands where the title said. */
     nv2a_pb_set_semaphore_target(0x5000);
@@ -208,6 +239,21 @@ int main(void)
     CHECK(s_pgraph_400b10 == 0xABCD1234u);
     nv2a_pb_exec_method(0, 0x0310, 7);
     CHECK(s_pgraph_400b10 == 0xABCD1234u);
+
+    /* A project that mirrors the fence (no back end names the semaphore): the
+     * latch keeps the marker's address and wrap bits but reports the fence bits
+     * (2..6) of the mirrored word, so D3D's compare of the two comes out equal. */
+    nv2a_pb_set_semaphore_target(0);
+    s_fence_va = 0x6000;
+    putf(0x6000, 0);
+    put32(0x6000, 0x0002D42Fu);                       /* the mirrored word: low 5 bits 0x0F */
+    nv2a_pb_exec_method(5, 0x0310, 0xABCD1234u | 0x7Cu);
+    CHECK(((s_pgraph_400b10 >> 2) & 0x1Fu) == 0x0Fu);
+    CHECK((s_pgraph_400b10 & ~0x7Cu) == (0xABCD1234u & ~0x7Cu));
+    s_fence_va = 0;                                   /* no mirror: the marker as it is */
+    nv2a_pb_exec_method(5, 0x0310, 0x11111111u);
+    CHECK(s_pgraph_400b10 == 0x11111111u);
+    nv2a_pb_set_semaphore_target(0x5000);
 
     /* Clears and flips reach the back end. */
     m(0x1D90, 0xFF102030u);                           /* SET_COLOR_CLEAR_VALUE */

@@ -57,6 +57,13 @@ the thread that would otherwise answer.
   whole rendered frame, so a level load — thousands of kickoffs — looked
   frozen. The walker now clears them every 256 words
   (`xbox_Nv2aAckBusyBits`).
+- **Fence mirrors.** A project that registers `xbox_Nv2aMirrorFence` has the
+  poll thread copy the title's "submitted" fence into its "consumed" one. The
+  walk now follows every CALL and JUMP, so a pass can be long, and a mirror
+  ticked only between passes lags the title by a whole walk. D3D then takes its
+  fence wait, which a mirrored fence cannot satisfy (Burnout 3 hung there at its
+  first menu). `xbox_Nv2aAckBusyBits` ticks the mirrors as well, so they keep
+  pace from inside the walk.
 - **Semaphore.** `BACK_END_WRITE_SEMAPHORE_RELEASE` (`0x1D70`) writes its value
   where `nv2a_pb_set_semaphore_target()` was told, once everything before it
   has run. `SET_SEMAPHORE_OFFSET` is not added: in *X-Men Legends* it held
@@ -171,7 +178,10 @@ wide enough for 1280×960.
 The index list was `uint16_t` and held 4096 entries, but `DRAW_ARRAYS` starts
 are 24-bit, so vertices past 65535 wrapped to the start of the buffer and big
 batches were cut short. Indices are 32-bit now, batches may hold 65536, and
-`ARRAY_ELEMENT32` (`0x1808`) is handled. `SET_VERTEX_DATA_ARRAY_FORMAT` size 7
+`ARRAY_ELEMENT32` (`0x1808`) is handled. An index comes from the pushbuffer, so
+`fetch_attr` checks every vertex read against guest memory (ordinary RAM and the
+contiguous window); a read outside it returns no vertex and the batch is dropped.
+`SET_VERTEX_DATA_ARRAY_FORMAT` size 7
 (`3W`) reads as three components.
 
 ## Render Back Ends
@@ -191,12 +201,16 @@ batches were cut short. Indices are 32-bit now, batches may hold 65536, and
 All calls come from the NV2A poll thread, one at a time, so a back end can
 create its window and device lazily and pump messages from `flip`.
 
-Things a back end should get right:
+Things a back end should get right. These come from a Direct3D 11 back end
+written against this interface for one title; that back end is not in this
+tree, so treat them as advice from one implementation, not as tested behaviour
+of the code here:
 
 - **Window z is compared as it is.** `SET_CLIP_MIN`/`MAX` only clip. A title
   narrows the range for a low-detail layer so it is cut off near the eye; a back
   end that rescales each draw's z over its own range makes that layer about 237
-  times deeper and puts it in front of everything near.
+  times deeper (the figure from that back end's title) and puts it in front of
+  everything near.
 - **Stencil.** A title can mark pixels with a stencil-writing mesh and then draw
   a full-screen quad that only the marked pixels pass. A back end that ignores
   `stencil_*` draws that quad over the whole surface.
@@ -216,6 +230,26 @@ when it matters rather than adding callbacks.
 |---|---|
 | `RECOMP_PB_SCAN` | read-only survey of the pushbuffer; ranks what is not implemented |
 | `RECOMP_PB_EXEC` | execute it |
+| `RECOMP_PB_WALK=dma` | walk the pushbuffer like the DMA engine (JUMPs, wraps, GET per command, the `0x0310` latch) instead of scanning each submitted segment; see [The DMA Walk Is Opt-In](#the-dma-walk-is-opt-in) |
 | `RECOMP_PB_EXEC_VERBOSE` | per-batch trace |
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
+
+## The DMA Walk Is Opt-In
+
+`RECOMP_PB_WALK=dma` turns on the DMA-engine walk; without it the executor
+scans each segment between the previous `DMA_PUT` and the new one, as it did
+before the walk existed.
+
+The walk is the more faithful of the two, and that is the reason it is opt-in.
+Told exactly how far the GPU has got (`DMA_GET` per command and the `0x0310`
+latch), XDK D3D's fence code takes its "GPU far behind" path: it patches a
+software method (`NO_OPERATION` with a value) into the pushbuffer and sleeps on
+an event that the GPU's interrupt for that method sets. Until the runtime
+delivers that interrupt, a title that runs under the segment scan can freeze
+under the walk on the first screen whose pushbuffer makes the walk long
+enough. Burnout 3 did, at its Crash Nav menu, with the main thread in
+`KeWaitForSingleObject` under D3D's fence wait.
+
+Turn the walk on for a project that delivers the GPU's software-method
+interrupt, or to bring up a title the segment scan draws wrongly.

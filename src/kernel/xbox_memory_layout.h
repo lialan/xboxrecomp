@@ -195,6 +195,10 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
+/* Where the mirrored fence word is (0 if none is registered or it does not
+ * resolve into the contiguous window). For the pushbuffer executor. */
+uint32_t xbox_Nv2aFenceWordVa(void);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

@@ -80,8 +80,10 @@ int main(void)
 {
 #ifdef _WIN32
     _putenv_s("RECOMP_PB_EXEC", "1");
+    _putenv_s("RECOMP_PB_WALK", "dma");
 #else
     setenv("RECOMP_PB_EXEC", "1", 1);
+    setenv("RECOMP_PB_WALK", "dma", 1);
 #endif
 
     /* 0x100: two methods, then CALL 0x200 (one method, RETURN), one more
@@ -159,6 +161,71 @@ int main(void)
     nv2a_pb_scan(0x90C);                                   /* in step again */
     CHECK(s_n == 12);
     expect(11, 0x0318, 22);
+
+    /* A method whose parameters run past PUT stops at PUT, and finishes when
+     * PUT moves. Header at 0xC00 promises four parameters and PUT is after the
+     * first. The walk must neither carry on through what the ring held before
+     * (a replayed lap of old commands) nor forget the method: the words that
+     * come next are its parameters, here deliberately shaped like headers, and
+     * reading them as headers would decode vertex data as commands. */
+    {
+        int n0 = s_n;
+
+        title_sets_get(0xC00);
+        put(0xC00, hdr(4, 0, 0x0500)); put(0xC04, 41);
+        put(0xC08, hdr(1, 0, 0x0600)); put(0xC0C, 43);
+        put(0xC10, 0x00000000u);       put(0xC14, hdr(1, 0, 0x0700)); put(0xC18, 71);
+        nv2a_pb_scan(0xC08);
+        CHECK(s_n == n0 + 1);
+        expect(n0, 0x0500, 41);
+        CHECK(s_get_reg == 0xC08);
+        nv2a_pb_scan(0xC08);                               /* nothing moves */
+        CHECK(s_n == n0 + 1);
+
+        nv2a_pb_scan(0xC14);                               /* PUT moves: three more */
+        CHECK(s_n == n0 + 4);
+        expect(n0 + 1, 0x0504, hdr(1, 0, 0x0600));
+        expect(n0 + 2, 0x0508, 43);
+        expect(n0 + 3, 0x050C, 0);
+        CHECK(s_get_reg == 0xC14);
+
+        nv2a_pb_scan(0xC1C);                               /* and a header after it */
+        CHECK(s_n == n0 + 5);
+        expect(n0 + 4, 0x0700, 71);
+    }
+
+    /* A CALL inside a CALL is an error on the hardware, and the walk stops at
+     * PUT rather than overwrite the return address. */
+    {
+        int n0 = s_n;
+
+        title_sets_get(0xD00);
+        put(0xD00, 0xD40u | 2u);                           /* CALL 0xD40 */
+        put(0xD04, hdr(1, 0, 0x0708)); put(0xD08, 53);     /* after the call */
+        put(0xD40, hdr(1, 0, 0x0700)); put(0xD44, 51);
+        put(0xD48, 0xD80u | 2u);                           /* CALL inside CALL */
+        put(0xD80, hdr(1, 0, 0x0704)); put(0xD84, 52);     /* never reached */
+        put(0xD88, 0x00020000u);
+        nv2a_pb_scan(0xD0C);
+        CHECK(s_n == n0 + 1);
+        expect(n0, 0x0700, 51);
+        CHECK(s_get_reg == 0xD0C);
+    }
+
+    /* A jump to itself never reaches PUT; the runaway guard ends the walk. */
+    {
+        int n0 = s_n;
+
+        title_sets_get(0xE00);
+        put(0xE00, 0xE00u | 1u);                           /* JUMP 0xE00 */
+        nv2a_pb_scan(0xE04);
+        CHECK(s_n == n0);
+        CHECK(s_get_reg == 0xE04);
+        put(0xE04, hdr(1, 0, 0x0710)); put(0xE08, 61);
+        nv2a_pb_scan(0xE0C);                               /* in step again */
+        CHECK(s_n == n0 + 1);
+        expect(n0, 0x0710, 61);
+    }
 
     if (!s_fail)
         printf("nv2a pushbuffer walk: ok\n");
