@@ -395,7 +395,12 @@ class FunctionDetector:
 
                     if found_ret:
                         next_addr = va_start + i
-                        if next_addr in self.engine.instructions:
+                        if (next_addr in self.engine.instructions
+                                and (self.engine.probes_as_prologue(next_addr)
+                                     or self.engine.probes_as_callback_body(
+                                         next_addr, va_start + len(data),
+                                         tail_targets=self._candidates,
+                                         allow_indirect_tails=True))):
                             self._add_candidate(
                                 next_addr,
                                 config.CONFIDENCE_CC_BOUNDARY,

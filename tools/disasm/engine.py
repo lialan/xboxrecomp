@@ -539,7 +539,8 @@ class DisasmEngine:
 
     def probes_as_callback_body(self, addr: int, upper: int,
                                 lower: Optional[int] = None,
-                                tail_targets=(), *, require_entry_frame=False) -> bool:
+                                tail_targets=(), *, require_entry_frame=False,
+                                allow_indirect_tails=False) -> bool:
         """Read-only proof of a closed callback CFG inside an unclaimed gap.
 
         Calls may return from other functions; branches and fallthrough must
@@ -572,6 +573,7 @@ class DisasmEngine:
         decoder = Disassembler()
         entries = {addr}
         tables = {}
+        indirect_tails = set()
         while True:
             decoded = decoder.disassemble_cfg(
                 raw, lower, upper, entries,
@@ -583,6 +585,11 @@ class DisasmEngine:
                 if not insn.operands:
                     return False
                 op = insn.operands[0]
+                if (allow_indirect_tails
+                        and (op.type != "mem" or not op.mem_index
+                             or not self.jump_table_entries(op.mem_disp))):
+                    indirect_tails.add(insn.address)
+                    continue
                 if (op.type != "mem" or not op.mem_index or op.mem_base
                         or op.mem_scale != 4 or op.mem_seg):
                     return False
@@ -616,7 +623,7 @@ class DisasmEngine:
                         "ud2", "ud0", "ud1", "retf", "in", "out",
                         "insb", "insw", "insd", "outsb", "outsw", "outsd")):
                 return False
-            if insn.is_ret:
+            if insn.is_ret or insn.address in indirect_tails:
                 exits = True
                 continue
             edges = []
