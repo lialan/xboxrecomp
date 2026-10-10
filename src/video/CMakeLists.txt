@@ -11,4 +11,11 @@ target_include_directories(xbox_video PUBLIC
 target_link_libraries(xbox_video PUBLIC xbox_d3d8)
 if(WIN32)
     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32)
+else()
+    # The framebuffer window on POSIX hosts: SDL2, on the process main thread
+    # (fb_present_sdl.c). xbox_input, because that thread then pumps the
+    # events the game controllers are read from.
+    find_package(SDL2 REQUIRED)
+    target_sources(xbox_video PRIVATE fb_present_sdl.c)
+    target_link_libraries(xbox_video PUBLIC SDL2::SDL2 xbox_input)
 endif()

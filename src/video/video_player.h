@@ -71,4 +71,14 @@ int  xbox_FramebufferDumpBmp(const char *path);
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
 void xbox_FramebufferWindowFrameStats(uint32_t draws);
 
+#if !defined(_WIN32)
+/* POSIX hosts: the framebuffer window needs the process main thread (AppKit
+ * on macOS), so a title that wants it calls this from main() with its boot
+ * sequence. With RECOMP_FB_WINDOW set it opens the window, runs guest_main on
+ * a pthread and pumps events until guest_main returns (its value is returned)
+ * or the window is closed (the process exits). Otherwise, or headless, it
+ * just calls guest_main. */
+int  xbox_HostWindowMain(int (*guest_main)(void));
+#endif
+
 #endif /* BURNOUT3_VIDEO_PLAYER_H */

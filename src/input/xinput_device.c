@@ -257,6 +257,26 @@ static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 
+/* Set while the framebuffer window's main thread pumps SDL events
+ * (src/video/fb_present_sdl.c). The pump already updates the controllers,
+ * and SDL_GameControllerUpdate pumps events itself, which on macOS must only
+ * happen on the main thread; so then this side only reads them. */
+static volatile int g_main_pump;
+
+void xbox_InputSetMainPump(int on)
+{
+    g_main_pump = on;
+}
+
+/* Whether any controller is open: SDL must stay up for it at shutdown. */
+int xbox_InputAnyOpen(void)
+{
+    for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if (g_pads[i])
+            return 1;
+    return 0;
+}
+
 /* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
 static void open_controllers(void)
 {
@@ -274,6 +294,9 @@ static void open_controllers(void)
 
 void xbox_InputInit(void)
 {
+    /* Keep the default SIGINT/SIGTERM: SDL would turn them into an SDL_QUIT
+     * that nothing reads without a window, and Ctrl-C would stop working. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
     open_controllers();
@@ -290,7 +313,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         return ERROR_DEVICE_NOT_CONNECTED;
     }
 
-    SDL_GameControllerUpdate();
+    if (!g_main_pump)
+        SDL_GameControllerUpdate();
     g_controller_connected[dwPort] = TRUE;
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
