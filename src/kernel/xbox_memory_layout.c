@@ -78,6 +78,27 @@ static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
  * question. */
 static void *g_span_base = NULL;
 static size_t g_span_size = 0;
+/* POSIX, RECOMP_EXT_VMA only: the span holds the whole 4 GB guest window, and
+ * every fixed-address window is carved out of it (layout_map_view,
+ * layout_commit_at). See the span reservation in xbox_MemoryLayoutInit. */
+static int g_span_whole_window = 0;
+
+/* POSIX: hand back the part of our span reservation a fixed-address window is
+ * about to take. Only when the span holds the whole window; the stock span
+ * covers RAM and the mirrors alone, whose loop frees its own slices. Not
+ * atomic: the slice is unmapped, then mapped again with MAP_FIXED_NOREPLACE,
+ * and another thread's mmap could land in between. The window's map then fails
+ * and says so, as it did before the span held it. */
+static void span_release_for(void *addr, size_t size)
+{
+#if !defined(_WIN32)
+    uintptr_t a = (uintptr_t)addr, lo = (uintptr_t)g_span_base;
+    if (g_span_whole_window && a >= lo && a + size <= lo + g_span_size)
+        VirtualFree(addr, size, MEM_RELEASE);
+#else
+    (void)addr; (void)size;
+#endif
+}
 static void *g_tiled_view = NULL;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
@@ -136,7 +157,11 @@ static HANDLE g_contig_mapping = NULL;
  * it: split the placeholder (VirtualFree MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)
  * and replace that piece with a view (MapViewOfFile3) or with private memory
  * (VirtualAlloc2), both with MEM_REPLACE_PLACEHOLDER. Nothing else in the
- * process can be placed inside the window in between.
+ * process can be placed inside the window in between. One exception, opt-in:
+ * under RECOMP_EXT_VMA the range above the mirrors is released outright for
+ * guest_vmem, which reserves it with a plain VirtualAlloc. Another
+ * thread could take it in that gap; guest_vmem then reports the reservation
+ * failed and stays off, which is detectable, not corrupting.
  *
  * Both functions are resolved at run time from kernelbase.dll: they need
  * Windows 10 1803 or later, and Wine has them too. Without them, the fallback
@@ -232,6 +257,17 @@ static void win_settle_placeholders(void)
 }
 #endif /* _WIN32 */
 
+/* RECOMP_EXT_VMA (guest_vmem): the guest range from the top of the
+ * RAM mirrors to GUEST_VMEM_TOP, or 0 when the switch is off or the mirrors
+ * already reach past it. Only when this is non-zero does the layout below
+ * differ from the stock one. */
+static uint64_t ext_vma_span(uint64_t mirror_top)
+{
+    if (!getenv("RECOMP_EXT_VMA") || mirror_top >= GUEST_VMEM_TOP)
+        return 0;
+    return GUEST_VMEM_TOP - mirror_top;
+}
+
 /* Map a view of `mapping` at a fixed host address. On Windows, inside the
  * reserved window, the view replaces the placeholder there. Elsewhere this is
  * the MapViewOfFileEx call it always was. */
@@ -245,6 +281,7 @@ static void *layout_map_view(HANDLE mapping, size_t size, void *addr)
                                 NULL, 0);
     }
 #endif
+    span_release_for(addr, size);
     return MapViewOfFileEx(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size, addr);
 }
 
@@ -264,6 +301,7 @@ static void *layout_commit_at(void *addr, size_t size)
         return VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE);
     }
 #endif
+    span_release_for(addr, size);
     return VirtualAlloc(addr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 
@@ -2238,6 +2276,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * otherwise run to 0xE8000000 and hold 0x80000000 against it. */
         if (g_span_size > XBOX_CONTIG_BASE)
             g_span_size = XBOX_CONTIG_BASE;
+        /* RECOMP_EXT_VMA: hold the whole 4 GB guest window, as Windows does
+         * with its placeholder. Linux places mappings top-down, so the host
+         * range just above a fresh span is usually already taken: guest_vmem's
+         * fixed reservation there failed (ENOMEM), and a span grown only to
+         * GUEST_VMEM_TOP pushed the contiguous window onto the neighbour
+         * instead. Each fixed window is carved out of the span as it is
+         * mapped, and guest_vmem's range is handed over just before
+         * guest_vmem_init. Off by default; the stock span is unchanged. */
+        if (ext_vma_span(g_span_size)) {
+            g_span_size = (size_t)1 << 32;
+            g_span_whole_window = 1;
+        }
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
@@ -2248,7 +2298,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
                 g_span_base = NULL;
                 g_span_size = 0;
+                g_span_whole_window = 0;
             }
+        } else {
+            g_span_whole_window = 0;
         }
 #endif
 
@@ -3073,8 +3126,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             }
             /* Inside the reservation this hands back the slice we are about
              * to use; outside it (no reservation) this is a no-op on an
-             * address we never held. */
-            if (g_span_base)
+             * address we never held. When the span holds the whole window
+             * (RECOMP_EXT_VMA), layout_map_view releases the slice itself:
+             * freeing it here too would unmap it twice, and the second
+             * munmap could take out another thread's mapping in the gap. */
+            if (g_span_base && !g_span_whole_window)
                 VirtualFree((LPVOID)mirror_base, g_memory_size, MEM_RELEASE);
             g_mirror_views[m] = layout_map_view(g_mapping_handle,
                                                 g_memory_size,
@@ -3094,8 +3150,30 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     /* Guest address space above the mirrors, for titles that ask for a specific
      * high address. RECOMP_EXT_VMA; a no-op without it. Straight after the
      * mirrors, while a fixed host address is still likely to be free. */
-    guest_vmem_init(g_memory_offset, g_memory_size,
-                    (uint64_t)g_memory_size * (1u + XBOX_NUM_MIRRORS));
+    {
+        uint64_t mirror_top = (uint64_t)g_memory_size * (1u + XBOX_NUM_MIRRORS);
+        uint64_t ext = ext_vma_span(mirror_top);
+
+        /* guest_vmem reserves its range itself, with a plain fixed-address
+         * reservation, and only where the host reports it free. Our own hold
+         * on that range has to go first: on Windows the 4 GB placeholder
+         * window covers it, on POSIX the span above. Nothing happens here
+         * with the switch off. */
+        if (ext) {
+            uintptr_t host = (uintptr_t)(mirror_top + (uint64_t)g_memory_offset);
+#if defined(_WIN32)
+            if (win_in_window(host, (size_t)ext)) {
+                win_split_placeholder(host, (size_t)ext);
+                VirtualFree((LPVOID)host, 0, MEM_RELEASE);
+            }
+#else
+            if (g_span_base && host >= (uintptr_t)g_span_base
+                    && host + ext <= (uintptr_t)g_span_base + g_span_size)
+                VirtualFree((LPVOID)host, (SIZE_T)ext, MEM_RELEASE);
+#endif
+        }
+        guest_vmem_init(g_memory_offset, g_memory_size, mirror_top);
+    }
 
     /*
      * Tiled / write-combined aperture at 0xF0000000.
@@ -3296,6 +3374,7 @@ void xbox_MemoryLayoutShutdown(void)
         VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
         g_span_base = NULL;
         g_span_size = 0;
+        g_span_whole_window = 0;
     }
 #if defined(_WIN32)
     /* The rest of the Windows guest window: the leftover placeholders and

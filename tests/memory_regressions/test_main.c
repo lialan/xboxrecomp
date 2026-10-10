@@ -370,6 +370,23 @@ int main(int argc, char **argv)
             snprintf(d, sizeof d, "status 0x%08X, base 0x%08X", st, base);
             check(base != hi, "default: an explicit high base is not honoured", d);
         } else if (ext) {
+            /* The layout's own reservations (the Windows placeholder window,
+             * the POSIX span) cover this range; it must hand it over, or the
+             * tracker finds nothing free and stays off. */
+            check(guest_vmem_active(),
+                  "the tracker is on: the layout handed its range over",
+                  "\"could not reserve host memory\": the placeholder window "
+                  "or the span still held the range");
+            /* And the windows above it are still mapped: on Linux a span
+             * grown to make room pushed the contiguous window onto a
+             * neighbouring mapping. Writing to it faults if it is missing. */
+            {
+                uint32_t c = xbox_ContiguousAlloc(0x1000, 4096);
+                if (c)
+                    *G(c) = 0x5A5A5A5Au;
+                check(c && *G(c) == 0x5A5A5A5Au,
+                      "the contiguous window is mapped beside the tracker", NULL);
+            }
             /* Reserve the exact address. */
             base = hi; size = 0x100000;
             st = nt_alloc_at(&base, &size, 0x2000);
