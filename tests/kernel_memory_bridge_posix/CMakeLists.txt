@@ -16,3 +16,9 @@ enable_testing()
 add_test(NAME kernel_memory_bridge_posix_test
          COMMAND kernel_memory_bridge_posix_test
                  ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
+# The same checks through upstream's RECOMP_HEAP_RECLAIM path.
+add_test(NAME kernel_memory_bridge_posix_reclaim
+         COMMAND kernel_memory_bridge_posix_test
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
+set_tests_properties(kernel_memory_bridge_posix_reclaim
+                     PROPERTIES ENVIRONMENT RECOMP_HEAP_RECLAIM=1)

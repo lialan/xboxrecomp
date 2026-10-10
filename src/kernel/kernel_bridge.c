@@ -1383,6 +1383,132 @@ static void bridge_NtQueryVirtualMemory(void)
     g_eax = 0;                                          /* STATUS_SUCCESS */
 }
 
+/* NtFreeVirtualMemory without RECOMP_HEAP_RECLAIM, answered in guest terms.
+ *
+ * Both pointer arguments are guest addresses of guest values: *BaseAddress is
+ * a 32-bit guest VA and *FreeSize a 32-bit byte count. Handing
+ * XBOX_TO_NATIVE(base_ptr) to xbox_NtFreeVirtualMemory as a host PVOID * read
+ * 8 bytes there -- the guest VA plus the next stack word -- and called the
+ * host VirtualFree on the result. That failed every time (one title logged
+ * tens of thousands of "NtFreeVirtualMemory failed ... err=487" in minutes),
+ * and even a correct read would have released a slice of the guest RAM view
+ * out from under the title.
+ *
+ * Guest memory is one committed mapping, and the regions a title frees here
+ * came from bridge_NtAllocateVirtualMemory, i.e. from xbox_HeapAlloc (or
+ * xbox_ReserveAlloc above RAM). So:
+ *
+ *   MEM_DECOMMIT  the pages stay mapped; they are zeroed, which is what the
+ *                 title sees on hardware when it commits them again (a
+ *                 recommit is a no-op in the allocate bridge).
+ *   MEM_RELEASE   the heap block goes back to xbox_HeapFree (reused only
+ *                 under RECOMP_HEAP_RECLAIM). A reservation above RAM comes
+ *                 from a bump allocator and is not reused.
+ *
+ * NT rounds the range out to whole pages and writes the rounded base and
+ * size back, and so does this. */
+#define BRIDGE_MEM_DECOMMIT 0x4000u
+#define BRIDGE_MEM_RELEASE  0x8000u
+#define BRIDGE_FREE_VM_NOT_AT_BASE 0xC000009Fu
+
+/* True when va lies inside a heap block but not at its start; left is
+ * xbox_HeapBlockSize(va). The byte before an interior address is in the same
+ * block, one byte further from its end. NT refuses a release there. */
+static int bridge_heap_interior(uint32_t va, uint32_t left)
+{
+    return left && va && xbox_HeapBlockSize(va - 1) == left + 1;
+}
+
+static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
+                                    uint32_t free_type)
+{
+    static unsigned long decommits, releases, refused;
+    static uint64_t decommit_bytes;
+    uint32_t base, size, page_base, end, left;
+    uint32_t mapped = (uint32_t)(g_xbox_map_size ? g_xbox_map_size
+                                                 : g_xbox_total_ram);
+
+    if (!base_ptr || !size_ptr || !bridge_va_mapped(base_ptr, 4)
+            || !bridge_va_mapped(size_ptr, 4)) {
+        g_eax = 0xC0000005u;                    /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+    base = BRIDGE_MEM32(base_ptr);
+    size = BRIDGE_MEM32(size_ptr);
+
+    if ((free_type != BRIDGE_MEM_DECOMMIT && free_type != BRIDGE_MEM_RELEASE)
+            || (free_type == BRIDGE_MEM_RELEASE && size != 0)) {
+        g_eax = 0xC00000F0u;           /* STATUS_INVALID_PARAMETER_2..3 */
+        if (refused++ < 8) {
+            fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X "
+                    "size=%u type=0x%X refused (bad type/size)\n",
+                    base, size, free_type);
+            fflush(stderr);
+        }
+        return;
+    }
+
+    /* Only the dynamic heap and the reservations above RAM are ever handed
+     * out by the allocate bridge. Anything lower is the image or the stacks,
+     * and zeroing it on a stray request would be far worse than refusing. */
+    page_base = base & ~0xFFFu;
+    if (page_base < XBOX_HEAP_BASE || page_base >= mapped) {
+        g_eax = 0xC00000A0u;                /* STATUS_MEMORY_NOT_ALLOCATED */
+        if (refused++ < 8) {
+            fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X "
+                    "type=0x%X outside guest memory\n", base, free_type);
+            fflush(stderr);
+        }
+        return;
+    }
+
+    left = xbox_HeapBlockSize(page_base);
+    if (free_type == BRIDGE_MEM_RELEASE) {
+        if (base != page_base || bridge_heap_interior(page_base, left)) {
+            g_eax = BRIDGE_FREE_VM_NOT_AT_BASE;
+            if (refused++ < 8) {
+                fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X "
+                        "release inside a block refused\n", base);
+                fflush(stderr);
+            }
+            return;
+        }
+        size = left;
+        xbox_HeapFree(page_base);          /* ignores what it never handed out */
+        releases++;
+    } else {
+        /* FreeSize 0 means "the whole region from here". */
+        if (!size)
+            size = left;
+        end = (uint32_t)(((uint64_t)base + size + 0xFFFu) & ~(uint64_t)0xFFFu);
+        if (end > mapped || end < page_base)
+            end = mapped;
+        /* Never past the block: its neighbour belongs to someone else. */
+        if (left && end - page_base > left)
+            end = page_base + left;
+        size = end - page_base;
+        if (size)
+            memset(XBOX_TO_NATIVE(page_base), 0, size);
+        decommits++;
+        decommit_bytes += size;
+    }
+
+    BRIDGE_MEM32(base_ptr) = page_base;
+    BRIDGE_MEM32(size_ptr) = size;
+    g_eax = 0;                                          /* STATUS_SUCCESS */
+
+    /* Hot on a title with a growable heap (hundreds of decommits a second):
+     * a running summary, not a line per call. */
+    if (KERNEL_LOG_ON() || decommits + releases <= 4
+            || ((decommits + releases) & 0x3FFFu) == 0) {
+        fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X size=%u "
+                "type=0x%X (decommits=%lu/%llu KB releases=%lu)\n",
+                page_base, size, free_type, decommits,
+                (unsigned long long)(decommit_bytes / 1024), releases);
+        fflush(stderr);
+    }
+}
+
 static void bridge_NtFreeVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);
@@ -1415,23 +1541,38 @@ static void bridge_NtFreeVirtualMemory(void)
 
         if (left) {
             if (free_type & 0x8000) {              /* MEM_RELEASE */
+                if (bridge_heap_interior(vm_base, left)) {
+                    g_eax = BRIDGE_FREE_VM_NOT_AT_BASE;
+                    return;
+                }
                 xbox_HeapFree(vm_base);
-                BRIDGE_MEM32(size_ptr) = 0;
+                /* NT writes back what it released: the base and the size. */
+                BRIDGE_MEM32(size_ptr) = left;
             } else {
                 /* MEM_DECOMMIT keeps the block, but on the console the pages
                  * are gone and a later MEM_COMMIT (a no-op here) brings them
                  * back zeroed. Zero them now so it does. */
                 uint32_t vm_size = BRIDGE_MEM32(size_ptr);
                 uint32_t n = (vm_size && vm_size < left) ? vm_size : left;
-                memset(XBOX_TO_NATIVE(vm_base), 0, n);
+                uint32_t page_base = vm_base & ~0xFFFu;
+                uint64_t end = ((uint64_t)vm_base + n + 0xFFFu) & ~(uint64_t)0xFFFu;
+                /* NT decommits whole pages and writes back the rounded range;
+                 * both stay inside the block (a block need not start on a
+                 * page, and then its first page is shared). */
+                if (end > (uint64_t)vm_base + left)
+                    end = (uint64_t)vm_base + left;
+                if (xbox_HeapBlockSize(page_base) != left + (vm_base - page_base))
+                    page_base = vm_base;
+                memset(XBOX_TO_NATIVE(page_base), 0, (size_t)(end - page_base));
+                BRIDGE_MEM32(base_ptr) = page_base;
+                BRIDGE_MEM32(size_ptr) = (uint32_t)(end - page_base);
             }
             g_eax = 0;
             return;
         }
     }
 
-    g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
-        XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
+    bridge_free_guest_pages(base_ptr, size_ptr, free_type);
 }
 
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─
