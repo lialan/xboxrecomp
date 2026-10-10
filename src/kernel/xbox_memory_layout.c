@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "guest_vmem.h"
+#include "kernel_missing.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1654,6 +1655,16 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                 *(const uint32_t *)(mem + a));
     }
     fflush(stderr);
+    /* Counts only, without the report's lock: the thread being reported
+     * on may be wedged anywhere, inside that lock included. */
+    {
+        uint32_t hi, lo;
+        xbox_missing_counts(&hi, &lo, NULL);
+        if (hi + lo)
+            fprintf(stderr, "  [FILE] missing at watchdog: %u high, %u low\n",
+                    (unsigned)hi, (unsigned)lo);
+        fflush(stderr);
+    }
     _exit(3);
     return 0;
 }

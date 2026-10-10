@@ -27,6 +27,7 @@
 
 #include "kernel.h"
 #include "guest_vmem.h"
+#include "kernel_missing.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
@@ -1760,6 +1761,10 @@ static void bridge_HalReturnToFirmware(void)
      * RECOMP_ICALL_FEEDBACK is on. */
     RECOMP_ICALL_FEEDBACK_DUMP();
 
+    /* The missing-file summary, for the same reason. On POSIX ExitProcess is
+     * exit() and atexit runs after all; the summary prints once either way. */
+    xbox_missing_summary("firmware");
+
     /* Let a host-played FMV finish before the process goes away.
      *
      * The title is not the one presenting it, so it has no reason to wait --
@@ -3375,11 +3380,12 @@ static int bridge_is_cdrom_device(const char *path)
     return _stricmp(path, "\\Device\\CdRom0") == 0;
 }
 
-/* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
-static NTSTATUS bridge_create_file_impl(
+/* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE.
+ * bridge_create_file_impl, below, wraps this with the per-attempt log. */
+static NTSTATUS bridge_create_file_open(
     uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
     uint32_t iostatus_va, ULONG file_attrs, ULONG share,
-    ULONG disposition, ULONG options)
+    ULONG disposition, ULONG options, XBOX_ANSI_STRING *name_out)
 {
     XBOX_OBJECT_ATTRIBUTES oa;
     XBOX_ANSI_STRING       name;
@@ -3388,6 +3394,7 @@ static NTSTATUS bridge_create_file_impl(
     NTSTATUS st;
 
     bridge_build_oa(obj_attrs_va, &oa, &name);
+    *name_out = name;
     if (!name.Buffer) {
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
@@ -3413,6 +3420,66 @@ static NTSTATUS bridge_create_file_impl(
     } else {
         bridge_write_iostatus(iostatus_va, st, 0);
     }
+    return st;
+}
+
+/* Every guest open -- NtCreateFile, NtOpenFile, IoCreateFile -- comes through
+ * here, so this is where each attempt is logged and where the missing-file
+ * report (kernel_missing.c) sees it. NtOpenFile and IoCreateFile used to
+ * print nothing at all. Their failures print now, since the report needs
+ * them; their successes only under RECOMP_MISSING_FILES=all, because a
+ * title that streams through IoCreateFile would otherwise log
+ * every open by default. ntcreate: the caller is NtCreateFile, whose
+ * success line has always printed. */
+static NTSTATUS bridge_create_file_impl(
+    uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
+    uint32_t iostatus_va, ULONG file_attrs, ULONG share,
+    ULONG disposition, ULONG options, int ntcreate)
+{
+    XBOX_ANSI_STRING name;
+    NTSTATUS st = bridge_create_file_open(handle_va, access, obj_attrs_va,
+                                          iostatus_va, file_attrs, share,
+                                          disposition, options, &name);
+    uint32_t status = (uint32_t)st;
+
+    /* Paired with the [PATH] line the translation just printed: that says what
+     * was asked for, this says whether it opened. A failed open is not itself
+     * a bug -- a title probing the cache partition before the disc expects one
+     * -- so the status is what separates a probe from a real miss. */
+    {
+        extern uint32_t xbox_LastFileError(void);
+        uint32_t _e = status ? xbox_LastFileError() : 0u;
+        /* The guest's own path, read from its OBJECT_ATTRIBUTES. The POSIX
+         * path backend prints no [PATH] line, so without this a failed open
+         * on macOS said that something was missing but not what. */
+        char gpath[160] = "?";
+        if (name.Buffer) {
+            uint32_t len = name.Length, k;
+            if (len >= sizeof gpath) len = sizeof gpath - 1;
+            for (k = 0; k < len; k++)
+                gpath[k] = name.Buffer[k];
+            gpath[len] = 0;
+        }
+        if (status) {
+            /* Once a path has its "[FILE] missing" line, its later attempts
+             * are counted rather than printed: a looping stream re-opens a
+             * missing file every loop (97 lines in 100 s on one title). The
+             * report decides; with it off, every attempt prints as before. */
+            if (!xbox_missing_is_reported(gpath))
+                fprintf(stderr, "  [FILE] %s (disp %u) -> 0x%08X FAILED (win32 err=%u%s)\n",
+                        gpath, (unsigned)disposition, status, _e,
+                        _e == 32u ? " ERROR_SHARING_VIOLATION"
+                      : _e ==  2u ? " ERROR_FILE_NOT_FOUND"
+                      : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "");
+            if (name.Buffer)
+                xbox_missing_note(gpath, status, (uint32_t)access,
+                                  (uint32_t)disposition, (uint32_t)options, 0);
+        } else if (ntcreate || xbox_missing_verbose())
+            fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X\n",
+                    gpath, (unsigned)disposition, (unsigned)options,
+                    g_xbox_kernel_caller, status);
+    }
+    fflush(stderr);
     return st;
 }
 
@@ -3510,7 +3577,7 @@ static void bridge_NtCreateFile(void)
      * ntdll and no recompiled frame to blame. */
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
-        file_attrs, share, disposition, options);
+        file_attrs, share, disposition, options, 1);
 
     /* FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT. Neither set
      * means the caller wants asynchronous completion on this handle. */
@@ -3550,41 +3617,6 @@ static void bridge_NtCreateFile(void)
                 && !xbox_VideoIsPlaying())
             xbox_VideoPlayFile(host);
     }
-
-    /* Paired with the [PATH] line the translation just printed: that says what
-     * was asked for, this says whether it opened. A failed open is not itself
-     * a bug -- a title probing the cache partition before the disc expects one
-     * -- so the status is what separates a probe from a real miss. */
-    {
-        extern uint32_t xbox_LastFileError(void);
-        uint32_t _e = g_eax ? xbox_LastFileError() : 0u;
-        /* The guest's own path, read from its OBJECT_ATTRIBUTES. The POSIX
-         * path backend prints no [PATH] line, so without this a failed open
-         * on macOS said that something was missing but not what. */
-        char gpath[160] = "?";
-        if (obj_attrs) {
-            uint32_t str = BRIDGE_MEM32(obj_attrs + 4);
-            if (str) {
-                uint32_t len = BRIDGE_MEM16(str), buf = BRIDGE_MEM32(str + 4), k;
-                if (buf) {
-                    if (len >= sizeof gpath) len = sizeof gpath - 1;
-                    for (k = 0; k < len; k++)
-                        gpath[k] = (char)BRIDGE_MEM8(buf + k);
-                    gpath[len] = 0;
-                }
-            }
-        }
-        if (g_eax)
-            fprintf(stderr, "  [FILE] %s (disp %u) -> 0x%08X FAILED (win32 err=%u%s)\n",
-                    gpath, (unsigned)disposition, g_eax, _e,
-                    _e == 32u ? " ERROR_SHARING_VIOLATION"
-                  : _e ==  2u ? " ERROR_FILE_NOT_FOUND"
-                  : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "");
-        else
-            fprintf(stderr, "  [FILE] %s (disp %u) -> 0x%08X\n",
-                    gpath, (unsigned)disposition, g_eax);
-    }
-    fflush(stderr);
 }
 
 /* ── NtOpenFile (ordinal 202, 6 args = 24 bytes) ──────── */
@@ -3600,7 +3632,7 @@ static void bridge_NtOpenFile(void)
     /* NtOpenFile = NtCreateFile with FILE_OPEN disposition */
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
-        0, share, 1 /* FILE_OPEN */, options);
+        0, share, 1 /* FILE_OPEN */, options, 0);
 }
 
 /*
@@ -4091,6 +4123,10 @@ static void bridge_NtQueryFullAttributesFile(void)
     if (!name.Buffer) { g_eax = STATUS_OBJECT_PATH_NOT_FOUND; return; }
     g_eax = (uint32_t)xbox_NtQueryFullAttributesFile(&oa,
                 (PXBOX_FILE_NETWORK_OPEN_INFORMATION)XBOX_TO_NATIVE(info_va));
+    /* Asking whether a file exists is not expecting it: a probe, listed only
+     * under RECOMP_MISSING_FILES=all. */
+    if (g_eax)
+        xbox_missing_note(name.Buffer, g_eax, 0, XBOX_FILE_OPEN, 0, 1);
 }
 
 /* ── NtFlushBuffersFile (ordinal 198, 2 args = 8 bytes) ─── */
@@ -4221,7 +4257,7 @@ static void bridge_IoCreateFile(void)
 
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
-        file_attrs, share, disposition, options);
+        file_attrs, share, disposition, options, 0);
 }
 
 /* -- NtDeviceIoControlFile (ordinal 196, 10 args = 40 bytes) ----
