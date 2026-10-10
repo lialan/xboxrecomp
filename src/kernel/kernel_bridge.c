@@ -456,10 +456,222 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 
 struct bridge_thread_start {
     recomp_func_t fn;
-    uint32_t ctx1, ctx2, stack_top;
+    uint32_t ctx1, ctx2, stack_top, obj_va, tls_size;
 };
 
+/* Lay out a thread's TLS the way the Xbox kernel does.
+ *
+ * PsCreateSystemThreadEx takes a TlsDataSize, and the kernel carves that many
+ * bytes off the top of the new thread's stack: KTHREAD.TlsData (+0x28) points
+ * at them and NtTib.StackBase, fs:[4], is the address just past them. XAPI's
+ * entry point stores -(TlsDataSize/4) as the image's TLS index, so
+ * [fs:[4] + index*4] and [[fs:[0x28]]+0x28] are the same dword -- the thread
+ * startup writes it through the second, the CRT reads it through the first.
+ *
+ * The loader cannot know that size: it is computed at run time from the TLS
+ * directory in .rdata, and a title's header copy of that directory can be all
+ * zeros. The loader then built a 4-byte block, fs:[4] sat 4 bytes past it,
+ * and the CRT read its per-thread pointer from 0x90 bytes below the block --
+ * zeros on most threads (so the CRT's exit path cleared guest address 0xC)
+ * and, on one loader thread, the tail of a texture someone else had allocated
+ * next to that thread's TIB, which faulted inside the CRT.
+ *
+ * `kthread` is the object fs:[0x28] names for this thread; `top` is where the
+ * block ends. Returns the new fs:[4], 0 when there was nothing to do. */
+static uint32_t bridge_layout_tls(uint32_t kthread, uint32_t top,
+                                  uint32_t tls_size)
+{
+    uint32_t data;
+
+    if (!kthread || !top || !tls_size || (tls_size & 3) || tls_size > 0x10000)
+        return 0;
+    data = (top - tls_size) & ~0xFu;
+    memset(XBOX_TO_NATIVE(data), 0, top - data);
+    BRIDGE_MEM32(kthread + 0x28) = data;              /* KTHREAD.TlsData */
+    BRIDGE_MEM32(g_fs_base + 0x04) = data + tls_size; /* NtTib.StackBase */
+    return data + tls_size;
+}
+
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
+
+/* ── Guest thread objects ─────────────────────────────────
+ *
+ * A thread handle has to lead to something in guest memory. XAPI's
+ * GetExitCodeThread is
+ *
+ *     ObReferenceObjectByHandle(h, &PsThreadObjectType, &thread);
+ *     code = thread->Header.SignalState ? thread->ExitStatus : STILL_ACTIVE;
+ *     ObfDereferenceObject(thread);
+ *
+ * reading SignalState at +4 and ExitStatus at +0x120. ObReferenceObjectByHandle
+ * used to hand back NULL, so the title read guest page 0, saw STILL_ACTIVE
+ * forever, and a title that waits for its loader thread this way spun on it
+ * after the loader had exited.
+ *
+ * Every spawned thread now gets a zeroed 0x200-byte object (Type 6 =
+ * ThreadObject), carved from contiguous pages because that allocator is
+ * locked and kernel objects live up there on hardware anyway. The object is
+ * reference counted host-side: one reference for the running thread, one per
+ * handle token, one per ObReferenceObjectByHandle. When the thread ends, by
+ * PsTerminateSystemThread or by returning, ExitStatus is written and then
+ * SignalState is set to 1. KeWaitForSingleObject on the object waits on the
+ * host thread through the KE shadow table. A slot goes back to the pool once
+ * its last reference is dropped.
+ */
+#define THOBJ_SIZE        0x200u
+#define THOBJ_SIGNAL      0x004u
+#define THOBJ_EXIT_STATUS 0x120u
+#define THOBJ_MAX         256
+#define THOBJ_PER_PAGE    (0x1000u / THOBJ_SIZE)
+
+static uint32_t s_thobj_va[THOBJ_MAX];     /* 0 = slot never carved */
+static LONG     s_thobj_refs[THOBJ_MAX];   /* 0 = free */
+static uint32_t s_thobj_count;             /* slots carved so far */
+static uint32_t s_token_thobj[16384];      /* token index -> object VA */
+static volatile LONG s_thobj_lock;
+static RECOMP_TLS uint32_t g_thread_obj_va;
+
+static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
+static void ke_shadow_remove(uint32_t guest_va);
+
+static void thobj_lock(void)
+{
+    while (InterlockedCompareExchange(&s_thobj_lock, 1, 0) != 0)
+        SwitchToThread();
+}
+
+static void thobj_unlock(void) { InterlockedExchange(&s_thobj_lock, 0); }
+
+/* Slot of a thread object VA, or -1. Lock held. */
+static int thobj_slot(uint32_t va)
+{
+    uint32_t i;
+
+    if (!va)
+        return -1;
+    for (i = 0; i < s_thobj_count; i++)
+        if (s_thobj_va[i] == va)
+            return (int)i;
+    return -1;
+}
+
+/* A fresh object holding one reference (the thread's). */
+static uint32_t thobj_alloc(void)
+{
+    uint32_t i, va = 0;
+
+    thobj_lock();
+    for (i = 0; i < s_thobj_count; i++)
+        if (s_thobj_refs[i] == 0)
+            break;
+    if (i == s_thobj_count && s_thobj_count < THOBJ_MAX) {
+        uint32_t page = xbox_ContiguousAlloc(0x1000, 0x1000);
+        uint32_t k;
+
+        if (page) {
+            for (k = 0; k < THOBJ_PER_PAGE && s_thobj_count < THOBJ_MAX; k++)
+                s_thobj_va[s_thobj_count++] = page + k * THOBJ_SIZE;
+        }
+    }
+    if (i < s_thobj_count) {
+        va = s_thobj_va[i];
+        s_thobj_refs[i] = 1;
+    }
+    thobj_unlock();
+
+    if (!va) {
+        fprintf(stderr, "  [KERNEL] no guest thread object (pool of %d full)\n",
+                THOBJ_MAX);
+        fflush(stderr);
+        return 0;
+    }
+    memset(XBOX_TO_NATIVE(va), 0, THOBJ_SIZE);
+    BRIDGE_MEM8(va + 0) = 6;                      /* Type: ThreadObject */
+    BRIDGE_MEM8(va + 2) = (uint8_t)(THOBJ_SIZE / 4);
+    BRIDGE_MEM32(va + 8)  = va + 8;               /* WaitListHead, empty */
+    BRIDGE_MEM32(va + 12) = va + 8;
+    BRIDGE_MEM32(va + THOBJ_EXIT_STATUS) = 0x103; /* STILL_ACTIVE */
+    return va;
+}
+
+static void thobj_ref(uint32_t va)
+{
+    int s;
+
+    thobj_lock();
+    s = thobj_slot(va);
+    if (s >= 0 && s_thobj_refs[s] > 0)
+        s_thobj_refs[s]++;
+    thobj_unlock();
+}
+
+static void thobj_unref(uint32_t va)
+{
+    int s, freed = 0;
+
+    thobj_lock();
+    s = thobj_slot(va);
+    if (s >= 0 && s_thobj_refs[s] > 0 && --s_thobj_refs[s] == 0)
+        freed = 1;
+    thobj_unlock();
+    if (freed)
+        ke_shadow_remove(va);   /* closes the shadow's host thread handle */
+}
+
+/* The thread has ended: publish ExitStatus, then SignalState, then drop the
+ * thread's own reference. */
+static void thobj_exit(uint32_t va, uint32_t status)
+{
+    if (!va)
+        return;
+    BRIDGE_MEM32(va + THOBJ_EXIT_STATUS) = status;
+    InterlockedExchange((volatile LONG *)XBOX_TO_NATIVE(va + THOBJ_SIGNAL), 1);
+    thobj_unref(va);
+}
+
+/* Handle tokens that lead to a thread object. */
+static void thobj_attach_token(uint32_t token, uint32_t va)
+{
+    uint32_t i = token & 0x00FFFFFFu;
+
+    if ((token & 0xFF000000u) != 0x48000000u || !i || i >= 16384 || !va)
+        return;
+    thobj_ref(va);
+    thobj_lock();
+    i = InterlockedExchange((volatile LONG *)&s_token_thobj[i], (LONG)va);
+    thobj_unlock();
+    if (i)
+        thobj_unref(i);   /* a stale mapping the slot never cleared */
+}
+
+static uint32_t thobj_from_token(uint32_t token)
+{
+    uint32_t i = token & 0x00FFFFFFu;
+
+    if ((token & 0xFF000000u) != 0x48000000u || !i || i >= 16384)
+        return 0;
+    return s_token_thobj[i];
+}
+
+static void thobj_detach_token(uint32_t token)
+{
+    uint32_t i = token & 0x00FFFFFFu, va;
+
+    if ((token & 0xFF000000u) != 0x48000000u || !i || i >= 16384)
+        return;
+    va = (uint32_t)InterlockedExchange((volatile LONG *)&s_token_thobj[i], 0);
+    if (va)
+        thobj_unref(va);
+}
+
+/* The calling thread's object; the main thread gets one on first use and
+ * keeps it (it never ends while the title runs). */
+static uint32_t thobj_current(void)
+{
+    if (!g_thread_obj_va)
+        g_thread_obj_va = thobj_alloc();
+    return g_thread_obj_va;
+}
 
 static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
                                      uint32_t ctx2)
@@ -490,6 +702,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     g_is_spawned_thread = 1;
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
+    g_thread_obj_va = s->obj_va;
     {
         uint32_t tib = xbox_AllocThreadTib();
         if (tib)
@@ -497,6 +710,14 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
         else
             fprintf(stderr, "  [KERNEL] worker thread has no TIB of its own;"
                             " it shares the main thread's\n");
+        /* The thread object stands in for the KTHREAD, so fs:[0x28] names it
+         * and its TlsData is this thread's own, at the top of its stack. */
+        if (tib && s->obj_va && s->tls_size) {
+            uint32_t top = (s->stack_top + 16) & ~0xFu;
+            BRIDGE_MEM32(tib + 0x28) = s->obj_va;
+            if (bridge_layout_tls(s->obj_va, top, s->tls_size))
+                g_esp = ((top - s->tls_size) & ~0xFu) - 16;
+        }
     }
     free(s);
 
@@ -510,17 +731,24 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * stack is still ours to give back. */
     xbox_FreeThreadStack(g_thread_stack_top);
     g_thread_stack_top = 0;
+    /* The kernel's thread startup ends a returning routine with
+     * PsTerminateSystemThread(STATUS_SUCCESS). */
+    thobj_exit(g_thread_obj_va, 0);
+    g_thread_obj_va = 0;
     return 0;
 }
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
-                                  uint32_t ctx2, uint32_t stack_top)
+                                  uint32_t ctx2, uint32_t stack_top,
+                                  uint32_t obj_va, uint32_t tls_size)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    s->obj_va = obj_va;
+    s->tls_size = tls_size;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
     if (!th) free(s);
@@ -528,6 +756,34 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
      * spawn workers too, but never read it back. See kernel_thread.c. */
     else xbox_set_game_thread(th);
+    return th;
+}
+
+/* A worker with its guest thread object: the object is made first and holds
+ * an extra reference until the handle token owns one, so a worker that ends
+ * at once cannot free it underneath us. The KE shadow gets its own duplicate
+ * of the host thread handle, which is what KeWaitForSingleObject waits on. */
+static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
+                                        uint32_t ctx2, uint32_t stack_top,
+                                        uint32_t handle_va, uint32_t tls_size)
+{
+    uint32_t obj = thobj_alloc();
+    HANDLE th, shadow = NULL;
+
+    thobj_ref(obj);
+    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, obj, tls_size);
+    if (!th) {
+        thobj_unref(obj);   /* the thread's own: it never ran */
+    } else {
+        if (obj && DuplicateHandle(GetCurrentProcess(), th, GetCurrentProcess(),
+                                   &shadow, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            ke_shadow_insert(obj, shadow);
+        if (handle_va) {
+            bridge_write_handle(handle_va, th);
+            thobj_attach_token(BRIDGE_MEM32(handle_va), obj);
+        }
+    }
+    thobj_unref(obj);
     return th;
 }
 
@@ -549,6 +805,7 @@ void xbox_SetThreadMode(int mode) { g_thread_mode = mode; }
 static void bridge_PsCreateSystemThreadEx(void)
 {
     uint32_t xbox_handle_ptr = STACK_ARG(0);
+    uint32_t tls_size        = STACK_ARG(3);
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
     uint32_t start_routine   = STACK_ARG(9);
@@ -584,6 +841,19 @@ static void bridge_PsCreateSystemThreadEx(void)
         if (fn) {
             if (is_first_call) {
                 /* Main game thread: run directly, inheriting register state */
+                /* Its TLS too: the stack is already in use, so the block
+                 * comes from the heap, and the main TIB's fs:[0x28] object
+                 * gets the TlsData pointer (see bridge_layout_tls). */
+                if (tls_size) {
+                    uint32_t blk = xbox_HeapAlloc((tls_size + 0xFu) & ~0xFu, 16);
+                    uint32_t fs4 = blk ? bridge_layout_tls(
+                        BRIDGE_MEM32(g_fs_base + 0x28),
+                        blk + ((tls_size + 0xFu) & ~0xFu), tls_size) : 0;
+                    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: %u-byte"
+                            " TLS at 0x%08X, fs:[4] = 0x%08X\n", tls_size,
+                            fs4 ? fs4 - tls_size : 0, fs4);
+                    fflush(stderr);
+                }
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
@@ -632,15 +902,13 @@ static void bridge_PsCreateSystemThreadEx(void)
                     fflush(stderr);
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
-                    HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                    bridge_spawn_guest_thread(fn, start_context1, start_context2,
+                                              stack_top, xbox_handle_ptr,
+                                              tls_size);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
                     fflush(stderr);
-                    if (xbox_handle_ptr && th) {
-                        bridge_write_handle(xbox_handle_ptr, th);
-                    }
                 }
             }
         } else {
@@ -678,6 +946,7 @@ static void bridge_NtClose(void)
     }
 
     bridge_forget_async_handle(raw_handle);
+    thobj_detach_token(raw_handle);
 
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
@@ -1956,6 +2225,8 @@ static void bridge_PsTerminateSystemThread(void)
          * to do it. */
         xbox_FreeThreadStack(g_thread_stack_top);
         g_thread_stack_top = 0;
+        thobj_exit(g_thread_obj_va, exit_status);
+        g_thread_obj_va = 0;
         ExitThread(exit_status);
     }
 }
@@ -2808,21 +3079,55 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
 #define BRIDGE_HANDLE_TAG  0x48000000u
 #define BRIDGE_HANDLE_MASK 0x00FFFFFFu
 #define BRIDGE_HANDLE_MAX  16384
+/* thobj_* above spell these out because it comes first. */
+typedef char thobj_tag_matches[(BRIDGE_HANDLE_TAG == 0x48000000u &&
+                                BRIDGE_HANDLE_MAX == 16384) ? 1 : -1];
 static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
 
-static uint32_t bridge_handle_token(HANDLE h)
+/* Every guest thread allocates and frees tokens. Without a lock, two threads
+ * that ask at the same moment can both take the same free slot and get the
+ * same token for different HANDLEs. A title hit that: one token named both a
+ * new loader thread and a file a worker had open. When the worker closed its
+ * file, the thread lost its guest object, and the main thread's
+ * GetExitCodeThread poll never saw the thread end. */
+static volatile LONG s_handle_lock;
+
+static void handle_lock(void)
+{
+    while (InterlockedCompareExchange(&s_handle_lock, 1, 0) != 0)
+        SwitchToThread();
+}
+
+static void handle_unlock(void) { InterlockedExchange(&s_handle_lock, 0); }
+
+/* A token for h. The same HANDLE normally gets the same token. A duplicate
+ * must not: on POSIX, DuplicateHandle returns its source pointer with one
+ * more reference. If the duplicate shared the source's token, NtClose on
+ * either one would clear the slot that both of them use. */
+static uint32_t bridge_handle_token_ex(HANDLE h, int fresh)
 {
     int i;
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
+    handle_lock();
+    for (i = 1; !fresh && i < BRIDGE_HANDLE_MAX; i++)
+        if (s_handle_table[i] == h) {
+            handle_unlock();
+            return BRIDGE_HANDLE_TAG | (uint32_t)i;
+        }
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
         if (s_handle_table[i] == NULL) {
             s_handle_table[i] = h;
+            handle_unlock();
             return BRIDGE_HANDLE_TAG | (uint32_t)i;
         }
+    handle_unlock();
     fprintf(stderr, "  [BRIDGE] handle table full\n");
     return 0;
+}
+
+static uint32_t bridge_handle_token(HANDLE h)
+{
+    return bridge_handle_token_ex(h, 0);
 }
 
 /* Store a native HANDLE into a 32-bit Xbox memory slot (as a token). */
@@ -2878,8 +3183,11 @@ static HANDLE bridge_take_handle(uint32_t token)
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         if (i > 0 && i < BRIDGE_HANDLE_MAX) {
-            HANDLE h = s_handle_table[i];
+            HANDLE h;
+            handle_lock();
+            h = s_handle_table[i];
             s_handle_table[i] = NULL;
+            handle_unlock();
             return h;
         }
     }
@@ -3943,6 +4251,18 @@ static void bridge_ObReferenceObjectByHandle(void)
     uint32_t handle = STACK_ARG(0);
     uint32_t obj_type = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
+    /* Threads have a guest object (see thobj_alloc); -2 is NtCurrentThread. */
+    uint32_t thread = handle == 0xFFFFFFFEu ? thobj_current()
+                                            : thobj_from_token(handle);
+
+    (void)obj_type;
+    if (thread) {
+        thobj_ref(thread);
+        if (object_ptr) BRIDGE_MEM32(object_ptr) = thread;
+        g_eax = 0;
+        return;
+    }
+    /* Other objects still have no guest body. */
     if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
     g_eax = 0;  /* STATUS_SUCCESS */
 }
@@ -4269,6 +4589,7 @@ static void bridge_NtResumeThread(void)
  * dereference whatever the caller happened to leave there. */
 static void bridge_ObfDereferenceObject(void)
 {
+    thobj_unref(g_ecx);   /* no-op unless ecx is a thread object */
     xbox_ObfDereferenceObject(XBOX_TO_NATIVE(g_ecx));
     g_eax = 0;
 }
@@ -4287,6 +4608,7 @@ static void bridge_ObfDereferenceObject(void)
  * dereference whatever the caller happened to leave there. */
 static void bridge_ObfReferenceObject(void)
 {
+    thobj_ref(g_ecx);     /* no-op unless ecx is a thread object */
     xbox_ObfReferenceObject(XBOX_TO_NATIVE(g_ecx));
     g_eax = 0;
 }
@@ -4472,9 +4794,15 @@ static void bridge_KeWaitForMultipleObjects(void)
     }
     if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
         count = BRIDGE_MAXIMUM_WAIT_OBJECTS;
-    for (i = 0; i < count; i++)
-        handles[i] = bridge_resolve_handle(
-            objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
+    /* Object pointers, as in KeWaitForSingleObject: a shadowed object (an
+     * event, or a thread) waits on its host twin. */
+    for (i = 0; i < count; i++) {
+        uint32_t obj = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
+
+        handles[i] = ke_shadow_lookup(obj);
+        if (!handles[i])
+            handles[i] = bridge_resolve_handle(obj);
+    }
 
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
         count, (PVOID *)handles, wait_type,
@@ -5120,7 +5448,19 @@ static void bridge_NtDuplicateObject(void)
         g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */
         return;
     }
-    bridge_write_handle(target_va, dup);
+    /* A host may hand back the current-process pseudo-handle itself as the
+     * duplicate (the POSIX shim does). It is not a table handle -- the token
+     * allocator would read it as INVALID_HANDLE_VALUE -- so give the guest
+     * its own NtCurrentProcess() value, which resolves back to it. */
+    if (dup == (HANDLE)(intptr_t)-1) {
+        BRIDGE_MEM32(target_va) = 0xFFFFFFFFu;
+        g_eax = 0;
+        return;
+    }
+    BRIDGE_MEM32(target_va) = bridge_handle_token_ex(dup, 1);
+    thobj_attach_token(BRIDGE_MEM32(target_va), thobj_from_token(STACK_ARG(0)));
+    if (opts & DUPLICATE_CLOSE_SOURCE)
+        thobj_detach_token(STACK_ARG(0));
     g_eax = 0;
 }
 
@@ -7818,10 +8158,8 @@ static void bridge_PsCreateSystemThread(void)
                 if (!stack_top) {
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
-                    HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
-                    if (xbox_handle_ptr && th)
-                        bridge_write_handle(xbox_handle_ptr, th);
+                    bridge_spawn_guest_thread(fn, start_context1, start_context2,
+                                              stack_top, xbox_handle_ptr, 0);
                 }
             }
         } else {
