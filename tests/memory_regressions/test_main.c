@@ -23,7 +23,12 @@
  *   5. MEM_DECOMMIT then MEM_COMMIT on heap memory gives zeroed pages, as on
  *      the console. Both were no-ops, so the old contents came back.
  *   6. MmFreeContiguousMemory gives a contiguous block back and the next
- *      request of that size reuses it; the default keeps the bump allocator.
+ *      request of that size reuses it; the default never reuses one.
+ *   7. (default too) MmAllocateContiguousMemoryEx's physical range is
+ *      honoured. A request limited to the low 16 MB still succeeds once
+ *      unconstrained requests have filled up to it -- XDK D3D's visibility
+ *      test report pages ask for exactly that, and a bump pointer refused
+ *      every one -- and a request for a range above the pointer lands in it.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
@@ -301,7 +306,6 @@ int main(int argc, char **argv)
 
     /* 6. Contiguous memory can be given back. */
     if (!ext) {
-        extern int xbox_ContiguousFree(uint32_t addr);
         uint32_t c1 = xbox_ContiguousAlloc(0x20000, 4096);
         uint32_t c2;
 
@@ -313,6 +317,42 @@ int main(int argc, char **argv)
             check(c1 && c2 == c1, "a freed contiguous block is reused", d2);
         } else {
             check(c1 && c2 != c1, "default: contiguous memory is never reused", d);
+        }
+    }
+
+    /* 7. The physical range of MmAllocateContiguousMemoryEx is honoured. */
+    if (!ext) {
+        const uint32_t MB = 1024u * 1024u;
+        uint32_t c = 0, lo, hi;
+        int k;
+
+        /* Unconstrained 1 MB blocks until one lands at or above 16 MB. */
+        for (k = 0; k < 32; k++) {
+            c = xbox_ContiguousAlloc(MB, 4096);
+            if (!c || c - XBOX_CONTIG_BASE >= 16 * MB)
+                break;
+        }
+        lo = xbox_ContiguousAllocEx(0x1000, 4096, 0, 0x00FFFFFFu);
+        snprintf(d, sizeof d, "last unconstrained 0x%08X, low request 0x%08X", c, lo);
+        check(c && lo && lo + 0x1000 - XBOX_CONTIG_BASE <= 16 * MB,
+              "a request limited to the low 16 MB still fits", d);
+
+        hi = xbox_ContiguousAllocEx(0x10000, 0x10000, 0x02800000u, 0x02FFFFFFu);
+        snprintf(d, sizeof d, "got 0x%08X", hi);
+        check(hi && hi - XBOX_CONTIG_BASE >= 0x02800000u &&
+              hi + 0x10000 - XBOX_CONTIG_BASE <= 0x03000000u &&
+              (hi & 0xFFFFu) == 0,
+              "a request for a range above the fill lands in it, aligned", d);
+
+        /* A caller-placed block that overlaps hi's last page still claims
+         * the free pages after it, so they are not handed out again. */
+        if (hi) {
+            uint32_t after = hi + 0x10000, again;
+            xbox_ContiguousClaim(after - 0x1000, 0x3000);
+            again = xbox_ContiguousAllocEx(0x1000, 4096, after - XBOX_CONTIG_BASE,
+                                           after - XBOX_CONTIG_BASE + 0x1FFF);
+            snprintf(d, sizeof d, "got 0x%08X", again);
+            check(again == 0, "a partly overlapped claim keeps its free pages", d);
         }
     }
 
