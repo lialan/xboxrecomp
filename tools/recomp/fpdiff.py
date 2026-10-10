@@ -19,6 +19,7 @@ otherwise declare, so the header the game really compiles is the one tested.
 import argparse
 import math
 import random
+import re
 import struct
 import subprocess
 from pathlib import Path
@@ -54,7 +55,12 @@ def cases():
     def add(name, asm, kind="fpu", tol=0.0, domain="1"):
         # domain: C condition on the fpu inputs a and b. Vectors outside it
         # are skipped, for instructions whose result Intel leaves undefined.
-        out.append(dict(Case(name, name, asm, [], kind, tol), domain=domain))
+        # Integer-only snippets compare bit for bit: their results can look
+        # like NaNs, and the NaN-payload allowance would hide differences.
+        exact = not any(re.match(r"(f|cvt|u?comis|rcp|rsqrt|sqrt)|.*(ss|sd|ps|pd)$",
+                                 insn.split()[0]) for insn in asm)
+        out.append(dict(Case(name, name, asm, [], kind, tol), domain=domain,
+                        exact=int(exact)))
 
     def status(name, asm, mask=0x4500, tol=0.0, domain="1"):
         # AL holds exception flags the model does not keep, and C1 is only
@@ -359,7 +365,7 @@ def translate(code, name):
 
 _SUPPORT = r"""
 static unsigned char saved[64], native_mem[64];
-static int unsupported;
+static int unsupported, g_exact;
 void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; unsupported++; }
 
 static int same_d(double a, double b, double tol) {
@@ -374,7 +380,7 @@ static int same_f(const unsigned char *x, const unsigned char *y) {
     float a, b;
     if (memcmp(x, y, 4) == 0) return 1;
     memcpy(&a, x, 4); memcpy(&b, y, 4);
-    return a != a && b != b;
+    return !g_exact && a != a && b != b;
 }
 /* Byte offset of the first scratch difference, or -1. NaN payloads match. */
 static int diff_mem(void) {
@@ -383,7 +389,7 @@ static int diff_mem(void) {
         double a, b; int j = i & ~7;
         if (same_f(native_mem + i, g_scratch + i)) continue;
         memcpy(&a, native_mem + j, 8); memcpy(&b, g_scratch + j, 8);
-        if (a != a && b != b) continue;
+        if (!g_exact && a != a && b != b) continue;
         return i;
     }
     return -1;
@@ -454,7 +460,7 @@ def source(prepared, prelude=None):
     body = ["int main(void) {", "    int vec, shown, fails, runs; g_scratch_ptr = g_scratch;"]
     for c, _, unsup in prepared:
         name, kind, fpu = c["name"], c["kind"], int(c["kind"] == "fpu")
-        body.append(f"""    shown = 0; fails = 0; unsupported = 0; runs = 0;
+        body.append(f"""    shown = 0; fails = 0; unsupported = 0; runs = 0; g_exact = {c['exact']};
     for (vec = 0; vec < (int)(sizeof input_{kind} / 64); ++vec) {{
         double a, b;
         memcpy(saved, input_{kind}[vec], 64); memcpy(g_scratch, saved, 64);
@@ -469,7 +475,7 @@ def source(prepared, prelude=None):
     g_fail += fails; if ({unsup} || unsupported) g_unsup++;
     printf("RESULT {name} %d %d%s\\n", fails, runs, ({unsup} || unsupported) ? " UNSUPPORTED" : "");""")
     body.append('    printf("%d vectors, %d mismatches, %d unsupported cases\\n", g_total, g_fail, g_unsup);')
-    body.append("    return g_fail != 0;\n}")
+    body.append("    return g_fail != 0 || g_unsup != 0;\n}")
     out.append("\n".join(body))
     return "\n".join(out)
 
@@ -493,7 +499,8 @@ def run(out, corpus, include=None, prelude=None):
         text = translate(runner._bytes_from_listing(listing, c["name"]), c["name"])
         prepared.append((c, text, int(any(s in text for s in _UNSUPPORTED))))
     (out / "lifted.c").write_text(source(prepared, prelude), newline="\n")
-    include = include or Path(__file__).resolve().parents[2] / "templates" / "runtime"
+    include = (Path(include).resolve() if include
+               else Path(__file__).resolve().parents[2] / "templates" / "runtime")
     built = runner._cl(vcvars, str(out),
                        f'/O2 /fp:strict /arch:SSE2 /I"{include}" lifted.c native.obj /Fecompare.exe')
     (out / "compile.txt").write_text(built.stdout + built.stderr)
@@ -516,7 +523,8 @@ def main():
     prelude = args.prelude.read_text() if args.prelude else None
     result = run(args.out, corpus, args.include, prelude)
     print("\n".join(l for l in result.stdout.splitlines()
-                    if not l.startswith("RESULT") or " 0 " not in l))
+                    if not l.startswith("RESULT") or " 0 " not in l
+                    or l.endswith("UNSUPPORTED")))
     return result.returncode
 
 

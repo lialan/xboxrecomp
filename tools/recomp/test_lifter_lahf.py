@@ -38,8 +38,9 @@ if __name__ == "__main__":
 
 class FpuUnorderedTest(unittest.TestCase):
     """fcomi/fucomi/sahf set ZF, PF and CF on an unordered compare. The
-    conditions read those bits from the _fa snapshot, so a later x87 compare
-    or an AH edit before sahf cannot change them."""
+    conditions read those bits from the _fa snapshot that the setter takes,
+    so a later x87 compare or AH edit cannot change them; sahf takes a new
+    snapshot from AH."""
 
     def test_ja_is_false_and_jb_true_when_unordered(self):
         from .lifter import _make_condition

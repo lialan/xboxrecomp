@@ -41,7 +41,8 @@ class FpdiffTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out:
             result = fpdiff.run(out, corpus)
         failed = [l for l in result.stdout.splitlines()
-                  if l.startswith("RESULT") and l.split()[2] != "0"]
+                  if l.startswith("RESULT")
+                  and (l.split()[2] != "0" or l.endswith("UNSUPPORTED"))]
         self.assertEqual(result.returncode, 0, "\n".join(failed[:40]))
 
 
