@@ -1,10 +1,13 @@
 /*
- * Kernel thread objects, through the path a title takes.
+ * Kernel thread objects and file bridges, through the path a title takes.
  *
- * A thread handle must lead to a guest thread object whose SignalState and
- * ExitStatus follow the host thread, through ObReferenceObjectByHandle and
- * through a duplicate of the handle, so a title that waits on the object or
- * polls its exit code sees the thread end.
+ *   Thread objects            a thread handle leads to a guest thread object
+ *                             whose SignalState and ExitStatus follow the host
+ *                             thread, also through a duplicate of the handle.
+ *   NtSetInformationFile (226) FileRenameInformation: a title that writes
+ *                             x.tmp and renames it to x.dat must find x.dat.
+ *   FATX overwrite            an overwrite followed by a smaller end-of-file
+ *                             keeps the bytes below the new end.
  *
  * Each bridge is driven by ordinal through recomp_lookup_kernel, as in
  * tests/kernel_bridge, but against a real guest window from
@@ -134,6 +137,142 @@ static unsigned char *load(const char *path, size_t *n)
     return b;
 }
 
+/* ---- FileRenameInformation -------------------------------------------- */
+static uint32_t put_str(uint32_t at, const char *s)
+{
+    /* ANSI_STRING at `at`, text right after it. */
+    uint16_t n = (uint16_t)strlen(s);
+    memcpy(GP(at + 8), s, n + 1);
+    G16(at) = n;
+    G16(at + 2) = (uint16_t)(n + 1);
+    G32(at + 4) = at + 8;
+    return at;
+}
+
+static uint32_t create(const char *path)
+{
+    uint32_t oa = g_scratch + 0x100, str = g_scratch + 0x200;
+    uint32_t ph = g_scratch + 0x10, ios = g_scratch + 0x18, st;
+
+    put_str(str, path);
+    G32(oa) = 0; G32(oa + 4) = str; G32(oa + 8) = 0x40;
+    st = CALL(ORD_NTCREATE, ph, 0xC0110000u /* R|W|DELETE|SYNC */, oa, ios, 0,
+              0x80, 0, 5 /* OVERWRITE_IF */, 0x60);
+    return st ? 0 : G32(ph);
+}
+
+static uint32_t rename_to(uint32_t h, const char *name, int replace)
+{
+    uint32_t info = g_scratch + 0x400, ios = g_scratch + 0x18;
+    uint16_t n = (uint16_t)strlen(name);
+
+    memset(GP(info), 0, 16);
+    G8(info) = (uint8_t)replace;
+    G32(info + 4) = 0;
+    G16(info + 8) = n;
+    G16(info + 10) = (uint16_t)(n + 1);
+    G32(info + 12) = info + 16;
+    memcpy(GP(info + 16), name, n + 1);
+    return CALL(ORD_NTSETINFO, h, ios, info, 16, 10);
+}
+
+static int exists(const char *dir, const char *name)
+{
+    char p[512];
+    struct stat st;
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return stat(p, &st) == 0;
+}
+
+static void test_rename(const char *cache)
+{
+    char d[160];
+    uint32_t h, h2, st;
+
+    printf("NtSetInformationFile(FileRenameInformation)\n");
+    h = create("z:\\a.tmp");
+    check(h != 0 && exists(cache, "a.tmp"), "create z:\\a.tmp", NULL);
+    st = rename_to(h, "z:\\a.dat", 0);
+    snprintf(d, sizeof d, "status 0x%08X", st);
+    check(st == 0, "rename to a full path succeeds", d);
+    check(exists(cache, "a.dat") && !exists(cache, "a.tmp"),
+          "a.tmp became a.dat on the host", NULL);
+    CALL(ORD_NTCLOSE, h);
+
+    h2 = create("z:\\b.tmp");
+    st = rename_to(h2, "z:\\a.dat", 0);
+    snprintf(d, sizeof d, "status 0x%08X", st);
+    check(st == 0xC0000035u, "existing target without ReplaceIfExists collides", d);
+    st = rename_to(h2, "z:\\a.dat", 1);
+    check(st == 0 && !exists(cache, "b.tmp"), "ReplaceIfExists replaces", NULL);
+    st = rename_to(h2, "c.dat", 0);
+    check(st == 0 && exists(cache, "c.dat") && !exists(cache, "a.dat"),
+          "bare name renames within the same directory", NULL);
+    CALL(ORD_NTCLOSE, h2);
+}
+
+/* ---- FATX overwrite: regrowing after an overwrite keeps the data ------ */
+static uint32_t set_eof(uint32_t h, uint32_t size)
+{
+    uint32_t info = g_scratch + 0x400, ios = g_scratch + 0x18;
+    G32(info) = size; G32(info + 4) = 0;
+    return CALL(ORD_NTSETINFO, h, ios, info, 8, 20 /* EndOfFile */);
+}
+
+static long host_file(const char *dir, const char *name, unsigned char *buf,
+                      size_t cap)
+{
+    char p[512];
+    FILE *f;
+    long n;
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    f = fopen(p, "rb");
+    if (!f) return -1;
+    n = (long)fread(buf, 1, cap, f);
+    fclose(f);
+    return n;
+}
+
+static void test_overwrite(const char *cache)
+{
+    unsigned char got[2048];
+    uint32_t h, i, buf = g_scratch + 0x800, ios = g_scratch + 0x18;
+    long n;
+    int same = 1;
+
+    printf("FATX overwrite (the texture-cache copy)\n");
+    for (i = 0; i < 1024; i++) G8(buf + i) = (uint8_t)(i * 7 + 1);
+    h = create("z:\\o.tmp");
+    set_eof(h, 1024);
+    CALL(ORD_NTWRITE, h, 0, 0, 0, ios, buf, 1024, 0);
+    CALL(ORD_NTCLOSE, h);
+
+    /* second CREATE_ALWAYS, then trim to the true size; XAPI SetEndOfFile
+     * queries the position first */
+    h = create("z:\\o.tmp");
+    CALL(ORD_NTQUERYINFO, h, ios, g_scratch + 0x400, 8, 14 /* Position */);
+    set_eof(h, 700);
+    CALL(ORD_NTCLOSE, h);
+    n = host_file(cache, "o.tmp", got, sizeof got);
+    for (i = 0; n == 700 && i < 700; i++)
+        if (got[i] != (unsigned char)(i * 7 + 1)) same = 0;
+    check(n == 700, "overwrite + end-of-file trims to 700 bytes", NULL);
+    check(n == 700 && same, "the bytes below the new end survive", NULL);
+
+    /* an overwrite followed by a write is a plain truncate */
+    h = create("z:\\o.tmp");
+    CALL(ORD_NTWRITE, h, 0, 0, 0, ios, buf, 4, 0);
+    CALL(ORD_NTCLOSE, h);
+    check(host_file(cache, "o.tmp", got, sizeof got) == 4,
+          "overwrite + 4-byte write leaves 4 bytes", NULL);
+
+    /* an overwrite that is just closed leaves an empty file */
+    h = create("z:\\o.tmp");
+    CALL(ORD_NTCLOSE, h);
+    check(host_file(cache, "o.tmp", got, sizeof got) == 0,
+          "overwrite + close leaves 0 bytes", NULL);
+}
+
 /* ---- thread handles lead to guest thread objects -------------------- */
 static uint32_t spawn(uint32_t routine, uint32_t handle_va)
 {
@@ -253,6 +392,8 @@ int main(int argc, char **argv)
     xbox_kernel_set_thunk_address(g_thunks, NORDS + 1);
     xbox_kernel_bridge_init();
 
+    test_rename(cache);
+    test_overwrite(cache);
     test_threads();
 
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmpl);

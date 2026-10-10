@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdlib.h>
 
 /* A project may set this to watch every guest path the kernel translates (for
  * example to print who opened a file). NULL by default. */
@@ -40,13 +41,26 @@ static int match_prefix(const char* path, const char* prefix)
 /* A device-path translation rule, shared by both backends. */
 typedef struct {
     const char* prefix;     /* Xbox path prefix (backslash form)         */
-    int         to_save;    /* 1 = under save_dir, 0 = under game_dir    */
+    int         to_save;    /* 1 = under save_dir, 0 = under game_dir,
+                               2 = under the user-data root (save_dir, or
+                               RECOMP_SAVE_DIR when set)                  */
     const char* sub_win;    /* sub-directory, Win32 backslash form       */
     const char* sub_posix;  /* sub-directory, POSIX slash form           */
 } path_rule;
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
+    /* Saves. Titles map U: and T: themselves (XapiMapLetterToDirectory) to
+     * E:\UDATA\<title id> and E:\TDATA\<title id>, which are under
+     * Partition1. Without these two rules the Partition1 rule below put every
+     * save in the game dir, shared by all runs and all save dirs: a fresh
+     * XDG_DATA_HOME still saw the last run's save game. Listed first so they
+     * win over Partition1; no trailing separator, the title opens the bare
+     * directories too. RECOMP_SAVE_DIR moves just these two (to_save 2), so a
+     * scripted run can start from an empty save without touching the rest of
+     * the save dir (partition images, caches). */
+    { "\\Device\\Harddisk0\\Partition1\\UDATA", 2, "\\UDATA",  "/UDATA"      },
+    { "\\Device\\Harddisk0\\Partition1\\TDATA", 2, "\\TDATA",  "/TDATA"      },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
@@ -84,6 +98,25 @@ static const path_rule s_rules[] = {
     { "\\??\\T:\\",                           1, "\\TitleData","/TitleData"  },
 };
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
+
+/* Match a rule. The UDATA and TDATA rules carry no trailing separator, since
+ * a title opens the bare directories too, so they stop at one: otherwise
+ * Partition1\UDATAx would be taken for Partition1\UDATA\x. */
+static int rule_match(const char* path, const path_rule* r)
+{
+    int skip = match_prefix(path, r->prefix);
+    if (skip && r->to_save == 2 && path[skip] && path[skip] != '\\')
+        return 0;
+    return skip;
+}
+
+/* Saves left in the game dir. Builds before the UDATA/TDATA rules sent all
+ * of Partition1 there, so a player's saves may be in <game_dir>/UDATA. With
+ * RECOMP_SAVE_DIR unset, no UDATA in the save dir and one in the game dir,
+ * xbox_path_init keeps using that one (and says so); the same for TDATA.
+ * Indexed 0 for UDATA, 1 for TDATA. */
+static int s_user_in_game[2];
+#define USER_RULE_SLOT(r) ((r)->sub_posix[1] == 'T')
 
 /*
  * Rewrite a path through a drive letter the title mapped for itself.
@@ -176,6 +209,7 @@ const wchar_t *xbox_LastHostPath(void)
 
 static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
+static WCHAR s_user_dir[MAX_PATH];   /* UDATA/TDATA root: s_save_dir or RECOMP_SAVE_DIR */
 static BOOL  s_initialized = FALSE;
 
 /*
@@ -374,8 +408,54 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
     }
 
+    /* RECOMP_SAVE_DIR: the root for the title's UDATA and TDATA, created if
+     * missing. Absolute; under Wine a DOS path (Z:\home\...) is safest. */
+    {
+        const char *ov = getenv("RECOMP_SAVE_DIR");
+        /* Room for the longest suffix the rules append (UDATA\<title id>\
+         * <save>\<file>); a longer root would only truncate later. */
+        int n = (ov && ov[0])
+              ? MultiByteToWideChar(CP_UTF8, 0, ov, -1, s_user_dir, MAX_PATH) : 0;
+        if (ov && ov[0] && (n == 0 || n > MAX_PATH - 96)) {
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+                     "RECOMP_SAVE_DIR %s: %s; using the default save dir",
+                     ov, n == 0 ? "conversion failed (longer than MAX_PATH?)" : "too long for the paths under it");
+            ov = NULL;
+        }
+        if (ov && ov[0]) {
+            for (WCHAR *p = s_user_dir; *p; p++)
+                if (*p == L'/') *p = L'\\';
+            len = wcslen(s_user_dir);
+            if (len > 3 && s_user_dir[len - 1] == L'\\')
+                s_user_dir[len - 1] = L'\0';
+            SHCreateDirectoryExW(NULL, s_user_dir, NULL);
+        } else {
+            wcscpy_s(s_user_dir, MAX_PATH, s_save_dir);
+        }
+
+        /* Saves still in the game dir stay there (s_user_in_game). */
+        for (int k = 0; k < 2; k++) {
+            static const WCHAR *names[2] = { L"UDATA", L"TDATA" };
+            WCHAR in_save[MAX_PATH], in_game[MAX_PATH];
+            DWORD fa, fg;
+            swprintf_s(in_save, MAX_PATH, L"%s\\%s", s_save_dir, names[k]);
+            swprintf_s(in_game, MAX_PATH, L"%s\\%s", s_game_dir, names[k]);
+            fa = GetFileAttributesW(in_save);
+            fg = GetFileAttributesW(in_game);
+            s_user_in_game[k] = !(ov && ov[0]) && fa == INVALID_FILE_ATTRIBUTES
+                             && fg != INVALID_FILE_ATTRIBUTES
+                             && (fg & FILE_ATTRIBUTE_DIRECTORY);
+            if (s_user_in_game[k])
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+                         "%S: saves found here and not in the save dir; kept "
+                         "here (move it to %S to use the save dir)",
+                         in_game, in_save);
+        }
+    }
+
     s_initialized = TRUE;
-    xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S, udata/tdata=%S",
+             s_game_dir, s_save_dir, s_user_dir);
 }
 
 /* The host path the last translation produced.
@@ -420,10 +500,13 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = match_prefix(xbox_path, s_rules[i].prefix);
+        skip = rule_match(xbox_path, &s_rules[i]);
         if (skip) {
             remainder = xbox_path + skip;
-            base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
+            base_dir  = s_rules[i].to_save == 2
+                          ? (s_user_in_game[USER_RULE_SLOT(&s_rules[i])]
+                               ? s_game_dir : s_user_dir)
+                      : s_rules[i].to_save     ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_win;
             goto translate;
         }
@@ -453,7 +536,7 @@ translate:
 
             WCHAR dir_path[MAX_PATH];
             swprintf_s(dir_path, MAX_PATH, L"%s%s", base_dir, sub_wide);
-            CreateDirectoryW(s_save_dir, NULL);
+            CreateDirectoryW(base_dir, NULL);
             CreateDirectoryW(dir_path, NULL);
         } else {
             swprintf_s(host_path_buf, buf_size, L"%s\\%s", base_dir, remainder_wide);
@@ -488,6 +571,7 @@ translate:
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
+static char s_user_dir[MAX_PATH];   /* UDATA/TDATA root: s_save_dir or RECOMP_SAVE_DIR */
 static BOOL s_initialized = FALSE;
 
 /* Strip a single trailing '/' (but never the root '/'). */
@@ -548,9 +632,38 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     strip_trailing_slash(s_game_dir);
     strip_trailing_slash(s_save_dir);
 
+    /* RECOMP_SAVE_DIR: the root for the title's UDATA and TDATA, created if
+     * missing, so a scripted run can start from an empty save. */
+    {
+        const char* ov = getenv("RECOMP_SAVE_DIR");
+        if (ov && ov[0]) {
+            snprintf(s_user_dir, sizeof(s_user_dir), "%s", ov);
+            strip_trailing_slash(s_user_dir);
+            mkdir_p(s_user_dir);
+        } else {
+            snprintf(s_user_dir, sizeof(s_user_dir), "%s", s_save_dir);
+        }
+
+        /* Saves still in the game dir stay there (s_user_in_game). */
+        for (int k = 0; k < 2; k++) {
+            static const char *names[2] = { "UDATA", "TDATA" };
+            char in_save[MAX_PATH], in_game[MAX_PATH];
+            struct stat sa, sg;
+            snprintf(in_save, sizeof(in_save), "%s/%s", s_save_dir, names[k]);
+            snprintf(in_game, sizeof(in_game), "%s/%s", s_game_dir, names[k]);
+            s_user_in_game[k] = !(ov && ov[0]) && stat(in_save, &sa) != 0
+                             && stat(in_game, &sg) == 0 && S_ISDIR(sg.st_mode);
+            if (s_user_in_game[k])
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+                         "%s: saves found here and not in the save dir; kept "
+                         "here (move it to %s to use the save dir)",
+                         in_game, in_save);
+        }
+    }
+
     s_initialized = TRUE;
-    xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
-             s_game_dir, s_save_dir);
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s, udata/tdata=%s",
+             s_game_dir, s_save_dir, s_user_dir);
 }
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
@@ -573,10 +686,13 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = match_prefix(xbox_path, s_rules[i].prefix);
+        skip = rule_match(xbox_path, &s_rules[i]);
         if (skip) {
             remainder = xbox_path + skip;
-            base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
+            base_dir  = s_rules[i].to_save == 2
+                          ? (s_user_in_game[USER_RULE_SLOT(&s_rules[i])]
+                               ? s_game_dir : s_user_dir)
+                      : s_rules[i].to_save     ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_posix;
             goto translate;
         }
