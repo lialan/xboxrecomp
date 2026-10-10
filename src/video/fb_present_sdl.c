@@ -45,6 +45,7 @@
 #include <time.h>
 
 #include "video_player.h"
+#include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
@@ -95,13 +96,6 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 
 /* The window is opened by xbox_HostWindowMain, on the main thread. */
 void xbox_FramebufferWindowStart(void) {}
-
-/* No keyboard path on POSIX hosts yet. */
-int xbox_FramebufferKeyDown(int vk)
-{
-    (void)vk;
-    return 0;
-}
 
 /* The back slot is filled: make it the ready one. An unshown ready frame is
  * overwritten (dropped), never waited for. */
@@ -337,6 +331,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     /* This thread pumps SDL events from here on, which also updates the
      * game controllers; the input layer then only reads them. */
     xbox_InputSetMainPump(1);
+    xbox_InputSdlInit();
     s_running = 1;
     if (!start_guest()) {
         fprintf(stderr, "  [FBWIN] cannot start the guest thread; running headless\n");
@@ -359,6 +354,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
          * the loop. */
         if (SDL_WaitEventTimeout(&ev, shown_seq ? 100 : 16)) {
             do {
+                /* Keys for the pad stand-in, and the window events that
+                 * release them; it only reads the event. */
+                xbox_InputSdlEvent(&ev);
                 if (ev.type == SDL_QUIT)
                     quit = 1;
                 else if (ev.type == s_guest_done_event)
