@@ -173,6 +173,8 @@ class FunctionDetector:
             before = len(self._candidates)
             if not self._pass_tail_jump_targets(sections):
                 return
+            # A realigned tail can hold direct calls the first pass never saw.
+            self._pass_call_targets(sections)
             print(f"  tail-jump pass: "
                   f"+{len(self._candidates) - before} standalone, "
                   f"{len(self._alias_entries)} aliases")
@@ -881,7 +883,10 @@ class FunctionDetector:
             self._alias_entries[target] = end
             reachable = self.engine.recursive_descent([target], [(target, end)])
             tails.update(reachable)
-            claimed.update(reachable)
+            # Every byte, as for immediate callbacks: a later immediate into
+            # an operand byte must not split this body.
+            for address in reachable:
+                claimed.update(range(address, self.engine.get_instruction(address).end_address))
             found += 1
 
         if found:

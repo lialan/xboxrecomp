@@ -136,7 +136,19 @@ def test_table_thunk_chain_requires_a_proven_destination(valid):
 
 
 def test_entry_frame_rejects_an_epilogue_without_its_saves():
-    for body, accepted in ((b'\x5b\xc3', False), (b'\x53\x5b\xc3', True)):
+    for body, accepted in ((b'\x5b\xc3', False), (b'\x53\x5b\xc3', True),
+                           (b'\x83\xc4\x08\xc3', False),  # add esp,8; ret
+                           (b'\xc9\xc3', False),            # leave; ret
+                           (b'\x83\xec\x08\x83\xc4\x08\xc3', True),
+                           (b'\x55\x89\xe5\xc9\xc3', True)):
+        engine, _ = _engine(body)
+        assert engine.probes_as_callback_body(
+            BASE, BASE + len(body), require_entry_frame=True) == accepted
+
+
+def test_entry_frame_rejects_flags_a_partial_writer_leaves():
+    # inc defines ZF but leaves CF, so jc still reads the owner's carry.
+    for body, accepted in ((b'\x40\x74\x00\xc3', True), (b'\x40\x72\x00\xc3', False)):
         engine, _ = _engine(body)
         assert engine.probes_as_callback_body(
             BASE, BASE + len(body), require_entry_frame=True) == accepted

@@ -14,10 +14,9 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CsInsn
 from capstone import (CS_OP_IMM, CS_OP_MEM, CS_OP_REG,
                       CS_GRP_INT, CS_GRP_IRET, CS_GRP_PRIVILEGE)
 from capstone.x86_const import (
-    X86_REG_EFLAGS, X86_EFLAGS_TEST_AF, X86_EFLAGS_TEST_CF,
-    X86_EFLAGS_TEST_OF, X86_EFLAGS_TEST_PF, X86_EFLAGS_TEST_SF,
-    X86_EFLAGS_TEST_ZF,
+    X86_REG_EFLAGS,
 )
+from capstone import x86_const
 
 from . import config
 from .loader import BinaryImage, SectionInfo
@@ -442,7 +441,10 @@ class DisasmEngine:
         section = self.image.get_section_at_va(addr)
         if section is None or not section.executable:
             return None
-        data = self.image.read_bytes_at_va(addr, max_insns * 8)
+        # Stay inside the section's file bytes: a long bound past the end of
+        # the image would otherwise read nothing at all.
+        data = self.image.get_section_data(section)
+        data = data[addr - section.virtual_addr:][:max_insns * 8]
         if not data:
             return None
 
@@ -559,16 +561,20 @@ class DisasmEngine:
         if require_entry_frame:
             # A weak table word may name a suffix after its owner's cmp.
             # Reject an entry prefix that reads arithmetic flags before
-            # producing them. String operations may read the ABI's DF.
-            flag_tests = (X86_EFLAGS_TEST_AF | X86_EFLAGS_TEST_CF
-                          | X86_EFLAGS_TEST_OF | X86_EFLAGS_TEST_PF
-                          | X86_EFLAGS_TEST_SF | X86_EFLAGS_TEST_ZF)
+            # producing them. String operations may read the ABI's DF. A
+            # writer defines only its own flags: inc and dec leave CF.
+            pending = {"AF", "CF", "OF", "PF", "SF", "ZF"}
+            flag = lambda kind, name: getattr(x86_const, f"X86_EFLAGS_{kind}_{name}")
             for insn in self._cs.disasm(raw[addr - lower:], addr):
                 if (X86_REG_EFLAGS in insn.regs_read
-                        and (insn.eflags & flag_tests or not insn.eflags)):
+                        and (not insn.eflags or any(
+                            insn.eflags & flag("TEST", f) for f in pending))):
                     return False
-                if (X86_REG_EFLAGS in insn.regs_write
-                        or insn.mnemonic in ("call", "jmp", "ret", "retn")):
+                if X86_REG_EFLAGS in insn.regs_write:
+                    pending = {f for f in pending if insn.eflags and not any(
+                        insn.eflags & flag(kind, f)
+                        for kind in ("MODIFY", "SET", "RESET", "UNDEFINED"))}
+                if not pending or insn.mnemonic in ("call", "jmp", "ret", "retn"):
                     break
         decoder = Disassembler()
         entries = {addr}
@@ -649,6 +655,16 @@ class DisasmEngine:
             # A callable shared body must supply its own saved registers. An
             # epilogue suffix that consumes its owner's saves is not an entry.
             if restored - saved:
+                return False
+            # Nor may it free a frame or stack it never built.
+            # shortcut: checks which instructions appear, not stack depth;
+            # walk the depth per path if a suffix ever frees more than it built.
+            esp = lambda insn, m: insn.mnemonic == m and insn.op_str.startswith("esp,")
+            if any(insn.mnemonic == "leave" for insn in decoded) and "ebp" not in saved:
+                return False
+            if (any(esp(insn, "add") for insn in decoded)
+                    and not any(insn.mnemonic in ("push", "enter") or esp(insn, "sub")
+                                for insn in decoded)):
                 return False
             if not (backward or restored or any(insn.is_ret for insn in decoded)
                     or any(insn.mnemonic == "int3" and insn.address in call_ends

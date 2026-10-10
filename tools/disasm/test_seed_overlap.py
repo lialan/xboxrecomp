@@ -13,7 +13,7 @@ def test_seed_realigns_only_outside_detected_bodies(monkeypatch):
     monkeypatch.setattr("tools.disasm.disasm.load_image", lambda *args: image)
     good, bad = base + 8, base + 2
     disasm = Disassembler("synthetic", force=True, stats_only=True,
-                          seed_functions=[good, bad], observed_seeds={bad})
+                          seed_functions=[good, bad])
     assert disasm.run()
     assert good in disasm.func_detector.functions
     assert disasm.engine.instructions[good].mnemonic == "xor"

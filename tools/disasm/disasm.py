@@ -49,6 +49,8 @@ class Disassembler:
         self.force = force
         self.extra_sections = extra_sections or []
         self.seed_functions = seed_functions or []
+        # Seeds a run actually reached (see _load_seed_functions). They are
+        # not guesses, so the mid-instruction guard below does not apply.
         self.observed_seeds = observed_seeds or set()
 
         # Components (initialized during run)
@@ -60,8 +62,15 @@ class Disassembler:
         self.strings: List[dict] = []
 
     def _trust_mid_instruction_seed(self, addr: int) -> bool:
-        """Only unclaimed sweep bytes may be replaced by a seed's decode."""
-        return self.func_detector.get_function_at(addr) is None
+        """A seed inside an instruction the sweep decoded: keep it anyway?
+
+        Yes when a run reached it (observed_seeds; Halo's XPP init at
+        0x001CF6AC), or when it decodes as a prologue, which means the sweep
+        is the one out of phase (default.xbe's push ebp at 0x00069538). An
+        RTTI guess six bytes into a mov (HL2's 0x00202C2E) is neither.
+        """
+        return (addr in self.observed_seeds
+                or self.engine.probes_as_prologue(addr))
 
     def run(self) -> bool:
         """
@@ -175,10 +184,13 @@ class Disassembler:
             for addr in self.seed_functions:
                 covering = self.engine.instruction_covering(addr)
                 if covering is not None:
-                    if not self._trust_mid_instruction_seed(addr):
+                    # Unclaimed sweep bytes may be replaced by the seed's
+                    # decode; a detected body only yields to trusted seeds.
+                    unclaimed = self.func_detector.get_function_at(addr) is None
+                    if not (unclaimed or self._trust_mid_instruction_seed(addr)):
                         mid_instruction += 1
                         continue
-                    if not self.engine.decode_at(addr, replace_overlaps=True):
+                    if not self.engine.decode_at(addr, replace_overlaps=unclaimed):
                         continue
                     realigned += 1
                 elif addr not in self.engine.instructions:
@@ -203,6 +215,8 @@ class Disassembler:
                 print(f"  Seeded {len(self.seed_functions)} function addresses")
 
         num_funcs = self.func_detector.detect_all(sections)
+        # Detection can realign the stream (tail targets); export its xrefs.
+        self.xrefs = build_xrefs(self.engine, self.image)
         if self.verbose:
             summary = self.func_detector.summary()
             print(f"  Total functions: {num_funcs:,d}")
