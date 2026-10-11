@@ -621,9 +621,29 @@ static void *mcpx_apu_frame_thread(void *arg)
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
+        /* A bit test, so HALTED (0x80, a subset of TRAPPED's 0xE0) counts
+         * too: xemu's frame thread idles in both modes. */
+        bool fe_trapped = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+                          (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
+                          !g_test_tone.active;
+
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
+        } else if (fe_trapped) {
+            /* The title has the APU on, but the front end is trapped (a voice
+             * went idle under FETFORCE1) and stays so until DirectSound's
+             * service routine clears FECTL, or the title halted it. No frame
+             * is produced meanwhile, as in xemu, which waits and re-checks:
+             * the device queue holds what is already paced into it. The
+             * software mixer pauses with it; the test tone keeps the branch
+             * below. This used to fall through to
+             * the lightweight branch, which advances the frame counter and
+             * hands the device a period with this frame's 32 samples silent:
+             * one hole per trapped frame, four or five in a row when the
+             * routine cleared the trap from a DPC (32-160 samples of digital
+             * zero in streamed music every few seconds). The interrupt is
+             * delivered below; the wait is after it. */
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
@@ -653,6 +673,14 @@ static void *mcpx_apu_frame_thread(void *arg)
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
         qemu_mutex_lock(&d->lock);
+        if (fe_trapped &&
+            (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
+             NV_PAPU_FECTL_FEMETHMODE_TRAPPED)) {
+            /* Still trapped after the delivery (held off at raised IRQL, or
+             * cleared from a DPC): give the title a millisecond with the lock
+             * dropped rather than spinning on it. */
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+        }
     }
 
     qemu_mutex_unlock(&d->lock);
