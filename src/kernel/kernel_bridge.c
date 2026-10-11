@@ -2957,8 +2957,10 @@ static void kernel_vblank_arm(int raised)
  * below instead: the absolute schedule on the performance counter, the
  * vblank-ack thread, PCRTC_INTR_EN_0 and PMC_INTR_EN_0 honoured, and
  * timeBeginPeriod(1) on Windows. The gate needs it (its DPCs come late,
- * and the tick's acks were lost behind them); a title that sets neither
- * gets the tick as before. */
+ * and the tick's acks were lost behind them), and so does the flip hold
+ * (RECOMP_FLIP_PACING), which holds flips to this count and would pace at
+ * the tick's 50 Hz; a title that sets none of them gets the tick as
+ * before. */
 int xbox_VblankMode(const char *env, int paced_wanted)
 {
     if (!env)
@@ -2968,13 +2970,16 @@ int xbox_VblankMode(const char *env, int paced_wanted)
     return XBOX_VBLANK_TICK;
 }
 
+extern int nv2a_pb_exec_flip_pacing(void);
+
 static int kernel_vblank_mode(void)
 {
     static volatile LONG mode = -1;
 
     if (mode < 0)
         InterlockedExchange(&mode, xbox_VblankMode(getenv("RECOMP_VBLANK"),
-                                                   xbox_DispatchGateOn()));
+                                                   xbox_DispatchGateOn()
+                                                   || nv2a_pb_exec_flip_pacing()));
     return (int)mode;
 }
 

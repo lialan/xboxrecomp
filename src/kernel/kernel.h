@@ -1258,14 +1258,15 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
 #define XBOX_LOG_THUNK   "THUNK"
 #define XBOX_LOG_PATH    "PATH"
 
-/* Vblanks the runtime has raised since start (0 while RECOMP_VBLANK is off).
- * Interlaced output shows one field per vblank, so its low bit is the field
- * parity that the field pin (port 0x80C0) reports. */
+/* Vblanks the runtime has raised since start (0 while RECOMP_VBLANK is off):
+ * the clock a held flip waits on (nv2a_flip_hold.h). Interlaced output shows
+ * one field per vblank, so its low bit is the field parity that the field pin
+ * (port 0x80C0) reports. */
 uint32_t xbox_VblankCount(void);
 
 /* RECOMP_VBLANK's mode (kernel_bridge.c): off when unset; the tick v0.14.0
  * had when set; the 60 Hz schedule with the vblank-ack thread when it is
- * "paced" or paced_wanted (a switch that needs the schedule is on). Pure,
+ * "paced" or paced_wanted (the gate or the flip hold is on). Pure,
  * for tests/vblank_ack. */
 enum { XBOX_VBLANK_OFF, XBOX_VBLANK_TICK, XBOX_VBLANK_PACED };
 int xbox_VblankMode(const char *env, int paced_wanted);
