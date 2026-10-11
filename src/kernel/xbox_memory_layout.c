@@ -4131,10 +4131,98 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
     return g_contig_high;
 }
 
+/* The in-use map, one byte per 4 KB page of the window: for a device model
+ * (the APU) deciding whether a physical address names the window or RAM. */
+const volatile uint8_t *xbox_ContiguousPageMap(void)
+{
+    return g_contig_used;
+}
+
 /* Bytes in use right now. */
 uint32_t xbox_ContiguousInUseBytes(void)
 {
     return g_contig_pages_in_use * CONTIG_PAGE;
+}
+
+/* Physical pages below 64 MB that MmGetPhysicalAddress has handed out for a
+ * heap address, whose physical number is its virtual address.
+ *
+ * On the console a physical page is one page of RAM. Here the window and the
+ * RAM below 64 MB are separate storage, and the arena above hands out
+ * physical numbers that the heap and the image also use. So one number can
+ * name two different pages, and a device given only the number cannot tell
+ * which the title meant. A title that loads its sound effects and music
+ * stream into the heap has DirectSound put each page's MmGetPhysicalAddress
+ * into the voice's scatter-gather list; when those numbers fall inside a
+ * block the arena has handed out, the APU read the window copy and played
+ * whatever the window held there as PCM.
+ *
+ * MmGetPhysicalAddress is the one moment the runtime sees which copy the title
+ * means, so it records RAM names here. Heap pages only: the image, its BSS and
+ * the stacks are never freed, so a record there would never clear, and a
+ * title's DirectSound voice array can sit at a window address whose number
+ * falls inside a large image (see mcpx_apu_phys). The record is kept until the
+ * heap frees the page. A window name does not clear it, because D3D names its
+ * window pages all the time and the effect buffer in RAM is still live. If one
+ * page holds live sound data in both copies, the APU picks RAM; this record
+ * cannot tell them apart.
+ *
+ * Plain byte stores and loads. The APU thread may see a mark a voice-processor
+ * pass late (or a cleared one a pass early); the title fills a buffer after
+ * naming it and frees it after stopping the voice, so a stale read costs at
+ * most one pass of one voice. */
+static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
+
+void xbox_PhysNoteRamName(uint32_t va)
+{
+    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
+        g_phys_ram_named[va / CONTIG_PAGE] = 1;
+}
+
+/* Heap block m is free (and merged with any free neighbours): its pages name
+ * nothing now, except an edge page it shares with a live block. Index order is
+ * address order, so the blocks that can share an edge page are the nearest
+ * ones on either side; empty slots (size 0) and free blocks are stepped over.
+ * Caller holds g_heap_lock. */
+static void heap_forget_ram_names(int m)
+{
+    uint32_t lo = g_heap_blocks[m].addr;
+    int64_t first, last;
+
+    if (!g_heap_blocks[m].size)
+        return;
+    first = lo / CONTIG_PAGE;
+    last = ((uint64_t)lo + g_heap_blocks[m].size - 1) / CONTIG_PAGE;
+    for (int j = m - 1; j >= 0; j--) {
+        if (!g_heap_blocks[j].size)
+            continue;
+        if ((uint64_t)g_heap_blocks[j].addr + g_heap_blocks[j].size <=
+                (uint64_t)first * CONTIG_PAGE)
+            break;
+        if (!g_heap_blocks[j].free) {
+            first++;
+            break;
+        }
+    }
+    for (int j = m + 1; j < g_heap_block_count; j++) {
+        if (!g_heap_blocks[j].size)
+            continue;
+        if ((uint64_t)g_heap_blocks[j].addr >= (uint64_t)(last + 1) * CONTIG_PAGE)
+            break;
+        if (!g_heap_blocks[j].free) {
+            last--;
+            break;
+        }
+    }
+    if (last >= (int64_t)CONTIG_PAGES)
+        last = (int64_t)CONTIG_PAGES - 1;
+    for (int64_t p = first; p <= last; p++)
+        g_phys_ram_named[p] = 0;
+}
+
+const volatile uint8_t *xbox_PhysRamNameMap(void)
+{
+    return g_phys_ram_named;
 }
 
 
@@ -4321,7 +4409,7 @@ void xbox_HeapFree(uint32_t xbox_va)
          * over the empty slots (size 0) earlier merges leave behind; without
          * that, one merge stops every later one dead. */
         {
-            int n = i + 1, p = i - 1;
+            int n = i + 1, p = i - 1, m = i;
             if (xbox_HeapReclaimEnabled()) {
                 while (n < g_heap_block_count && g_heap_blocks[n].size == 0) n++;
                 while (p >= 0 && g_heap_blocks[p].size == 0) p--;
@@ -4337,7 +4425,12 @@ void xbox_HeapFree(uint32_t xbox_va)
                 g_heap_blocks[p].size += g_heap_blocks[i].size;
                 g_heap_blocks[i].size = 0;
                 g_heap_blocks[i].addr = 0;
+                m = p;
             }
+            /* After the merge, so a page this block shared with a neighbour
+             * that is free too is forgotten. Under the lock, so a block
+             * reused at once is named afresh after this, not wiped by it. */
+            heap_forget_ram_names(m);
         }
         ReleaseSRWLockExclusive(&g_heap_lock);
         return;
