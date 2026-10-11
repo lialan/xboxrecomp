@@ -829,8 +829,11 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
         if (is_write) {
             mcpx_apu_write(d, addr, val, size);
         }
+    } else if (addr == 0x30000 + NV_PAPU_GPRST) {
+        if (is_write)
+            mcpx_apu_dsp_gprst_write((uint32_t)val);
     }
-    /* GP (0x30000) and EP (0x50000) regions ignored for now */
+    /* The rest of the GP (0x30000) and EP (0x50000) regions is ignored */
 }
 
 /* ============================================================
