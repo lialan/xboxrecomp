@@ -148,8 +148,9 @@ static uint32_t *dsp_ack_auto_slot(MCPXAPUState *d)
     if (page != s_dsp_ack_auto_page) {
         s_dsp_ack_auto_page = page;
         fprintf(stderr, "[APU] DSP doorbell: GP scratch SGE table 0x%08X maps"
-                        " page 0x%08X; doorbell at physical 0x%08X\n",
-                sge, page, page + GP_DOORBELL_OFFSET);
+                        " page 0x%08X (%s); doorbell at physical 0x%08X\n",
+                sge, page, mcpx_apu_phys_class(page),
+                page + GP_DOORBELL_OFFSET);
     }
     return (uint32_t *)(mcpx_apu_phys(page) + GP_DOORBELL_OFFSET);
 }

@@ -11,3 +11,7 @@ target_include_directories(apu_monitor_test PRIVATE ../../src ../../src/apu)
 target_link_libraries(apu_monitor_test PRIVATE xboxrecomp)
 enable_testing()
 add_test(NAME apu_monitor COMMAND apu_monitor_test)
+# The voice trace (and the host accounting the monitor runs with it) is on
+# only under RECOMP_APU_TRACE: the plain run checks it stays silent.
+add_test(NAME apu_monitor_quiet COMMAND apu_monitor_test)
+set_tests_properties(apu_monitor PROPERTIES ENVIRONMENT "RECOMP_APU_TRACE=1")

@@ -347,6 +347,31 @@ usually moves the stall rather than fixing it. Find the probe that failed.
 
 **Fix**: ensure all ICALL failure paths clean up the stack. Use `RECOMP_ICALL_SAFE` for stdcall callsites. Monitor `g_esp` trend.
 
+## Audio Diagnostics
+
+All off unless set; with none of them set the APU runs exactly as before.
+
+- `RECOMP_AUDIO_WAV=<path>` writes exactly what the APU hands the host
+  device (48 kHz s16 stereo) to a WAV whose header stays valid however the
+  run ends. `RECOMP_AUDIO_WAV_SECS=N` caps it. Compare that with what you
+  hear: a fault in the file is in the APU, a fault only in the speaker is
+  the host.
+- `RECOMP_AUDIO_HOST=1` covers the second case: it sets the device's
+  consumed-sample count against the wall clock and prints
+  `[AUDIO-HOST] starve wav=<sample> ms=<length>` wherever the device ran
+  out, indexed into the WAV, plus a once-a-second summary and front-end
+  trap spells over 20 ms.
+- `RECOMP_APU_TRACE=1` (which also prints the first register accesses)
+  adds the host lines above, `[APU-VSTAT]` once a second for each voice
+  that played (format, source address and how it resolved, envelope,
+  volumes, RMS and zero-crossing rate: about 0.5 is white noise, music sits
+  near 0.1-0.2), `[APU] voice N pos=` every 60 frames, and `[APU-IRQ]`
+  every 5 s (front-end traps, VP frames, trapped frames, underruns).
+- `RECOMP_APU_SOLO=<voice>` mixes only that voice.
+  `RECOMP_APU_VOICE_DUMP=<voice>|all` writes a voice's fetched samples as
+  raw s16 stereo to `RECOMP_APU_VOICE_DUMP_FILE` (default `voice_dump.raw`;
+  with `all`, `<file>.<voice>.raw` per voice).
+
 ## Reports RECOMP_ABI_CHECK Always Gives
 
 With `RECOMP_ABI_CHECK` on (see
