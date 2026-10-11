@@ -22,6 +22,7 @@
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
+#include "apu_wav.h"
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 
@@ -384,6 +385,15 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
 
+    /* RECOMP_AUDIO_WAV=<path>: dump exactly what the device is given,
+     * capped at RECOMP_AUDIO_WAV_SECS seconds when that is set. */
+    {
+        const char *wav = getenv("RECOMP_AUDIO_WAV");
+        const char *secs = getenv("RECOMP_AUDIO_WAV_SECS");
+        if (wav && *wav)
+            apu_wav_open(wav, secs ? atof(secs) : 0.0);
+    }
+
     /* Try XAudio2 first (lower latency) */
     if (xa2_init()) {
         /* Pacing marks in samples (xa2_pacing_marks): high is all the
@@ -438,6 +448,7 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 {
     (void)d;
+    apu_wav_close();
     if (xa2_is_active()) {
         xa2_shutdown();
         return;
@@ -543,6 +554,11 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         mixer_render(extra, MIXER_FRAME_SAMPLES);
         mix_into(period, (const int16_t (*)[2])extra, MIXER_FRAME_SAMPLES);
     }
+
+    /* A period dropped while pacing is stalled never reaches the device,
+     * so it stays out of the dump too. */
+    if (!(xa2_is_active() && d->pace_stalled))
+        apu_wav_write((const int16_t *)period, MIXER_FRAME_SAMPLES);
 
     if (xa2_is_active()) {
         if (!d->pace_stalled)
