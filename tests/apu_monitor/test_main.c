@@ -171,6 +171,96 @@ static void voice_trace_case(void)
     free(d);
 }
 
+/* ---- the ring monitor ----
+ * One looping 16-bit mono voice of 8 KB (eight 1 KB blocks), as a title
+ * streaming music into a ring would set it up. For six laps a writer
+ * refills the block two ahead of the cursor each time the cursor enters a
+ * block: every block plays new data each lap, so nothing is stale. Then
+ * the writer stops, and from the next lap each block replays its last lap.
+ * With RECOMP_APU_RING set, phase one must log no stale block and phase two
+ * at least a lap of them; unset, no [APU-RING] line at all. */
+static unsigned count_lines(const char *path, const char *prefix)
+{
+    char line[256];
+    unsigned n = 0;
+    FILE *f = fopen(path, "r");
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, prefix, strlen(prefix)))
+            n++;
+    if (f) fclose(f);
+    return n;
+}
+
+static void ring_case(void)
+{
+    enum { VPV = 0x100000, SGE = 0x200000, PCM = 0x300000,
+           EBO = 4095, BLK_SAMPLES = 512, NBLK = 8, LAP_FRAMES = 128 };
+    static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(*d));
+    int ring = getenv("RECOMP_APU_RING") != NULL;
+    const char *pa = ring ? "apu_monitor_ring_a.txt" : "apu_monitor_ring_qa.txt";
+    const char *pb = ring ? "apu_monitor_ring_b.txt" : "apu_monitor_ring_qb.txt";
+    unsigned cur = ~0u, fills = 0, stale_a, stale_b, any;
+
+    g_apu_ram_ptr = (uint8_t *)calloc(1, 64u << 20);
+    if (!d || !g_apu_ram_ptr) { failures++; return; }
+
+    d->regs[NV_PAPU_VPVADDR]   = VPV;
+    d->regs[NV_PAPU_VPSGEADDR] = SGE;
+    d->regs[NV_PAPU_TVL2D] = 0;
+    d->regs[NV_PAPU_TVL3D] = 0xFFFF;
+    d->regs[NV_PAPU_TVLMP] = 0xFFFF;
+    for (int page = 0; page < 2; page++)
+        wr32(SGE + page * 8, PCM + page * 4096);
+    for (int i = 0; i <= EBO; i++) {
+        int16_t smp = (int16_t)(1000 + i);
+        memcpy(g_apu_ram_ptr + PCM + i * 2, &smp, 2);
+    }
+    wr32(VPV + NV_PAVS_VOICE_CFG_FMT,
+         (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28) | (1u << 30)
+         | NV_PAVS_VOICE_CFG_FMT_LOOP);
+    wr32(VPV + NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+    wr32(VPV + NV_PAVS_VOICE_PAR_NEXT, EBO);
+    wr32(VPV + NV_PAVS_VOICE_TAR_PITCH_LINK, 0xFFFF);
+
+    for (int phase = 0; phase < 2; phase++) {
+        fflush(stderr);
+        if (!freopen(phase ? pb : pa, "w", stderr)) { failures++; return; }
+        for (int fr = 0; fr < (phase ? 3 : 6) * LAP_FRAMES; fr++) {
+            uint32_t cbo;
+            memcpy(&cbo, g_apu_ram_ptr + VPV + NV_PAVS_VOICE_PAR_OFFSET, 4);
+            cbo &= NV_PAVS_VOICE_PAR_OFFSET_CBO;
+            if (!phase && cbo / BLK_SAMPLES != cur) {
+                uint32_t b = (cbo / BLK_SAMPLES + 2) % NBLK;
+                cur = cbo / BLK_SAMPLES;
+                fills++;
+                for (int i = 0; i < BLK_SAMPLES; i++) {
+                    int16_t smp = (int16_t)(fills * 61 + i * 3 + 1);
+                    memcpy(g_apu_ram_ptr + PCM + (b * BLK_SAMPLES + i) * 2, &smp, 2);
+                }
+            }
+            memset(mixbins, 0, sizeof(mixbins));
+            mcpx_apu_vp_frame(d, mixbins);
+        }
+        fflush(stderr);
+    }
+
+    stale_a = count_lines(pa, "[APU-RING] stale");
+    stale_b = count_lines(pb, "[APU-RING] stale");
+    any = count_lines(pa, "[APU-RING]") + count_lines(pb, "[APU-RING]");
+    printf("ring: %u fills, %u stale while written, %u after the writer stopped\n",
+           fills, stale_a, stale_b);
+    if (!ring) {
+        CHECK("no ring lines with RECOMP_APU_RING unset", any == 0);
+    } else {
+        CHECK("writer kept up: no stale block", stale_a == 0);
+        CHECK("writer stopped: a lap of stale blocks", stale_b >= NBLK);
+    }
+    free(g_apu_ram_ptr);
+    g_apu_ram_ptr = NULL;
+    free(d);
+}
+
 /* ---- pacing by queue depth ----
  * The frame thread's decision (mcpx_apu_pace_step) against the fake queue,
  * on a simulated clock: the device consumes 48 samples per millisecond
@@ -477,7 +567,8 @@ int main(void)
     pacing_case();
     trapped_case();
     stall_fallback_case();
-    voice_trace_case();                      /* last: it redirects stderr */
+    voice_trace_case();                      /* last: they redirect stderr */
+    ring_case();
     if (failures == 0) { printf("apu_monitor: ALL PASS\n"); return 0; }
     printf("apu_monitor: %d FAILURE(S)\n", failures);
     return 1;

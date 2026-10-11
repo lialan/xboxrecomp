@@ -371,6 +371,12 @@ All off unless set; with none of them set the APU runs exactly as before.
   `RECOMP_APU_VOICE_DUMP=<voice>|all` writes a voice's fetched samples as
   raw s16 stereo to `RECOMP_APU_VOICE_DUMP_FILE` (default `voice_dump.raw`;
   with `all`, `<file>.<voice>.raw` per voice).
+- `RECOMP_APU_RING=1` watches looping PCM buffers that a title refills
+  ahead of the play cursor (streamed music decoded on the CPU). When the
+  writer falls behind, the VP replays the previous lap: no silence, only a
+  stutter. `[APU-RING] stale` names each block that played exactly as it
+  did one lap before in a buffer known to change; a once-a-second line
+  gives the writer's lead over the cursor.
 
 ## Reports RECOMP_ABI_CHECK Always Gives
 

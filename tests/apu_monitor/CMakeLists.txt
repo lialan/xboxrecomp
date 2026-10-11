@@ -12,6 +12,8 @@ target_link_libraries(apu_monitor_test PRIVATE xboxrecomp)
 enable_testing()
 add_test(NAME apu_monitor COMMAND apu_monitor_test)
 # The voice trace (and the host accounting the monitor runs with it) is on
-# only under RECOMP_APU_TRACE: the plain run checks it stays silent.
+# only under RECOMP_APU_TRACE, the ring monitor only under RECOMP_APU_RING:
+# the plain run checks both stay silent.
 add_test(NAME apu_monitor_quiet COMMAND apu_monitor_test)
-set_tests_properties(apu_monitor PROPERTIES ENVIRONMENT "RECOMP_APU_TRACE=1")
+set_tests_properties(apu_monitor PROPERTIES
+                     ENVIRONMENT "RECOMP_APU_TRACE=1;RECOMP_APU_RING=1")
