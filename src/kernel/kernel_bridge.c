@@ -3286,6 +3286,13 @@ static int kernel_drain_dpcs(int *ran)
     }
 }
 
+/* The timer thread's drain, for tests/irq_progress: the timer thread itself
+ * cannot start without a title's TLS image for its TIB. */
+int xbox_DpcDrainTimer(int *ran)
+{
+    return kernel_drain_dpcs(ran);
+}
+
 /* The queue, run on a guest thread that owns "the processor at DISPATCH":
  * its raise, before its critical region, and its release point
  * (kernel_hal.c, dpc_run_here). The caller holds the gate and is at or

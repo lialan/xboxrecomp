@@ -977,6 +977,8 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
  */
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
+    KIRQL old;
+
     if (NewIrql > g_current_irql) {
         /* A lower that would raise. The title's own pairs never do this;
          * one that does is restoring a level it read from somewhere other
@@ -1008,9 +1010,17 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
         }
     }
 
-    irql_track(g_current_irql, NewIrql, IRQL_CALLER());
+    old = g_current_irql;
+    irql_track(old, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
     irql_publish();
+    /* Down from a device level to DISPATCH: the thread keeps the gate, and
+     * the interrupts the level held off are taken now, as the console takes
+     * them at the lower. The thunk's safe point came before this, still at
+     * the old level, and the guest may go on at DISPATCH with no kernel call.
+     * A lower below DISPATCH takes them at its release point instead. */
+    if (old > DISPATCH_LEVEL && NewIrql == DISPATCH_LEVEL)
+        xbox_IrqSafePoint();
 }
 
 /*

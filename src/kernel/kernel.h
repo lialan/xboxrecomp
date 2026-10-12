@@ -933,6 +933,9 @@ void    xbox_IrqNoteUngated(int line);
 int     xbox_DpcQueue(uint32_t dpc_va, uint32_t arg1, uint32_t arg2);
 int     xbox_DpcPending(void);          /* an unlocked look */
 int     xbox_DpcDrainHere(void);        /* the caller holds the gate; DPCs run */
+/* The timer thread's drain: takes the gate only when it is free, never
+ * waits; 1 when DPCs stayed queued on a busy gate. *ran counts what ran. */
+int     xbox_DpcDrainTimer(int *ran);
 void    xbox_DpcMarkGuestThread(void);  /* this thread runs guest code */
 int     xbox_DpcOnRaise(void);  /* gate on and RECOMP_DPC_ON_RAISE not 0 */
 
