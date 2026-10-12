@@ -183,6 +183,89 @@ static void check_maps(const char *guest, const char *want, const char *what)
     check(ok && strcmp(got, want) == 0, what, d);
 }
 
+/* A search abandoned after one result must not outlive its handle.
+ *
+ * A title that looks for one save (FindFirstFile, then FindClose without
+ * reading on) leaves its enumeration part-way. Host handle values are reused,
+ * so a later directory opened at the same value carried the old search on:
+ * its first answer was the old directory's next entry, or "no more files",
+ * and with no reuse the table of searches filled up. */
+#define DIRS 8
+#define SEARCHES 300
+
+static NTSTATUS open_dir(const char *path, HANDLE *out)
+{
+    XBOX_ANSI_STRING name;
+    XBOX_OBJECT_ATTRIBUTES oa;
+    XBOX_IO_STATUS_BLOCK ios;
+
+    name.Length = (USHORT)strlen(path);
+    name.MaximumLength = (USHORT)(name.Length + 1);
+    name.Buffer = (PCHAR)path;
+    oa.RootDirectory = NULL;
+    oa.ObjectName = &name;
+    oa.Attributes = 0x40;
+    *out = NULL;
+    /* what XAPI's FindFirstFile asks for: list, synchronous, shared */
+    return xbox_NtCreateFile(out, 0x00100001u, &oa, &ios, NULL, 0, 3,
+                             XBOX_FILE_OPEN, 0x21);
+}
+
+static void test_dir_search(void)
+{
+    static ULONG info[128];
+    PXBOX_FILE_DIRECTORY_INFORMATION e = (PXBOX_FILE_DIRECTORY_INFORMATION)info;
+    char p[700], guest[32], want[8], pat[8], d[160], first_bad[96] = "";
+    unsigned i, k, fresh = 0, reused = 0;
+    HANDLE h, prev = NULL;
+
+    printf("\nDirectory searches closed after one result\n");
+    for (k = 0; k < DIRS; k++) {
+        FILE *f;
+        snprintf(p, sizeof p, "%s" SEP_S "d%u", g_cache, k);
+        make_dir(p);
+        for (i = 0; i < 2; i++) {   /* two entries: one result leaves it open */
+            snprintf(p, sizeof p, "%s" SEP_S "d%u" SEP_S "e%u%c.txt", g_cache, k, k, 'a' + i);
+            if ((f = fopen(p, "wb")) != NULL) fclose(f);
+        }
+    }
+
+    for (i = 0; i < SEARCHES; i++) {
+        XBOX_ANSI_STRING mask;
+        XBOX_IO_STATUS_BLOCK ios;
+        NTSTATUS st;
+        int ok;
+
+        k = i % DIRS;
+        snprintf(guest, sizeof guest, "z:\\d%u", k);
+        snprintf(want, sizeof want, "e%u", k);
+        snprintf(pat, sizeof pat, "e%u*", k);
+        if (open_dir(guest, &h) != 0 || !h) {
+            snprintf(first_bad, sizeof first_bad, "search %u: open %s failed", i, guest);
+            break;
+        }
+        if (h == prev) reused++;
+        prev = h;
+        mask.Length = (USHORT)strlen(pat);
+        mask.MaximumLength = (USHORT)(mask.Length + 1);
+        mask.Buffer = pat;
+        memset(info, 0, sizeof info);
+        st = xbox_NtQueryDirectoryFile(h, NULL, NULL, NULL, &ios, e, sizeof info,
+                                       XboxFileDirectoryInformation, &mask, FALSE);
+        ok = st == 0 && e->FileNameLength >= 2 && memcmp(e->FileName, want, 2) == 0;
+        if (ok) fresh++;
+        else if (!first_bad[0])
+            snprintf(first_bad, sizeof first_bad, "search %u in d%u: status 0x%08X, \"%.*s\"",
+                     i, k, (unsigned)st, (int)(e->FileNameLength < 16 ? e->FileNameLength : 16),
+                     e->FileName);
+        xbox_NtClose(h);
+    }
+    snprintf(d, sizeof d, "%u/%u fresh, handle reused %u times; first stale: %s",
+             fresh, SEARCHES, reused, first_bad[0] ? first_bad : "none");
+    printf("  (%s)\n", d);
+    check(fresh == SEARCHES, "each new search starts in its own directory", d);
+}
+
 /* Where Partition1's UDATA and TDATA go: RECOMP_SAVE_DIR, the save dir, or
  * the game dir when saves are only there. */
 static void test_save_dir(const char *root)
@@ -259,7 +342,11 @@ int main(int argc, char **argv)
     for (i = 0; i < 4096; i++) buf[i] = pattern(i);
     memcpy(buf, "IPK1", 4);
 
-    printf("FATX overwrite (the texture-cache copy)\n");
+    /* First, so the overwrite and rename checks below run on handle values
+     * that directory searches have used and closed. */
+    test_dir_search();
+
+    printf("\nFATX overwrite (the texture-cache copy)\n");
 
     /* First pass: create, size, write unbuffered, close. */
     st = open_file("z:\\o.tmp", XBOX_FILE_OVERWRITE_IF, 0x48, &h);
