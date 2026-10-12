@@ -155,6 +155,14 @@ const char *mcpx_apu_phys_class(uint64_t addr)
     return "ram";
 }
 
+/* A diagnostic switch is on when set to anything but empty or a leading
+ * '0', as RECOMP_HEADLESS is read: =0 turns it off rather than on. */
+int apu_env_on(const char *name)
+{
+    const char *e = getenv(name);
+    return e && *e && *e != '0';
+}
+
 /* The interrupt line, as the frame thread sees it. update_irq used to call
  * pci_irq_assert, which is an empty stub here, so DirectSound's service
  * routine never ran and no voice completion ever reached it. */
@@ -492,26 +500,95 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 /* ============================================================
  * Host playback accounting (RECOMP_AUDIO_HOST, or RECOMP_APU_TRACE)
  *
- * The WAV tap records every period handed to the device, back to back, so
- * it cannot show a period that reached the device late: the device plays
- * silence meanwhile and the WAV has no hole. This measures that from the
- * host side. At each submit, the device's consumed-sample count
- * (xa2_samples_played) is set against the wall clock since a baseline: a
- * deficit that grows by more than one device buffer is starvation, logged
- * as
+ * The WAV tap records what the APU hands the device backend, back to back,
+ * so it cannot show a period that reached the device late: the device
+ * plays silence meanwhile and the WAV has no hole. A clean WAV therefore
+ * says nothing about whether the output was continuous; that rests on what
+ * the device consumed, which this measures. At each submit the device's
+ * consumed-sample count (xa2_samples_played) is set against the wall clock
+ * since a baseline. The difference, the deficit, is silence the device
+ * inserted, plus about one device buffer of jitter (the device takes a
+ * buffer at a time, and Wine mixes in its own periods). Each time the
+ * deficit passes the part already accounted for by more than that jitter,
+ * the excess is starvation, logged as
  *   [AUDIO-HOST] starve wav=<sample index> ms=<length> ...
  * with the sample index into the WAV, so a check can splice that much
- * silence in and analyse what the speaker actually played. Also tracked:
- * the longest wall-clock gap between submits, and each spell with FECTL
- * trapped (frames produced: none) with its wall-clock length.
+ * silence in and analyse what the speaker actually played. starved_ms on
+ * the once-a-second line is their total, and pending_ms what is above the
+ * accounted part but not yet reported (negative: inside the jitter band);
+ * the inserted silence is their sum, to within one buffer. Also tracked:
+ * submits the backend refused (in the WAV, never played), the longest
+ * wall-clock gap between submits, and each spell with FECTL trapped
+ * (frames produced: none) with its wall-clock length.
  * ============================================================ */
+
+/* For this long after a baseline the accounted part follows the deficit
+ * up, so it starts at the top of the jitter band: the device's first pull,
+ * and XAudio2 staging a whole buffer before it queues one, both read as
+ * deficit. A loss in it is still reported when it comes as one rise of
+ * more than the jitter. */
+#define STARVE_SETTLE_US 250000
+/* The device's clock and the wall clock drift apart. While the device has
+ * not run dry the accounted part follows the deficit up whatever the rate
+ * (a device clock several percent slow, as SDL's dummy driver runs, is
+ * not loss). Once it has, a loss is pending and the accounted part only
+ * creeps up at this rate, so drift on a real device (tens of ppm) is not
+ * added to it, and silence inserted at under 0.2 ms a second is missed.
+ * The limit: on a clock more than this far off (the dummy driver) each dry
+ * spell can add up to about a buffer of drift to its report, and a single
+ * loss under one buffer is absorbed by the creep and never reported. */
+#define STARVE_DRIFT_PPM 200
+
+void apu_starve_rebase(ApuStarve *s, int64_t now_us, uint64_t played)
+{
+    s->t0_us = now_us;
+    s->played0 = played;
+    s->deficit = 0;
+    s->ref = 0;
+    s->ref_us = now_us;
+    s->dry = 0;
+}
+
+int64_t apu_starve_step(ApuStarve *s, int64_t now_us, uint64_t played,
+                        int jitter, int dry)
+{
+    int64_t deficit = (now_us - s->t0_us) * 48 / 1000
+                    - (int64_t)(played - s->played0);
+    double creep = (double)(now_us - s->ref_us) * 48e-3 * STARVE_DRIFT_PPM * 1e-6;
+
+    s->deficit = deficit;
+    s->ref_us = now_us;
+    s->dry |= dry;
+    /* Once the device has run dry, only a reported loss moves the accounted
+     * part to the deficit, so the reports add up to the inserted silence
+     * however it came. Moving it to every new high (as this did) left a run
+     * of losses each under the jitter -- twenty 5 ms gaps -- reporting
+     * nothing, while one 100 ms gap reported 100 ms. */
+    if (s->dry && deficit > s->ref + jitter) {
+        int64_t lost = deficit - (int64_t)s->ref;
+        s->ref = (double)deficit;
+        s->dry = 0;
+        return lost;
+    }
+    if (deficit > s->ref) {
+        if (!s->dry || now_us - s->t0_us < STARVE_SETTLE_US)
+            s->ref = (double)deficit;
+        else
+            s->ref = fmin((double)deficit, s->ref + creep);
+    } else if (deficit < s->ref - jitter) {
+        /* A device clock running fast pulls the band down: follow it to
+         * the top of the band. */
+        s->ref = (double)(deficit + jitter);
+    }
+    return 0;
+}
 
 static struct {
     int      on;                /* -1 until the environment is read */
-    int64_t  t0_us;             /* baseline wall time (0: rebase at next submit) */
-    uint64_t played0;           /* device samples consumed at the baseline */
-    int64_t  deficit_max;       /* largest deficit since the baseline, samples */
-    uint64_t submitted;         /* samples submitted (= WAV sample index) */
+    ApuStarve acct;             /* t0_us 0: a new baseline at the next submit */
+    uint64_t submitted;         /* samples handed to the backend (= WAV sample index) */
+    unsigned refused;           /* submits the backend refused (in the WAV, not played) */
+    unsigned underruns_seen;    /* xa2_underruns() at the last submit */
     double   starved_ms;        /* total, all baselines */
     unsigned starves;
     int64_t  last_submit_us, gap_max_us;    /* gap_max: this report interval */
@@ -525,8 +602,8 @@ static struct {
 static int hs_on(void)
 {
     if (g_hs.on < 0)
-        g_hs.on = getenv("RECOMP_APU_TRACE") != NULL ||
-                  getenv("RECOMP_AUDIO_HOST") != NULL;
+        g_hs.on = apu_env_on("RECOMP_APU_TRACE") ||
+                  apu_env_on("RECOMP_AUDIO_HOST");
     return g_hs.on;
 }
 
@@ -556,24 +633,40 @@ static void hs_trap(bool trapped)
     }
 }
 
-/* The frame thread is pausing on purpose: start a new baseline after it. */
+/* The frame thread is pausing on purpose: the device drains, which is not
+ * starvation. Start a new baseline after it. */
 static void hs_rebase(void)
 {
-    g_hs.t0_us = 0;
+    g_hs.acct.t0_us = 0;
 }
 
-/* Before handing n samples (stereo frames) to the device. */
-static void hs_submit(int n)
+/* The queue is read before the submit. Both backends count an underrun
+ * only when a poll sees the queue empty, and a dry spell that begins
+ * partway through a period (a front-end trap, a stall) gets no other poll
+ * before this one: read after the submit, the queue holds the new period
+ * and the spell is never counted, so its loss would be folded into the
+ * reference. It also keeps queued= and q_min meaning what was left. */
+static int hs_poll(void)
 {
-    int64_t now, gap, deficit;
+    return hs_on() && xa2_is_active() ? xa2_queued_samples() : 0;
+}
+
+/* After handing n samples (stereo frames) to the device; ok is what the
+ * backend returned and q the queue hs_poll read just before. A refused
+ * submit is in the WAV and counts in the sample index all the same, so the
+ * index stays the WAV's; what was lost ends at the index on the refused
+ * line (on XAudio2 the whole device buffer the period completed, on SDL2
+ * the period). */
+static void hs_submit(int n, int ok, int q)
+{
+    int64_t now, gap, lost;
     uint64_t played;
-    int q;
+    unsigned u;
 
     if (!hs_on() || !xa2_is_active())
         return;
     now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     played = xa2_samples_played();
-    q = xa2_queued_samples();
 
     /* samples= on the last-submit line is what was submitted since the
      * first, so samples / (t_last - t_first) is the rate the device was fed
@@ -582,10 +675,9 @@ static void hs_submit(int n)
         g_hs.first_submit_us = now;
         fprintf(stderr, "[APU] first submit t=%.6f\n", now / 1e6);
     }
-    if (g_hs.t0_us == 0) {
-        g_hs.t0_us = now;
-        g_hs.played0 = played;
-        g_hs.deficit_max = 0;
+    if (g_hs.acct.t0_us == 0) {
+        apu_starve_rebase(&g_hs.acct, now, played);
+        g_hs.underruns_seen = xa2_underruns();
         g_hs.last_submit_us = now;
         g_hs.q_min = q;
         g_hs.next_report_us = now + 1000000;
@@ -598,28 +690,30 @@ static void hs_submit(int n)
     if (q < g_hs.q_min)
         g_hs.q_min = q;
 
-    deficit = (now - g_hs.t0_us) * 48 / 1000 - (int64_t)(played - g_hs.played0);
-    /* The device consumes a buffer at a time (and Wine mixes in its own
-     * periods), so the deficit jitters by about one buffer; a rise beyond
-     * that is time the device had nothing to play. */
-    if (deficit > g_hs.deficit_max + xa2_get_buffer_size()) {
-        int64_t lost = deficit - g_hs.deficit_max;
+    u = xa2_underruns();
+    lost = apu_starve_step(&g_hs.acct, now, played, xa2_get_buffer_size(),
+                           u != g_hs.underruns_seen);
+    g_hs.underruns_seen = u;
+    if (lost) {
         g_hs.starves++;
         g_hs.starved_ms += lost / 48.0;
         fprintf(stderr, "[AUDIO-HOST] starve wav=%llu ms=%.1f queued=%d gap_ms=%.1f trapped=%d\n",
                 (unsigned long long)g_hs.submitted, lost / 48.0, q, gap / 1000.0,
                 g_hs.trap_start_us != 0);
-        g_hs.deficit_max = deficit;
-    } else if (deficit > g_hs.deficit_max) {
-        g_hs.deficit_max = deficit;
     }
     g_hs.submitted += (uint64_t)n;
+    if (!ok && g_hs.refused++ < 100)
+        fprintf(stderr, "[AUDIO-HOST] refused wav=%llu queued=%d\n",
+                (unsigned long long)g_hs.submitted, q);
 
     if (now >= g_hs.next_report_us) {
-        fprintf(stderr, "[AUDIO-HOST] wav=%llu starves=%u starved_ms=%.1f deficit=%lld"
-                " gap_max_ms=%.1f q_min=%d trap_spells=%u trap_long=%u trap_max_ms=%.1f underruns=%u\n",
-                (unsigned long long)g_hs.submitted, g_hs.starves, g_hs.starved_ms,
-                (long long)deficit, g_hs.gap_max_us / 1000.0, g_hs.q_min,
+        fprintf(stderr, "[AUDIO-HOST] wav=%llu played=%llu starves=%u starved_ms=%.1f pending_ms=%.1f"
+                " deficit=%lld refused=%u gap_max_ms=%.1f q_min=%d trap_spells=%u trap_long=%u"
+                " trap_max_ms=%.1f underruns=%u\n",
+                (unsigned long long)g_hs.submitted, (unsigned long long)played,
+                g_hs.starves, g_hs.starved_ms,
+                (g_hs.acct.deficit - g_hs.acct.ref) / 48.0, (long long)g_hs.acct.deficit,
+                g_hs.refused, g_hs.gap_max_us / 1000.0, g_hs.q_min,
                 g_hs.trap_spells, g_hs.trap_long, g_hs.trap_max_us / 1000.0,
                 xa2_underruns());
         fprintf(stderr, "[APU] last submit t=%.6f samples=%llu\n", now / 1e6,
@@ -728,8 +822,10 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
     if (xa2_is_active()) {
         if (!d->pace_stalled) {
-            hs_submit(MIXER_FRAME_SAMPLES);
-            xa2_submit_samples((const int16_t *)period, MIXER_FRAME_SAMPLES);
+            int q = hs_poll();
+            hs_submit(MIXER_FRAME_SAMPLES,
+                      xa2_submit_samples((const int16_t *)period,
+                                         MIXER_FRAME_SAMPLES), q);
         }
         return;
     }
@@ -911,24 +1007,25 @@ ApuIrqStats apu_irq_stats;
  * device underruns. Trapped frames climbing while se_frames stands still is
  * the service routine not clearing the trap; underruns with se_frames
  * advancing is the host, not the title. */
+static int s_irq_trace = -1;
+static uint64_t s_irq_next_ns;
+
 static void apu_irq_stats_line(void)
 {
-    static int trace = -1;
-    static uint64_t next_ns;
     uint64_t now;
 
-    if (trace < 0)
-        trace = getenv("RECOMP_APU_TRACE") != NULL;
-    if (!trace)
+    if (s_irq_trace < 0)
+        s_irq_trace = apu_env_on("RECOMP_APU_TRACE");
+    if (!s_irq_trace)
         return;
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    if (now < next_ns)
+    if (now < s_irq_next_ns)
         return;
-    if (next_ns)
+    if (s_irq_next_ns)
         fprintf(stderr, "[APU-IRQ] traps %u se_frames %u fe-trapped-frames %u underruns %u\n",
                 apu_irq_stats.traps, apu_irq_stats.se_frames,
                 apu_irq_stats.fe_trapped_frames, xa2_underruns());
-    next_ns = now + 5000000000ull;
+    s_irq_next_ns = now + 5000000000ull;
 }
 
 static void *mcpx_apu_frame_thread(void *arg)
@@ -1084,6 +1181,18 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
  * Public API: Init / Shutdown
  * ============================================================ */
 
+/* The diagnostics' state is per instance: a new instance after a shutdown
+ * reads the switches again and counts from zero, with no baseline or trap
+ * spell left over from the last one. */
+static void apu_diag_reset(void)
+{
+    memset(&g_hs, 0, sizeof(g_hs));
+    g_hs.on = -1;
+    memset(&apu_irq_stats, 0, sizeof(apu_irq_stats));
+    s_irq_trace = -1;
+    s_irq_next_ns = 0;
+}
+
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
 {
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(MCPXAPUState));
@@ -1095,6 +1204,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     g_apu_ram_ptr = ram_ptr;
     g_state = d;
     d->ram_ptr = ram_ptr;
+    apu_diag_reset();
 
     /* RECOMP_APU_SOLO=<voice>: mute every other voice in the mix, for
      * telling which voice a sound (or a noise) comes from. */

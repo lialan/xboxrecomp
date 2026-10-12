@@ -102,7 +102,7 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
      * a title that waits on one waits forever, and the only way to work out
      * what it is waiting for is to see the register traffic that precedes the
      * wait. */
-    if (getenv("RECOMP_APU_TRACE")) {
+    if (apu_env_on("RECOMP_APU_TRACE")) {
         static unsigned n;
         if (n++ < 400) {
             /* The value as well as the offset: finding which register carries

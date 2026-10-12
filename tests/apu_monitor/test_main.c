@@ -100,10 +100,21 @@ static int16_t clamp16(int v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 
 
 /* ---- the voice position trace ----
  * One looping 16-bit mono voice in fake guest RAM, run through the real VP
- * for 120 frames. stderr is captured to a file. With RECOMP_APU_TRACE set
+ * for 120 frames. stderr is captured to a file. With RECOMP_APU_TRACE on
  * (the apu_monitor ctest) two "[APU] voice 0 pos=" lines must appear, with
- * the position advancing between them; unset (apu_monitor_quiet), none. */
+ * the position advancing between them; unset (apu_monitor_quiet) or =0
+ * (apu_monitor_off), none. */
 extern uint8_t *g_apu_ram_ptr;
+
+
+
+/* What the ctest set, from its command line: on (the switches =1), unset,
+ * or off (=0). The expectations come from here and never from the switch
+ * reader, so reading =0 as on fails the off run instead of agreeing with
+ * itself. It also names the capture files, one per ctest, so they can run
+ * in parallel. */
+static const char *g_mode = "unset";
+static int g_expect_on;
 
 static void wr32(uint32_t addr, uint32_t v) { memcpy(g_apu_ram_ptr + addr, &v, 4); }
 
@@ -114,7 +125,7 @@ static void voice_trace_case(void)
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(*d));
     char line[256];
     unsigned pos[4], len[4], n = 0, v;
-    const char *path;
+    char path[64];
     FILE *f;
 
     g_apu_ram_ptr = (uint8_t *)calloc(1, 64u << 20);
@@ -139,9 +150,8 @@ static void voice_trace_case(void)
     wr32(VPV + NV_PAVS_VOICE_PAR_NEXT, EBO);
     wr32(VPV + NV_PAVS_VOICE_TAR_PITCH_LINK, 0xFFFF);    /* end of list  */
 
-    /* One file per ctest, so the two can run in parallel. */
-    path = getenv("RECOMP_APU_TRACE") ? "apu_monitor_trace.txt"
-                                      : "apu_monitor_quiet.txt";
+    snprintf(path, sizeof(path), "apu_monitor_trace_%s.txt",
+             g_mode);
     fflush(stderr);
     if (!freopen(path, "w", stderr)) { failures++; return; }
     for (int fr = 0; fr < 120; fr++) {
@@ -159,8 +169,8 @@ static void voice_trace_case(void)
     printf("voice trace: %u lines", n);
     for (unsigned i = 0; i < n; i++) printf(" %u/%u", pos[i], len[i]);
     printf("\n");
-    if (!getenv("RECOMP_APU_TRACE")) {
-        CHECK("no trace lines with RECOMP_APU_TRACE unset", n == 0);
+    if (!g_expect_on) {
+        CHECK("no trace lines with RECOMP_APU_TRACE unset or 0", n == 0);
     } else {
         CHECK("two trace lines in 120 frames", n == 2);
         CHECK("position advances", n == 2 && pos[1] > pos[0]);
@@ -178,7 +188,7 @@ static void voice_trace_case(void)
  * block: every block plays new data each lap, so nothing is stale. Then
  * the writer stops, and from the next lap each block replays its last lap.
  * With RECOMP_APU_RING set, phase one must log no stale block and phase two
- * at least a lap of them; unset, no [APU-RING] line at all. */
+ * at least a lap of them; unset or 0, no [APU-RING] line at all. */
 static unsigned count_lines(const char *path, const char *prefix)
 {
     char line[256];
@@ -197,13 +207,14 @@ static void ring_case(void)
            EBO = 4095, BLK_SAMPLES = 512, NBLK = 8, LAP_FRAMES = 128 };
     static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(*d));
-    int ring = getenv("RECOMP_APU_RING") != NULL;
-    const char *pa = ring ? "apu_monitor_ring_a.txt" : "apu_monitor_ring_qa.txt";
-    const char *pb = ring ? "apu_monitor_ring_b.txt" : "apu_monitor_ring_qb.txt";
+    int ring = g_expect_on;
+    char pa[64], pb[64];
     unsigned cur = ~0u, fills = 0, stale_a, stale_b, any;
 
     g_apu_ram_ptr = (uint8_t *)calloc(1, 64u << 20);
     if (!d || !g_apu_ram_ptr) { failures++; return; }
+    snprintf(pa, sizeof(pa), "apu_monitor_ring_%s_a.txt", g_mode);
+    snprintf(pb, sizeof(pb), "apu_monitor_ring_%s_b.txt", g_mode);
 
     d->regs[NV_PAPU_VPVADDR]   = VPV;
     d->regs[NV_PAPU_VPSGEADDR] = SGE;
@@ -251,7 +262,7 @@ static void ring_case(void)
     printf("ring: %u fills, %u stale while written, %u after the writer stopped\n",
            fills, stale_a, stale_b);
     if (!ring) {
-        CHECK("no ring lines with RECOMP_APU_RING unset", any == 0);
+        CHECK("no ring lines with RECOMP_APU_RING unset or 0", any == 0);
     } else {
         CHECK("writer kept up: no stale block", stale_a == 0);
         CHECK("writer stopped: a lap of stale blocks", stale_b >= NBLK);
@@ -259,6 +270,112 @@ static void ring_case(void)
     free(g_apu_ram_ptr);
     g_apu_ram_ptr = NULL;
     free(d);
+}
+
+/* ---- host starvation accounting ----
+ * apu_starve_step against a device that takes 512-sample buffers whole (as
+ * XAudio2 and Wine do) on its own clock, which stops for each gap: the
+ * producer is late, nothing is submitted and the device plays silence.
+ * Submits come once an EP period. The same 100 ms of inserted silence as
+ * one gap, or as twenty 5 ms gaps 100 ms or 1 s apart, must report 100 ms
+ * to within two buffers: one of jitter band, and up to one more below the
+ * threshold that has not been reported yet (before the fix the twenty
+ * gaps reported nothing). A gap leaves the device dry (the backend's
+ * underrun count rises) at the next submit. Ten minutes of device clock
+ * drift at +-150 ppm reports nothing, nor does a device clock 3% fast or
+ * slow that never runs dry (SDL's dummy driver runs about 3% slow); a 2 s
+ * gap reports 2 s, unless it is a drain the frame thread announced (a
+ * rebase, with the dry spell pre-marked), which reports nothing. */
+typedef struct { int64_t start_us, len_us; } StarveGap;
+
+static double starve_run(const StarveGap *gaps, int ngaps, int64_t run_us,
+                         double ppm, int drain, unsigned *reports)
+{
+    enum { BUF = 512 };
+    ApuStarve s;
+    double total = 0;
+    int rebase = 1, dry = 0;
+
+    *reports = 0;
+    for (int64_t k = 0;; k++) {
+        int64_t now = k * 256 * 1000000 / 48000, stopped = 0;
+        int in_gap = 0;
+        uint64_t played;
+        int64_t lost;
+
+        if (now >= run_us)
+            break;
+        for (int i = 0; i < ngaps; i++) {
+            int64_t into = now - gaps[i].start_us;
+            if (into > 0)
+                stopped += into < gaps[i].len_us ? into : gaps[i].len_us;
+            if (into >= 0 && into < gaps[i].len_us)
+                in_gap = 1;
+        }
+        /* The device pulls a buffer as it starts playing it. */
+        played = ((uint64_t)((double)(now - stopped) * (1.0 + ppm * 1e-6)
+                             * 48 / 1000) / BUF + 1) * BUF;
+        if (in_gap) {
+            rebase |= drain;
+            dry = !drain;
+            continue;
+        }
+        if (rebase) {
+            apu_starve_rebase(&s, now, played);
+            rebase = 0;
+        }
+        lost = apu_starve_step(&s, now, played, BUF, dry);
+        dry = 0;
+        if (lost) {
+            (*reports)++;
+            total += lost / 48.0;
+        }
+    }
+    return total;
+}
+
+static void starve_case(void)
+{
+    StarveGap one = { 2000000, 100000 }, many[20], slow[20], drain = { 2000000, 2000000 };
+    const double tol = 2 * 512 / 48.0 + 0.5;
+    unsigned r_one, r_many, r_slow, r_fast, r_lag, r_fast3, r_lag3, r_stop, r_drain, r_slowdry;
+    double t_one, t_many, t_slow, t_fast, t_lag, t_fast3, t_lag3, t_stop, t_drain, t_slowdry;
+
+    for (int i = 0; i < 20; i++) {
+        many[i].start_us = 2000000 + i * 100000; many[i].len_us = 5000;
+        slow[i].start_us = 2000000 + i * 1000000; slow[i].len_us = 5000;
+    }
+    t_one  = starve_run(&one, 1, 5000000, 0, 0, &r_one);
+    t_many = starve_run(many, 20, 6000000, 0, 0, &r_many);
+    t_slow = starve_run(slow, 20, 24000000, 0, 0, &r_slow);
+    t_fast = starve_run(NULL, 0, 600000000, 150, 0, &r_fast);
+    t_lag  = starve_run(NULL, 0, 600000000, -150, 0, &r_lag);
+    t_fast3 = starve_run(NULL, 0, 60000000, 30000, 0, &r_fast3);
+    t_lag3 = starve_run(NULL, 0, 60000000, -30000, 0, &r_lag3);
+    t_stop = starve_run(&drain, 1, 6000000, 0, 0, &r_stop);
+    t_drain = starve_run(&drain, 1, 6000000, 0, 1, &r_drain);
+    /* The known limit, printed rather than checked: on a clock 3% slow each
+     * dry spell adds up to about a buffer of drift to its report (true
+     * total 100 ms). Real devices sit well inside the 200 ppm allowance. */
+    t_slowdry = starve_run(slow, 20, 24000000, -30000, 0, &r_slowdry);
+    printf("starve limit: 20 x 5 ms 1 s apart on a 3%% slow clock %.1f ms (%u)\n",
+           t_slowdry, r_slowdry);
+    printf("starve: one gap %.1f ms (%u), 20 x 5 ms %.1f ms (%u), 1 s apart %.1f ms (%u),"
+           " drift +150 ppm %.1f ms (%u), -150 ppm %.1f ms (%u), +3%% %.1f ms (%u),"
+           " -3%% %.1f ms (%u), 2 s gap %.1f ms (%u), drained %.1f ms (%u)\n",
+           t_one, r_one, t_many, r_many, t_slow, r_slow, t_fast, r_fast,
+           t_lag, r_lag, t_fast3, r_fast3, t_lag3, r_lag3, t_stop, r_stop,
+           t_drain, r_drain);
+    CHECK("one 100 ms gap reports 100 ms", fabs(t_one - 100) <= tol);
+    CHECK("twenty 5 ms gaps report 100 ms", fabs(t_many - 100) <= tol);
+    CHECK("twenty 5 ms gaps 1 s apart report 100 ms", fabs(t_slow - 100) <= tol);
+    CHECK("small gaps add up over several reports", r_many >= 2);
+    CHECK("no report from a fast device clock", r_fast == 0);
+    CHECK("no report from a slow device clock", r_lag == 0);
+    CHECK("no report from a 3% fast clock that never runs dry", r_fast3 == 0);
+    CHECK("no report from a 3% slow clock that never runs dry", r_lag3 == 0);
+    CHECK("a 2 s gap reports 2 s", fabs(t_stop - 2000) <= tol);
+    CHECK("an announced drain reports nothing", r_drain == 0);
 }
 
 /* ---- pacing by queue depth ----
@@ -502,13 +619,32 @@ static void stall_fallback_case(void)
     free(d);
 }
 
-int main(void)
+/* ---- the switches ----
+ * The reader against what the ctest set: on with =1, off unset or =0. */
+static void switch_case(void)
+{
+    CHECK("RECOMP_APU_TRACE reads as the ctest set it",
+          apu_env_on("RECOMP_APU_TRACE") == g_expect_on);
+    CHECK("RECOMP_AUDIO_HOST reads as the ctest set it",
+          apu_env_on("RECOMP_AUDIO_HOST") == g_expect_on);
+    CHECK("RECOMP_APU_RING reads as the ctest set it",
+          apu_env_on("RECOMP_APU_RING") == g_expect_on);
+}
+
+int main(int argc, char **argv)
 {
     /* Zeroed: ram_ptr NULL keeps dsp_ack_frame out of guest memory, and
      * monitor.point 0 is MON_AC97, so dsp_frame writes frame_buf. */
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(*d));
     int ok, i;
     if (!d) return 2;
+    if (argc != 2 || (strcmp(argv[1], "on") && strcmp(argv[1], "off")
+                      && strcmp(argv[1], "unset"))) {
+        fprintf(stderr, "usage: apu_monitor_test on|off|unset\n");
+        return 2;
+    }
+    g_mode = argv[1];
+    g_expect_on = !strcmp(g_mode, "on");
     printf("apu_monitor: running\n");
 
     /* 1. The DSP's period reaches the device unchanged, once, 256 samples. */
@@ -567,6 +703,8 @@ int main(void)
     pacing_case();
     trapped_case();
     stall_fallback_case();
+    starve_case();
+    switch_case();
     voice_trace_case();                      /* last: they redirect stderr */
     ring_case();
     if (failures == 0) { printf("apu_monitor: ALL PASS\n"); return 0; }

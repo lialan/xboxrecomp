@@ -350,16 +350,34 @@ usually moves the stall rather than fixing it. Find the probe that failed.
 ## Audio Diagnostics
 
 All off unless set; with none of them set the APU runs exactly as before.
+The switches (`RECOMP_AUDIO_HOST`, `RECOMP_APU_TRACE`, `RECOMP_APU_RING`)
+are on for any value but empty or one starting with `0`, so `=0` turns
+them off.
 
 - `RECOMP_AUDIO_WAV=<path>` writes exactly what the APU hands the host
   device (48 kHz s16 stereo) to a WAV whose header stays valid however the
   run ends. `RECOMP_AUDIO_WAV_SECS=N` caps it. Compare that with what you
   hear: a fault in the file is in the APU, a fault only in the speaker is
-  the host.
+  the host. The file is what was submitted, not what the device played:
+  when a period arrives late the device plays its own silence and the file
+  has no gap there. A clean WAV does not show continuous output; the
+  counters below do.
 - `RECOMP_AUDIO_HOST=1` covers the second case: it sets the device's
   consumed-sample count against the wall clock and prints
   `[AUDIO-HOST] starve wav=<sample> ms=<length>` wherever the device ran
-  out, indexed into the WAV, plus a once-a-second summary and front-end
+  out, indexed into the WAV. Small losses add up: twenty 5 ms gaps report
+  the same 100 ms as one 100 ms gap, in a few lines once each passes a
+  device buffer (the jitter allowed for). A loss counts only once the
+  device has run dry (an underrun), so a device clock slower than the
+  wall clock is not reported as silence. After a dry spell the accounted
+  part creeps up at most 200 ppm, so on a clock further off than that
+  (SDL's dummy driver) each dry spell can over-report by about a buffer,
+  and a single loss under one buffer is absorbed and never reported. A
+  pause the frame thread announces (the device drains) is not counted. The once-a-second summary
+  gives `wav=` (samples submitted), `played=` (samples the device
+  consumed), `starved_ms` (the silence it inserted, as reported so far)
+  with `pending_ms` (not yet reported), `refused=` (submits the backend
+  turned away: in the WAV, never played, each also logged), and front-end
   trap spells over 20 ms.
 - `RECOMP_APU_TRACE=1` (which also prints the first register accesses)
   adds the host lines above, `[APU-VSTAT]` once a second for each voice

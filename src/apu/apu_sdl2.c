@@ -125,6 +125,7 @@ int xa2_init(void)
     }
 
     g_frames_written = 0;
+    g_samples_queued = 0;
     g_dry = 0;
     g_initialized = 1;
     SDL_PauseAudioDevice(g_dev, 0);

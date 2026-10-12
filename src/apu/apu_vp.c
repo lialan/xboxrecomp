@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include "apu.h"
 #include "fpconv.h"
 
 /* #define DEBUG_MCPX */
@@ -760,11 +761,12 @@ static FILE *s_vdump;
 static FILE *s_vdump_all[MCPX_HW_MAX_VOICES];
 static uint8_t s_vdump_failed[MCPX_HW_MAX_VOICES]; /* open failed: no retry */
 static char s_vdump_prefix[512];
+static unsigned s_vstat_frames, s_vstat_secs;
 
 static void vp_stat_init(void)
 {
     const char *e;
-    s_vstat_on = getenv("RECOMP_APU_TRACE") != NULL;
+    s_vstat_on = apu_env_on("RECOMP_APU_TRACE");
     e = getenv("RECOMP_APU_VOICE_DUMP");
     if (e && *e) {
         const char *path = getenv("RECOMP_APU_VOICE_DUMP_FILE");
@@ -832,23 +834,22 @@ static void vp_stat_samples(uint32_t v, const float samples[][2], int n,
 
 static void vp_stat_report(void)
 {
-    static unsigned frames, secs;
     if (s_vstat_on <= 0 && s_vdump_voice == -1) return;
-    if (++frames % 1500) return;
+    if (++s_vstat_frames % 1500) return;
     /* Flush the dumps once a second, trace or not: a watchdog _exit or a
      * crash skips the stdio buffers. */
     if (s_vdump) fflush(s_vdump);
     for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++)
         if (s_vdump_all[v]) fflush(s_vdump_all[v]);
     if (s_vstat_on <= 0) return;
-    secs++;
+    s_vstat_secs++;
     for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         struct VpVoiceStat *s = &s_vstat[v];
         if (!s->frames) continue;
         fprintf(stderr, "[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
                 " rate=%.3f ea=%.2f vol=%03X/%03X bin=%u/%u addr=%08X %s"
                 " frames=%u rms=%.0f zcr=%.2f\n",
-                secs, v, s->fmt,
+                s_vstat_secs, v, s->fmt,
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0),
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_STEREO) != 0),
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE) >> ctz32(NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE)),
@@ -909,6 +910,7 @@ struct VpRing {
 static struct VpRing *s_ring[MCPX_HW_MAX_VOICES];
 static int s_ring_on = -1;
 static unsigned s_ring_logged;
+static unsigned s_ring_frames, s_ring_secs;
 
 static uint64_t ring_hash_block(MCPXAPUState *d, uint32_t ba, uint32_t off,
                                 uint32_t len)
@@ -970,7 +972,7 @@ static void vp_ring_check(MCPXAPUState *d, uint32_t v, uint32_t ba,
     uint32_t fpb;
 
     if (s_ring_on < 0)
-        s_ring_on = getenv("RECOMP_APU_RING") != NULL;
+        s_ring_on = apu_env_on("RECOMP_APU_RING");
     if (!s_ring_on || v >= MCPX_HW_MAX_VOICES || bytes < 2 * RING_BLK ||
         frame_bytes == 0 || RING_BLK % frame_bytes)
         return;
@@ -1601,14 +1603,13 @@ static void voice_process(MCPXAPUState *d,
  * times video or game events off a voice's play position follows this
  * clock; set against the flip count it shows whether audio runs fast or
  * slow relative to the frames. */
+static unsigned s_pos_frames;
+
 static void vp_trace_positions(MCPXAPUState *d)
 {
-    static int trace = -1;
-    static unsigned frames;
-
-    if (trace < 0)
-        trace = getenv("RECOMP_APU_TRACE") != NULL;
-    if (!trace || ++frames % 60)
+    if (s_vstat_on < 0)
+        vp_stat_init();
+    if (s_vstat_on <= 0 || ++s_pos_frames % 60)
         return;
 
     for (int list = 0; list < 3; list++) {
@@ -1670,11 +1671,8 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
     vp_trace_positions(d);
     vp_stat_report();
-    {
-        static unsigned ring_frames, ring_secs;
-        if (s_ring_on > 0 && ++ring_frames % 1500 == 0)
-            vp_ring_report(++ring_secs);
-    }
+    if (s_ring_on > 0 && ++s_ring_frames % 1500 == 0)
+        vp_ring_report(++s_ring_secs);
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
@@ -1701,9 +1699,30 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
     (void)d;
 }
 
+/* Shutdown, after the frame thread has stopped: close the voice dumps, free
+ * the ring monitors and clear the statistics, so a new instance reads the
+ * switches again and starts from nothing. */
 void mcpx_apu_vp_finalize(MCPXAPUState *d)
 {
     (void)d;
+    if (s_vdump)
+        fclose(s_vdump);
+    s_vdump = NULL;
+    for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        if (s_vdump_all[v])
+            fclose(s_vdump_all[v]);
+        s_vdump_all[v] = NULL;
+        free(s_ring[v]);
+        s_ring[v] = NULL;
+    }
+    memset(s_vdump_failed, 0, sizeof(s_vdump_failed));
+    memset(s_vstat, 0, sizeof(s_vstat));
+    s_vstat_on = -1;
+    s_vdump_voice = -1;
+    s_vstat_frames = s_vstat_secs = s_pos_frames = 0;
+    s_ring_on = -1;
+    s_ring_logged = 0;
+    s_ring_frames = s_ring_secs = 0;
 }
 
 void mcpx_apu_vp_reset(MCPXAPUState *d)

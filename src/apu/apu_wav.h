@@ -2,10 +2,14 @@
  * apu_wav.h -- the WAV tap on the APU's output (RECOMP_AUDIO_WAV).
  *
  * Writes exactly the samples handed to the host device -- 48 kHz, 16-bit
- * stereo, after the mixdown, tone and software mixer -- so what a check reads
- * is what was played. (One exception: a buffer XAudio2 refuses because its
- * queue is full is in the file but never played; pacing keeps the queue
- * below that.)
+ * stereo, after the mixdown, tone and software mixer. That is what the APU
+ * produced, not what the speaker played: when a period reaches the device
+ * late, the device plays silence of its own in the meantime, and the file
+ * has no hole there. Whether the output was continuous is measured from the
+ * device's consumption (RECOMP_AUDIO_HOST: [AUDIO-HOST] starve lines and
+ * starved_ms), never from this file alone. Also in the file but never
+ * played: a buffer the backend refuses ([AUDIO-HOST] refused; XAudio2 with
+ * its queue full, which pacing keeps it below).
  *
  * The header is valid at every point a run can end: it is rewritten with the
  * current sizes once per second of audio (so a hard kill loses at most the
