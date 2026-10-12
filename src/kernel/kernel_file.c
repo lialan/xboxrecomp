@@ -923,6 +923,8 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        /* Drop the search before the freed host handle value can be reused. */
+        xbox_dir_context_drop(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1151,6 +1153,24 @@ typedef struct {
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+
+/* An abandoned enumeration owns a separate DIR stream and a table slot.
+ * Neither may outlive its Nt handle: recycled handle values must start fresh. */
+void xbox_dir_context_drop(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init)
+        return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].handle == FileHandle) {
+            if (s_dir_contexts[i].dir)
+                closedir(s_dir_contexts[i].dir);
+            s_dir_contexts[i].dir = NULL;
+            s_dir_contexts[i].handle = NULL;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
