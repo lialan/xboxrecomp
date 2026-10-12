@@ -356,6 +356,11 @@ _RESULT_SNAPSHOT_SETTERS = frozenset({
     "and", "or", "xor", "adc", "sbb", "neg",
     "shl", "sal", "shr", "sar", "shld", "shrd",
     "add", "sub",
+    # xadd writes dst = dst + src and sets the flags from that sum; the lift
+    # publishes the sum into _fa/_fas next to the atomic (see the atomic
+    # read-modify-write lowering), so a jcc after it reads the snapshot and
+    # not the destination, which another thread may have moved on since.
+    "xadd",
 })
 # ...and the two whose conditions also need the SOURCE, to recover the
 # original destination from the result. Theirs goes into _fb, captured before
@@ -397,7 +402,6 @@ _EFLAGS_SETTERS = frozenset({
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
     "rdtsc", "cpuid",      # Special instructions
-    "lock xadd",           # Lock prefix - complex flag behavior
     # popfd REPLACES every flag with whatever was pushed. Its flags are not
     # architecturally undefined -- they are simply not knowable from the
     # instruction stream -- but the tracking action is the same: whatever the
@@ -981,12 +985,29 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return "(_fa != _fb)", desc
         return None
 
-    # ── xadd: exchange and add, flags from addition ──
+    # ── xadd: exchange and add, flags from the sum ──
+    #
+    # `lock xadd [refcount], -1 / jne` is InterlockedDecrement's shape, so a
+    # COM Release reads these flags to decide whether to destroy the object.
+    # Before the sum was snapshotted (and while "lock xadd" was listed as
+    # undefined flags) the jne fell to the `_flags` fallback, which is never
+    # assigned, and every Release took the destroy arm: a refcount of 2
+    # freed the object on the first Release and the second Release freed it
+    # again, corrupting the title's heap (Jet Set Radio Future, after
+    # Direct3D device creation).
     if flag_setter == "xadd":
         if jcc in ("je", "jz"):
             return f"({lhs} == 0)", desc
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
+        if jcc in ("js", "jl", "jnge"):
+            return f"({slhs} < 0)", desc
+        if jcc in ("jns", "jge", "jnl"):
+            return f"({slhs} >= 0)", desc
+        if jcc in ("jle", "jng"):
+            return f"({slhs} <= 0)", desc
+        if jcc in ("jg", "jnle"):
+            return f"({slhs} > 0)", desc
         return None
 
     # ── repe cmpsb / repne scasb: string comparison ──
@@ -1742,10 +1763,18 @@ class Lifter:
                 addr = _fmt_mem(ops[0])
                 src = _fmt_operand_read(ops[1])
                 if atomic_m == "xadd":
-                    # dst = dst + src, and src receives dst's old value.
+                    # dst = dst + src, and src receives dst's old value. The
+                    # flags come from the sum, which is snapshotted into
+                    # _fa/_fas here: the source operand is overwritten by the
+                    # old value in the same instruction, and the destination
+                    # may be changed by another thread before the jcc reads
+                    # it (_RESULT_SNAPSHOT_SETTERS explains the rule).
                     return [
-                        "{ uint32_t _old = RECOMP_ATOMIC_ADD32("
-                        f"XBOX_PTR({addr}), {src});",
+                        f"{{ uint32_t _add = {src};",
+                        "  uint32_t _old = RECOMP_ATOMIC_ADD32("
+                        f"XBOX_PTR({addr}), _add);",
+                        "  _fa = _old + _add; _fas = (int32_t)_fa;"
+                        f" /* {m} result */",
                         "  " + _fmt_operand_write(ops[1], "_old") + " }"
                         f"  /* {m} */",
                     ]
@@ -3992,6 +4021,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # Flags are undefined after these - clear tracking
             last_flag_setter = None
             last_flag_ops = []
+        elif curr.mnemonic in ("lock xadd", "lock cmpxchg"):
+            # Capstone keeps the lock prefix in the mnemonic; the flags are
+            # those of the bare instruction, which the lowering snapshots.
+            last_flag_setter = curr.mnemonic[5:]
+            last_flag_ops = list(curr.operands)
         elif curr.mnemonic in _EFLAGS_SETTERS:
             # Additional flag-setting instructions
             last_flag_setter, last_flag_ops = normalise_zero_test(
