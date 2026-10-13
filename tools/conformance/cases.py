@@ -504,11 +504,6 @@ CASES = [
          [(7.5, 3.0), (-7.5, 3.0), (7.5, -3.0), (0.0, 3.0),
           (100.0, 7.0), (2.5, 2.0)], "fpu"),
 
-    # ══ SSE ═════════════════════════════════════════════════════════════════
-    #
-    # All four lanes are compared, which is the whole point: modelling XMM as a
-    # scalar float made movaps move 4 of 16 bytes and nothing noticed.
-
     Case("fpu_nan_unordered",
          "comparing a value with itself is the isnan idiom; NaN is unordered",
          ["fld qword ptr [eax]", "fld qword ptr [eax]", "fucompp",
