@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "kernel_missing.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
 #include <stdlib.h>
@@ -456,6 +457,9 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
     DebugBreak();
 #endif
 
+    /* ExitProcess skips atexit. Guest code calls this, never from inside
+     * the report's lock, so the summary's list write may take it. */
+    xbox_missing_summary("bugcheck");
     ExitProcess(BugCheckCode);
 }
 
@@ -475,6 +479,9 @@ VOID __stdcall xbox_KeBugCheckEx(
     DebugBreak();
 #endif
 
+    /* ExitProcess skips atexit. Guest code calls this, never from inside
+     * the report's lock, so the summary's list write may take it. */
+    xbox_missing_summary("bugcheck");
     ExitProcess(BugCheckCode);
 }
 
