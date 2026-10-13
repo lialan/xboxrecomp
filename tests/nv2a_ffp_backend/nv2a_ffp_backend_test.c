@@ -29,6 +29,7 @@ static uint8_t s_mem[MEM_BYTES];
 /* ---- what the executor expects the runtime to provide ------------------ */
 ptrdiff_t xbox_GetMemoryOffset(void) { return (ptrdiff_t)s_mem; }
 uint32_t g_xbox_image_lo, g_xbox_image_hi;
+uint32_t g_xbox_stack_base, g_xbox_stack_size;   /* #189 made the stack placement runtime state */
 uint32_t xbox_ContiguousAllocatedBytes(void) { return 0; }
 void xbox_FramebufferWindowSet(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
 void xbox_FramebufferWindowSetAA(uint32_t sy) { (void)sy; }
