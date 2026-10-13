@@ -652,6 +652,65 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+#if !defined(_WIN32) && defined(__aarch64__)
+#include "../platform/mmio_decode_a64.h"
+#include <sys/mman.h>
+static size_t g_ac97_hsize;    /* host page: 16 KB on arm64 Darwin */
+
+static uint64_t ac97_posix_rd(void *dev, uint32_t off, int size)
+{
+    uint64_t v = 0;
+    memcpy(&v, (char *)dev + off, size > 8 ? 8 : size);
+    return v;
+}
+
+static void ac97_posix_wr(void *dev, uint32_t off, uint64_t v, int size)
+{
+    memcpy((char *)dev + off, &v, size > 8 ? 8 : size);
+}
+
+/* POSIX arm64 half of the AC'97 write trap: the page is PROT_READ, so a
+ * write arrives as SIGBUS/SIGSEGV; the title's fault handler reaches this
+ * through xbox_PosixMmioFault before reporting. The store is emulated onto
+ * the page (open for the moment), the controller's reaction applied, and the
+ * page closed again. Returns 1 when the fault was this trap and the access
+ * was serviced. */
+static volatile int g_ac97_posix_lock;
+
+int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
+{
+    int ok;
+
+    if (!g_ac97_page || fault < (uintptr_t)g_ac97_page
+            || fault >= (uintptr_t)g_ac97_page + g_ac97_hsize)
+        return 0;
+    /* One trap at a time. The page is open process-wide while the store is
+     * emulated, so a second thread trapping in that window would have its
+     * page closed under it by the first thread's mprotect and fault inside
+     * the emulation. Spin: the window is a few hundred instructions, and a
+     * plain store from another thread while the page is open is still
+     * caught by the sweep below if it lands before it; one landing between
+     * the sweep and the close keeps its RR bit until the next trap. That
+     * residual needs two threads resetting channels at once, which
+     * DirectSound's single-threaded init never does. */
+    while (__atomic_exchange_n(&g_ac97_posix_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    /* Not opened: the emulated store would fault again on this thread,
+     * which holds the lock it would then spin on. Let it be reported. */
+    if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ | PROT_WRITE) != 0) {
+        __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
+        return 0;
+    }
+    ok = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
+                          g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+    if (ok)
+        ac97_clear_reset_bits();
+    mprotect(g_ac97_page, g_ac97_hsize, PROT_READ);
+    __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
+    return ok;
+}
+#endif
+
 /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
  * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
  * channel has nothing to gain from it, and the page fault costs something. */
@@ -661,7 +720,31 @@ static void ac97_arm_write_trap(void)
 
     if (!g_mcpx_memory || g_ac97_page)
         return;
+#if !defined(_WIN32) && !defined(__aarch64__)
+    /* No POSIX decoder for this host's stores: a trapped write would be a
+     * fault nothing services. Leave the page writable. */
+    (void)old;
+    fprintf(stderr, "  AC97: bus-master write trap not available on this"
+                    " host; a channel reset will spin\n");
+    return;
+#endif
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
+#if !defined(_WIN32) && defined(__aarch64__)
+    (void)old;
+    g_ac97_hsize = (size_t)sysconf(_SC_PAGESIZE);
+    if (g_ac97_hsize < AC97_TRAP_BYTES)
+        g_ac97_hsize = AC97_TRAP_BYTES;
+    if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ) != 0) {
+        g_ac97_page = NULL;
+        fprintf(stderr, "  AC97: could not arm the bus-master write trap;"
+                        " a channel reset will spin\n");
+        return;
+    }
+    fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
+                    " (POSIX; channel reset completes on write)\n",
+            XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+    return;
+#endif
     /* First, so it runs before the game target's own crash reporter, which
      * would otherwise print the write as an access violation. */
     g_ac97_veh = AddVectoredExceptionHandler(1, ac97_write_veh);
@@ -681,6 +764,99 @@ static void ac97_arm_write_trap(void)
                     " (channel reset completes on write)\n",
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
 }
+
+/*
+ * Trapped-MMIO dispatch: one call for a title's fault handler.
+ *
+ * Three models answer hardware registers by faulting on them -- the APU, the
+ * AC'97 bus-master page and the USB OHCI controllers -- and each has its own
+ * handler. A title's fault handler had to call them one by one, and one whose
+ * handler missed a model died at that device's first register access. These
+ * route the fault to whichever model owns the address and return 1 when it
+ * was serviced, so the caller resumes the thread instead of reporting a
+ * crash. They only re-route: each model's own handler does the work.
+ */
+#include "apu/apu.h"
+#include "usb/ohci.h"
+
+#define MMIO_APU_BASE 0xFE800000u   /* what MemoryLayoutInit unmaps for the APU */
+#define MMIO_APU_END  0xFE880000u
+
+extern MCPXAPUState *g_apu_state;   /* apu_mmio_hook.c; NULL until audio is up */
+
+/* The guest VA a host fault address names. Only an address inside the 4 GB
+ * guest window names one: truncating the offset to 32 bits would let a host
+ * address far above it alias into a device range. */
+static int mmio_fault_va(uintptr_t fault, uint32_t *va)
+{
+    uintptr_t base = (uintptr_t)xbox_GetMemoryOffset();
+    uint64_t rel = (uint64_t)fault - (uint64_t)base;
+
+    if (fault < base || rel >= 0x100000000ull)
+        return 0;
+    *va = (uint32_t)rel;
+    return 1;
+}
+
+#if defined(_WIN32)
+extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                                 uint32_t fault_xbox_va, int is_write);
+
+/* Win32: call from the title's VEH for an access violation; on 1, return
+ * EXCEPTION_CONTINUE_EXECUTION. APU, then OHCI. The AC'97 page needs no call
+ * here: its trap is a VEH of its own, installed first, because it single-steps
+ * the write and so has to see the EXCEPTION_SINGLE_STEP that follows. */
+int xbox_VehMmioFault(void *exception_pointers)
+{
+    PEXCEPTION_POINTERS ep = (PEXCEPTION_POINTERS)exception_pointers;
+    uintptr_t fault;
+    uint32_t va;
+
+    if (!ep || ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return 0;
+    fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+    if (!mmio_fault_va(fault, &va))
+        return 0;
+    if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
+        return g_apu_state
+            && apu_hook_handle_mmio(ep->ContextRecord, fault, va,
+                   ep->ExceptionRecord->ExceptionInformation[0] ? 1 : 0);
+    if (xbox_OhciOwnsAddress(va))
+        return xbox_OhciHandleMmio(ep->ContextRecord, va);
+    return 0;
+}
+#else
+#if defined(__aarch64__)
+extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
+                                       uint32_t fault_xbox_va, int is_write);
+#endif
+
+/* POSIX: call from the title's SIGBUS/SIGSEGV handler (SA_SIGINFO) with its
+ * ucontext_t * and si_addr; on 1, return from the handler and the thread
+ * resumes after the emulated instruction. APU, then AC'97, then OHCI. Only
+ * arm64 hosts have a decoder; elsewhere nothing is trapped and this returns
+ * 0. */
+int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
+{
+#if defined(__aarch64__)
+    uint32_t va;
+
+    if (!mmio_fault_va(fault, &va))
+        return 0;
+    /* The APU decodes the direction from the opcode; is_write is advisory. */
+    if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
+        return g_apu_state
+            && apu_hook_handle_mmio_posix(ucv, fault, va, 0);
+    if (xbox_Ac97PosixFault(ucv, fault))
+        return 1;
+    if (xbox_OhciOwnsAddress(va))
+        return xbox_OhciHandleMmio(ucv, va);
+#else
+    (void)ucv; (void)fault;
+#endif
+    return 0;
+}
+#endif
 
 /*
  * Command words the DSP stub completes instantly. A bring-up probe, not a

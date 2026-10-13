@@ -321,10 +321,10 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 
     /* Try XAudio2 first (lower latency) */
     if (xa2_init()) {
-        fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
+        fprintf(stderr, "[APU] Using %s audio backend\n", XA2_BACKEND_NAME);
         return;
     }
-    fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
+    fprintf(stderr, "[APU] %s unavailable, falling back to waveOut\n", XA2_BACKEND_NAME);
 
     WAVEFORMATEX wfx = { 0 };
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
