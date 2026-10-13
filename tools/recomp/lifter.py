@@ -356,6 +356,11 @@ _RESULT_SNAPSHOT_SETTERS = frozenset({
     "and", "or", "xor", "adc", "sbb", "neg",
     "shl", "sal", "shr", "sar", "shld", "shrd",
     "add", "sub",
+    # xadd writes dst = dst + src and sets the flags from that sum; the lift
+    # publishes the sum into _fa/_fas next to the atomic (see the atomic
+    # read-modify-write lowering), so a jcc after it reads the snapshot and
+    # not the destination, which another thread may have moved on since.
+    "xadd",
 })
 # ...and the two whose conditions also need the SOURCE, to recover the
 # original destination from the result. Theirs goes into _fb, captured before
@@ -397,7 +402,6 @@ _EFLAGS_SETTERS = frozenset({
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
     "rdtsc", "cpuid",      # Special instructions
-    "lock xadd",           # Lock prefix - complex flag behavior
     # popfd REPLACES every flag with whatever was pushed. Its flags are not
     # architecturally undefined -- they are simply not knowable from the
     # instruction stream -- but the tracking action is the same: whatever the
@@ -984,12 +988,29 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return "(_fa != _fb)", desc
         return None
 
-    # ── xadd: exchange and add, flags from addition ──
+    # ── xadd: exchange and add, flags from the sum ──
+    #
+    # `lock xadd [refcount], -1 / jne` is InterlockedDecrement's shape, so a
+    # COM Release reads these flags to decide whether to destroy the object.
+    # Before the sum was snapshotted (and while "lock xadd" was listed as
+    # undefined flags) the jne fell to the `_flags` fallback, which is never
+    # assigned, and every Release took the destroy arm: a refcount of 2
+    # freed the object on the first Release and the second Release freed it
+    # again, corrupting the title's heap (Jet Set Radio Future, after
+    # Direct3D device creation).
     if flag_setter == "xadd":
         if jcc in ("je", "jz"):
             return f"({lhs} == 0)", desc
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
+        if jcc in ("js", "jl", "jnge"):
+            return f"({slhs} < 0)", desc
+        if jcc in ("jns", "jge", "jnl"):
+            return f"({slhs} >= 0)", desc
+        if jcc in ("jle", "jng"):
+            return f"({slhs} <= 0)", desc
+        if jcc in ("jg", "jnle"):
+            return f"({slhs} > 0)", desc
         return None
 
     # ── repe cmpsb / repne scasb: string comparison ──
@@ -1773,10 +1794,18 @@ class Lifter:
                 addr = _fmt_mem(ops[0])
                 src = _fmt_operand_read(ops[1])
                 if atomic_m == "xadd":
-                    # dst = dst + src, and src receives dst's old value.
+                    # dst = dst + src, and src receives dst's old value. The
+                    # flags come from the sum, which is snapshotted into
+                    # _fa/_fas here: the source operand is overwritten by the
+                    # old value in the same instruction, and the destination
+                    # may be changed by another thread before the jcc reads
+                    # it (_RESULT_SNAPSHOT_SETTERS explains the rule).
                     return [
-                        "{ uint32_t _old = RECOMP_ATOMIC_ADD32("
-                        f"XBOX_PTR({addr}), {src});",
+                        f"{{ uint32_t _add = {src};",
+                        "  uint32_t _old = RECOMP_ATOMIC_ADD32("
+                        f"XBOX_PTR({addr}), _add);",
+                        "  _fa = _old + _add; _fas = (int32_t)_fa;"
+                        f" /* {m} result */",
                         "  " + _fmt_operand_write(ops[1], "_old") + " }"
                         f"  /* {m} */",
                     ]
@@ -3856,7 +3885,36 @@ class Lifter:
         if m == "fld1":
             return [f"fp_push(1.0); /* fld1 */"]
 
+        if m in _FCMOV_JCC:
+            # Reached only when lift_basic_block had no tracked flag setter
+            # to build the condition from; `_flags` is what every other
+            # untracked flag reader falls back to (see _lift_cmovcc).
+            return [_fcmov_statement(insn, f"_flags /* {m} */")]
+
         return [f"/* FPU: {m} {insn.op_str} */"]
+
+
+# FCMOVcc moves st(i) into st(0) when an EFLAGS condition holds; each one
+# reads the same flags as the jcc named here (Intel SDM, FCMOVcc). They were
+# left as comments, so the move never happened. MSVC builds float min/max
+# from `fld a; fld b; fcom st(1); fnstsw ax; test ah, 1; fcmove st(0),
+# st(1); fxch st(1); fstp st(0)`: without the move such a min(x, 1.0)
+# always returned 1.0 and max(x, 0.0) always 0.0, which in one title reset
+# a screen fade to zero every frame and held the boot on its first logo.
+_FCMOV_JCC = {
+    "fcmovb": "jb", "fcmove": "je", "fcmovbe": "jbe", "fcmovu": "jp",
+    "fcmovnb": "jae", "fcmovne": "jne", "fcmovnbe": "ja", "fcmovnu": "jnp",
+}
+
+
+def _fcmov_statement(insn, cond_expr):
+    """`if (cond) st(0) = st(i);` for an FCMOVcc instruction. Capstone lists
+    both operands, (st(0), st(i)); the source is the last one."""
+    ops = insn.operands
+    i = (Lifter._st_index(ops[-1].reg)
+         if (ops and ops[-1].type == "reg" and ops[-1].reg) else 1)
+    return (f"if ({cond_expr}) fp_top() = {Lifter._st_expr(i)};"
+            f" /* {insn.mnemonic} {insn.op_str} */")
 
 
 def _is_rep_compare(insn):
@@ -4008,6 +4066,14 @@ def lift_basic_block(lifter, bb, flag_state=None):
                         if last_flag_setter else None)
             stmts.append(f"_fb = ({overflow[0] if overflow else '0'}) != 0; /* SAHF preserves OF */")
 
+        if curr.mnemonic in _FCMOV_JCC and last_flag_setter:
+            cond = _make_condition(_FCMOV_JCC[curr.mnemonic],
+                                   last_flag_setter, last_flag_ops)
+            if cond:
+                stmts.append(_fcmov_statement(curr, cond[0]))
+                i += 1
+                continue
+
         # NEG sets CF when its operand is nonzero. Preserve that value when
         # a later SBB/ADC consumes it, skipping over EFLAGS-preserving
         # instructions (e.g. neg eax; push edi; sbb eax, eax).
@@ -4059,6 +4125,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # Flags are undefined after these - clear tracking
             last_flag_setter = None
             last_flag_ops = []
+        elif curr.mnemonic in ("lock xadd", "lock cmpxchg"):
+            # Capstone keeps the lock prefix in the mnemonic; the flags are
+            # those of the bare instruction, which the lowering snapshots.
+            last_flag_setter = curr.mnemonic[5:]
+            last_flag_ops = list(curr.operands)
         elif curr.mnemonic in _EFLAGS_SETTERS:
             # Additional flag-setting instructions
             last_flag_setter, last_flag_ops = normalise_zero_test(
