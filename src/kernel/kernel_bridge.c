@@ -789,6 +789,8 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
          * backing view happened to contain shows up later as structures that
          * are "allocated" but full of garbage. */
         memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
+        /* Keep the arena from handing the same pages to someone else. */
+        xbox_ContiguousClaim(xbox_va, size);
 
         if (KERNEL_LOG_ON_HALF()) {
             fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
@@ -801,7 +803,28 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     }
 
     if (align < 4096) align = 4096;
-    xbox_va = xbox_ContiguousAlloc(size, align);
+    /* Lowest/highest are physical and inclusive; the window maps physical P
+     * at XBOX_CONTIG_BASE + P, so the arena can honour them directly. */
+    if (high < low) {
+        g_eax = 0;
+        return;
+    }
+    xbox_va = xbox_ContiguousAllocEx(size, align, low, high);
+
+    /* A refusal is the title's problem only if it says who asked: the guest
+     * return address and the stack above it (the XDK wrapper's callers). */
+    if (!xbox_va) {
+        static int n;
+        if (n++ < 8) {
+            int k;
+            fprintf(stderr, "  [CONTIG] refused: caller 0x%08X size=%u low=0x%08X "
+                    "high=0x%08X align=%u prot=0x%X stack:", g_xbox_kernel_caller,
+                    size, low, high, align, prot);
+            for (k = 5; k < 40; k++)
+                fprintf(stderr, " %08X", STACK_ARG(k));
+            fprintf(stderr, "\n");
+        }
+    }
 
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
@@ -817,7 +840,6 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
  */
 static void bridge_MmFreeContiguousMemory(void)
 {
-    extern int xbox_ContiguousFree(uint32_t addr);
     uint32_t addr = STACK_ARG(0);
     /* Contiguous blocks come from their own arena, not the heap: passing
      * them to xbox_HeapFree found nothing, so none ever came back. */
@@ -4197,7 +4219,6 @@ static void bridge_MmLockUnlockBufferPages(void)
  */
 static void bridge_MmQueryAllocationSize(void)
 {
-    extern uint32_t xbox_ContiguousBlockSize(uint32_t addr);
     uint32_t va = STACK_ARG(0);
     uint32_t n = xbox_ContiguousBlockSize(va);   /* XPhysicalSize asks this too */
     g_eax = n ? n : xbox_HeapBlockSize(va);
