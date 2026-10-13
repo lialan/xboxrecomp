@@ -161,6 +161,12 @@ class FunctionDetector:
         # from table/seed aliases that were absent from the earlier bodies.
         self._close_tail_jump_targets(sections)
 
+        # Branches out of alias bodies into unclaimed bytes. Runs last, once
+        # every alias is known, because those bodies exist only from here on.
+        self._pass_alias_branch_orphans()
+
+        self._build_alias_entries()
+
         # Populate call graph
         self._build_call_graph()
 
@@ -988,6 +994,74 @@ class FunctionDetector:
         if added:
             print("  conditional-branch orphans recovered as alias entries")
         return added
+
+    def _pass_alias_branch_orphans(self) -> bool:
+        """
+        A jump out of an alias body into bytes no body claims.
+
+        _pass_cond_branch_orphans does this for function bodies, but alias
+        bodies are only known after the passes that register them, so their
+        own branches were never looked at. When such a branch leaves the alias
+        for a block in a gap, the translator lowers it to a call to an
+        unresolved-target stub that pops only a return address -- the block
+        never runs and esp comes back short by whatever the block's own ret N
+        would have removed.
+
+        The shape that exposed it: a dispatcher reached only through a vtable
+        (so it became a tail-jump alias) that branches on its argument to two
+        blocks after its own `ret 0xc`. _pass_gap_prologues had already made
+        the first of them a function, which cut the alias short, and the
+        second fell in the gap between. Jet Set Radio Future's graphics device
+        wrapper (0x00154D70 -> 0x00154DAA) took exactly that path on every
+        Init, came back 12 bytes low, and the imbalance travelled up through
+        every lifted caller until a constructor wrote its result to the wrong
+        stack slot.
+
+        Same acceptance test as the function-body pass: the target must be
+        executable, in no body, and decode to a returning body or a block that
+        ends in a tail jump. Repeats until nothing new turns up, since a new
+        alias can branch onward itself.
+        """
+        added_any = False
+        while True:
+            bodies = sorted((f.start, f.end) for f in self.functions.values())
+            starts = [b[0] for b in bodies]
+            all_starts = sorted(set(starts) | set(self._alias_entries))
+
+            def claimed(addr: int) -> bool:
+                i = bisect.bisect_right(starts, addr) - 1
+                return i >= 0 and addr < bodies[i][1]
+
+            added = False
+            for alias, end in sorted(self._alias_entries.items()):
+                if alias in self.functions:
+                    continue
+                for insn in self.engine.get_instructions_in_range(alias, end):
+                    if not (insn.is_cond_jump or insn.is_jump):
+                        continue
+                    target = insn.jump_target
+                    if target is None or alias <= target < end:
+                        continue
+                    if (target in self._alias_entries or target in self.functions
+                            or target in self._candidates or claimed(target)):
+                        continue
+                    section = self.image.get_section_at_va(target)
+                    if section is None or not section.executable:
+                        continue
+                    if not (self.engine.probes_as_returning_body(target, max_insns=256)
+                            or self.engine.block_tail_jump(target) is not None):
+                        continue
+                    k = bisect.bisect_right(all_starts, target)
+                    stop = all_starts[k] if k < len(all_starts) else (section.virtual_addr
+                                                                     + section.virtual_size)
+                    self._alias_entries[target] = stop
+                    added = True
+            if not added:
+                break
+            added_any = True
+        if added_any:
+            print("  blocks recovered that alias bodies branch to")
+        return added_any
 
     def _build_alias_entries(self) -> None:
         """
