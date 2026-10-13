@@ -257,6 +257,13 @@ extern RECOMP_TLS int g_df;
 extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS uint16_t g_fp_cc;
+/* SSE control and status (MXCSR), reset value 0x1F80: every exception
+ * masked, rounding to nearest. Like the x87 control word it is guest state
+ * that STMXCSR stores and LDMXCSR loads; the host's MXCSR is never changed.
+ * The rounding-control bits (13-14) steer CVTSS2SI/CVTSD2SI. The exception
+ * flags (bits 0-5) are not modelled and read as clear, as the x87 status
+ * word's exception byte is not. */
+extern RECOMP_TLS uint32_t g_mxcsr;
 /* x87 precision control (control word bits 8-9). The stack is double-backed,
  * which matches PC=53 and is close enough for PC=64, but PC=24 -- what the
  * Xbox runs with -- rounds every arithmetic result to float. A title that
@@ -328,6 +335,19 @@ static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits)
     if(!isfinite(rounded) || rounded < -limit || rounded >= limit)
         return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
     return (int64_t)rounded;
+}
+
+/* CVTSS2SI/CVTSD2SI (and the truncating CVTT forms) to a 32-bit integer.
+ * The non-truncating forms round under MXCSR.RC (bits 13-14), which uses the
+ * x87 RC encoding, so recomp_frndint does the rounding. A C cast would always
+ * truncate, and is undefined out of range; the hardware answers NaN, the
+ * infinities and out-of-range values with the integer indefinite. */
+static inline int32_t recomp_cvt_si32(double value, uint32_t mxcsr, int truncate) {
+    double rounded = truncate ? (isfinite(value) ? trunc(value) : value)
+                              : recomp_frndint(value, (uint16_t)(((mxcsr >> 13) & 3u) << 10));
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
+        return (int32_t)0x80000000u;
+    return (int32_t)rounded;
 }
 
 /* ================================================================
