@@ -1985,6 +1985,11 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
 }
 #endif
 
+/* Menu and overlay vertex shaders skip the epilogue's divide-by-w: oPos.w is
+ * a written constant (0) and xy are already surface pixels. A w this small on
+ * all three vertices marks that path; anything else below it is the eye. */
+#define NV_CLIP_W 1e-3f
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
@@ -1993,7 +1998,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     const Nv2aVshOutput *v[3];
     const float *a, *b, *c;
     float area, su = 1.0f, sv = 1.0f;
-    int k;
+    int k, screen_space;
     static int no_rc = -1;
 
     if (no_rc < 0)
@@ -2010,7 +2015,16 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     T.a = a; T.b = b; T.c = c;
     if (T.bpp != 4 && T.bpp != 2)
         return;
-    if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
+    /* Menu and overlay shaders skip the epilogue's divide-by-w entirely:
+     * oPos.w is a written constant (0 in this title) and xy are already
+     * surface pixels. xemu's epilogue clamps such a w away from zero and
+     * carries on; there is no perspective here, so texture coordinates and
+     * colours interpolate linearly. A negative or tiny-but-mixed w is still
+     * the near-plane case and drops as before. */
+    screen_space = fabsf(a[3]) < NV_CLIP_W && fabsf(b[3]) < NV_CLIP_W
+                && fabsf(c[3]) < NV_CLIP_W;
+    if (!screen_space
+            && (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f)) {
         s_gpu.tris_behind++;
         return;
     }
@@ -2035,7 +2049,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         sv = (float)s_gpu.texs[0].height;
     }
     for (k = 0; k < 3; k++) {
-        T.iw[k] = 1.0f / v[k]->pos[3];
+        T.iw[k] = screen_space ? 1.0f : 1.0f / v[k]->pos[3];
         T.uv[k][0] = v[k]->tex[0][0] * su * T.iw[k];
         T.uv[k][1] = v[k]->tex[0][1] * sv * T.iw[k];
     }
@@ -2096,8 +2110,6 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
  * w = NV_CLIP_W (Sutherland-Hodgman, one plane), re-projected, and fanned.
  * ponytail: the near plane only; x/y/far fall to the rasteriser's bounds
  * check, which is correct, just slower for huge off-screen triangles. */
-#define NV_CLIP_W 1e-3f
-
 static void xf_to_clip(const Nv2aVshOutput *v, const float k[3],
                        const float o[3], float c[3])
 {
@@ -2130,6 +2142,15 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     }
     if (a->pos[3] <= NV_CLIP_W && b->pos[3] <= NV_CLIP_W
         && c->pos[3] <= NV_CLIP_W) {
+        /* Unless none of the three has a real w at all -- the menu/overlay
+         * path, where xy are surface pixels and w is a written constant.
+         * There is nothing to clip; the rasteriser's bounds check does the
+         * work and its iw=1 keeps interpolation linear. */
+        if (fabsf(a->pos[3]) < NV_CLIP_W && fabsf(b->pos[3]) < NV_CLIP_W
+                && fabsf(c->pos[3]) < NV_CLIP_W) {
+            raster_xf_triangle(a, b, c);
+            return;
+        }
         s_gpu.tris_behind++;                  /* wholly behind: nothing */
         return;
     }
@@ -2218,7 +2239,8 @@ static void raster_batch_program(void)
                         at->size, at->stride, in[0], in[1], in[2], in[3]);
             }
             {
-                static const uint32_t cs[] = {58, 59, 96, 97, 112, 113, 114, 115};
+                static const uint32_t cs[] = {58, 59, 96, 97, 112, 113, 114,
+                                              115, 190, 191};
                 for (i = 0; i < 8; i++) {
                     const float *c = nv2a_vsh_constant(cs[i]);
                     fprintf(stderr, "[VTRACE]   c[%u] %g %g %g %g%c", cs[i],
@@ -2904,6 +2926,34 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             && !(method >= 0x0B00 && method < 0x0C00))
             fprintf(stderr, "[FTRACE]   m %u:%04X = %08X%c", subch, method,
                     param, 10);
+    }
+    {
+        /* RECOMP_VSH_DUMP: constant-arrival watch. The UI program of this
+         * title reads c[191] and nothing writes it through the inline
+         * constant path, so every other channel that can reach the constant
+         * file has to be visible: the dedicated "set" methods (0x0A00-0x0B00,
+         * which is where the viewport scale/offset constants come from) and
+         * the transform block (0x1E00-0x1EFF). Per-method cap keeps a whole
+         * run's traffic to a few hundred lines. */
+        static int vdump = -1;
+        if (vdump < 0)
+            vdump = getenv("RECOMP_VSH_DUMP") != NULL;
+        if (vdump
+                && ((method >= 0x0A00 && method < 0x0B00)
+                    || (method >= 0x1E00 && method < 0x1F00))) {
+            static int shown[1024];
+            int slot = (method < 0x0B00) ? method - 0x0A00
+                                         : 0x100 + method - 0x1E00;
+            if (slot >= 0 && slot < 1024 && shown[slot]++ < 6)
+                fprintf(stderr, "  [VSH] s%u m %04X = %08X (%g)\n", subch,
+                        method, param, *(const float *)&param);
+        }
+        if (vdump && subch != 0) {
+            static int oshown[2048];
+            if (method / 2 < 2048 && oshown[method / 2]++ < 4)
+                fprintf(stderr, "  [VSH] NONZERO SUBCH s%u m %04X = %08X\n",
+                        subch, method, param);
+        }
     }
     if (subch == 0 && method >= NV_TEX_FIRST && method <= NV_TEX_LAST) {
         tex_stage_method(method, param);
