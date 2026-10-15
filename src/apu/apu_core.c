@@ -196,7 +196,11 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
 
     switch (addr) {
     case NV_PAPU_XGSCNT:
-        r = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100);
+        /* The sequencer's own sample counter, reset by a title write and
+         * advanced by the frame thread while the sequencer runs. It used to
+         * return the host clock divided by 100, which advances far too fast
+         * and in the wrong units for a title comparing it against SSL. */
+        r = d->sample_count;
         break;
     default:
         if (addr < 0x20000) {
@@ -205,10 +209,9 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
         break;
     }
 
-    /* Uncomment for register tracing:
-     * fprintf(stderr, "[APU] read  [0x%05llX] size=%u -> 0x%08llX\n",
-     *         (unsigned long long)addr, size, (unsigned long long)r);
-     */
+    if (getenv("RECOMP_APU_TRACE"))
+        fprintf(stderr, "[APU] read  [0x%05llX] size=%u -> 0x%08llX\n",
+                (unsigned long long)addr, size, (unsigned long long)r);
     (void)size;
     return r;
 }
@@ -218,13 +221,18 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
 {
     MCPXAPUState *d = (MCPXAPUState *)opaque;
 
-    /* Uncomment for register tracing:
-     * fprintf(stderr, "[APU] write [0x%05llX] size=%u <- 0x%08llX\n",
-     *         (unsigned long long)addr, size, (unsigned long long)val);
-     */
+    if (getenv("RECOMP_APU_TRACE"))
+        fprintf(stderr, "[APU] write [0x%05llX] size=%u <- 0x%08llX\n",
+                (unsigned long long)addr, size, (unsigned long long)val);
     (void)size;
 
     switch (addr) {
+    case NV_PAPU_XGSCNT:
+        /* Writing XGSCNT resets the sequencer's sample counter; the value
+         * the title writes (0, so far, always) becomes the new start. */
+        qatomic_set(&d->regs[addr], (uint32_t)val);
+        d->sample_count = val;
+        break;
     case NV_PAPU_ISTS:
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~(uint32_t)val);
         update_irq(d);
@@ -581,6 +589,28 @@ static void *mcpx_apu_frame_thread(void *arg)
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
+        }
+
+        /* The SSL tick: the sequencer's periodic sample-limit interrupt.
+         *
+         * DirectSound (Black, XDK 5849) resets XGSCNT to 0, programs SSL
+         * (0x800 = 2048 samples) and enables ISTS bit 3 in IEN. Its service
+         * routine -- dispatched on that bit, kicking the GP doorbell and
+         * reposting front-end commands -- is what lets the rest of
+         * DirectSound initialisation finish. Without the tick the title
+         * re-runs the sequencer setup forever and never gets past audio. */
+        {
+            uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
+            uint32_t ssl = qatomic_read(&d->regs[NV_PAPU_SSL]);
+            d->sample_count += NUM_SAMPLES_PER_FRAME;
+            if (ssl
+                    && d->sample_count >= ssl
+                    && (sectl & NV_PAPU_SECTL_XCNTMODE)
+                           != NV_PAPU_SECTL_XCNTMODE_OFF) {
+                d->sample_count -= ssl;
+                qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
+                d->set_irq = true;
+            }
         }
 
         /* What xemu's frame thread does after each frame: turn a pending
