@@ -11,6 +11,7 @@
  */
 
 #include "xinput_xbox.h"
+#include "mkb_input.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -144,8 +145,14 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     result = XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
-        if (dwPort == 0 && keyboard_enabled()) {
-            keyboard_state(pState);
+        if (dwPort == 0 && (keyboard_enabled() || mkb_enabled())) {
+            memset(pState, 0, sizeof *pState);
+            if (keyboard_enabled())
+                keyboard_state(pState);
+            /* Mouse+keyboard stands in for the pad entirely, so the game
+             * is playable on a machine with no controller plugged in. */
+            if (mkb_merge(dwPort, pState))
+                g_controller_connected[dwPort] = TRUE;
             return ERROR_SUCCESS;
         }
         return result;
@@ -206,6 +213,11 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
          * read as the same state and the press never happens. */
         pState->dwPacketNumber = kb.dwPacketNumber;
     }
+
+    /* Mouse+keyboard merges on top of a real pad too: the mouse owns the
+     * aim stick while it is moving, WASD owns movement while held. */
+    if (dwPort == 0)
+        mkb_merge(dwPort, pState);
 
     return ERROR_SUCCESS;
 }
