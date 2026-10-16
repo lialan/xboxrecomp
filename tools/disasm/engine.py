@@ -543,9 +543,38 @@ class DisasmEngine:
         function has them. So is a switch dispatch through a table that
         resync_jump_tables has measured: the probe continues in its arms.
         """
+        return self._probe_straight_line(addr, max_insns) == ("ret", None)
+
+    def probe_tail_call(self, addr: int,
+                        max_insns: int = 64) -> Optional[int]:
+        """
+        Where the body at `addr` tail-jumps, when the walk
+        probes_as_returning_body makes ends in a direct `jmp` out of the window
+        rather than a ret. None otherwise.
+
+        The tail jump on its own is not evidence -- data disassembles into a
+        stray `jmp` readily -- so this only reports the destination. A caller
+        that finds it is the exact start of a known function has a body that
+        ends in "return f(...)", which is how MSVC emits frameless wrappers and
+        the `mov eax, <FuncInfo>; jmp __CxxFrameHandler` handler thunks.
+        """
+        kind, target = self._probe_straight_line(addr, max_insns)
+        return target if kind == "tail" else None
+
+    def _probe_straight_line(self, addr: int, max_insns: int):
+        """Shared walk for the two probes above.
+
+        Returns ("ret", None), ("tail", target) for a direct jmp that leaves
+        the window or goes backwards, or (None, None) for anything else.
+
+        A walk that crossed int3 never counts as a tail call: it started in
+        alignment padding and ran into the function after it. One title has
+        an immediate naming the last int3 before a function that tail-jumps.
+        """
+        crossed_padding = False
         section = self.image.get_section_at_va(addr)
         if section is None or not section.executable:
-            return False
+            return None, None
         count = 0
         resume = addr
         # One pass per straight-line segment. A segment ends at a ret (yes),
@@ -559,15 +588,17 @@ class DisasmEngine:
         while resume is not None and count < max_insns:
             data = self.image.read_bytes_at_va(resume, (max_insns - count) * 8)
             if not data:
-                return False
+                return None, None
             limit = resume + len(data)
             start = resume
             resume = None
             for decoded in self._cs.disasm(data, start):
                 count += 1
                 mnemonic = decoded.mnemonic.lower()
+                if mnemonic == "int3":
+                    crossed_padding = True
                 if mnemonic in config.RET_MNEMONICS:
-                    return True
+                    return "ret", None
                 if mnemonic in config.JMP_MNEMONICS:
                     # An unconditional jump forward, still inside the window
                     # being probed, is ordinary control flow -- MSVC emits it
@@ -582,24 +613,26 @@ class DisasmEngine:
                     try:
                         ops = decoded.operands
                     except Exception:
-                        return False
+                        return None, None
                     if not ops:
-                        return False
+                        return None, None
                     if ops[0].type == CS_OP_MEM and ops[0].mem.index != 0:
                         arm = self._first_arm_after(
                             ops[0].mem.disp & 0xFFFFFFFF, decoded.address)
                         if arm is None:
-                            return False
+                            return None, None
                         resume = arm
                         break
                     if ops[0].type != CS_OP_IMM:
-                        return False
+                        return None, None
                     target = ops[0].imm & 0xFFFFFFFF
                     if not (decoded.address < target < limit):
-                        return False
+                        if crossed_padding:
+                            return None, None
+                        return "tail", target
                 if count >= max_insns:
-                    return False
-        return False
+                    return None, None
+        return None, None
 
     def probes_as_callback_body(self, addr: int, upper: int,
                                 lower: Optional[int] = None,

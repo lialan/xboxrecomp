@@ -323,6 +323,13 @@ class FunctionDetector:
             return addr
         return None
 
+    def _tail_calls_known_function(self, addr: int) -> bool:
+        """Does the straight-line body at `addr` end in a direct jmp to the
+        exact start of a function already built?"""
+        target = self.engine.probe_tail_call(addr)
+        return (target is not None and target != addr
+                and target in self.functions)
+
     def _pass_jump_table_followers(self, sections: List[SectionInfo]) -> bool:
         """A function that starts right after an embedded switch table.
 
@@ -859,6 +866,15 @@ class FunctionDetector:
             # dispatches through the vtable and is gone. Those are taken by
             # address and passed around as values, so an immediate is exactly
             # how they show up.
+            #
+            # ...or a body that ends by tail-jumping to the exact start of a
+            # known function when its first instruction is not the jmp:
+            # every C++ EH handler thunk, `mov eax, <FuncInfo>; jmp
+            # __CxxFrameHandler`, whose address the function's SEH prologue
+            # pushes as an immediate. A stray jmp decoded out of data almost
+            # never lands precisely on a function start, so the destination is
+            # the corroboration the missing ret would have been. One title lost
+            # three such thunks this way.
             # An address-taken direct thunk is also callable when its
             # destination supplies the return; tail closure finds that body.
             section = self.image.get_section_at_va(target)
@@ -870,7 +886,8 @@ class FunctionDetector:
                     or self.engine.probes_as_vcall_thunk(target)
                     or (self.engine.get_instruction(target) is not None
                         and self.engine.get_instruction(target).is_jump
-                        and self._probes_as_tail_body(target, starts, sections))):
+                        and self._probes_as_tail_body(target, starts, sections))
+                    or self._tail_calls_known_function(target)):
                 continue
             if target not in self.engine.instructions:
                 if not self.engine.decode_at(target):
