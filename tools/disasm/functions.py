@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from . import config
 from .engine import DisasmEngine, Instruction
-from .loader import MAX_INSN_LEN, BinaryImage, SectionInfo
+from .loader import DATA_SECTION_NAMES, MAX_INSN_LEN, BinaryImage, SectionInfo
 from .xrefs import XRefTracker
 from .labels import LabelManager, Label, LabelType
 
@@ -658,10 +658,23 @@ class FunctionDetector:
 
         call_targets = self.engine.get_call_targets()
         realigned = unaligned = 0
+        swept = {sec.name for sec in sections}
+        unswept: Dict[str, List[int]] = {}
         for target in call_targets:
             section = self.image.get_section_at_va(target)
             if not (section and section.executable):
                 continue
+            # A call into a code section the sweep skipped (an XDK library
+            # under --text-only without --extra-sections) still becomes a
+            # function below, but only down to decode_at's first terminator,
+            # and the calls inside it are never collected: every callee is a
+            # stub that returns without running. Spartan's XGAssembleShader
+            # was one, and its caller crashed on the out-buffer it never
+            # wrote. Nothing else reports the gap, so count it.
+            # Mirrors loader.get_code_sections(); keep the two in step.
+            if (section.name not in swept and section.raw_size > 0
+                    and section.name not in DATA_SECTION_NAMES):
+                unswept.setdefault(section.name, []).append(target)
             # A direct call to an executable address is the strongest evidence
             # of a function start there is -- stronger than a prologue match,
             # which is a guess about bytes. It used to be discarded whenever the
@@ -700,6 +713,10 @@ class FunctionDetector:
         if realigned or unaligned:
             print(f"  Realigned {realigned} call targets the sweep stepped over"
                   f" ({unaligned} rejected: bytes do not decode as a function)")
+        for name, targets in sorted(unswept.items()):
+            print(f"  Warning: {len(targets)} call target(s) into unswept code"
+                  f" section {name} (e.g. 0x{min(targets):08X}); their callees"
+                  f" will be stubs. Add it with --extra-sections {name}.")
 
     def _pass_indirect_call_slots(self) -> None:
         """
