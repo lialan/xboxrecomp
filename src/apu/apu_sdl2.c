@@ -45,6 +45,7 @@ static int       g_initialized;
 static int       g_audio_opened;    /* this backend brought SDL audio up */
 static int       g_frames_written;  /* periods handed to the queue */
 static unsigned  g_underruns;
+static uint64_t  g_samples_queued;  /* samples handed to the queue, ever */
 static int       g_dry;
 static int64_t   g_underrun_logged_ms;
 
@@ -124,6 +125,7 @@ int xa2_init(void)
     }
 
     g_frames_written = 0;
+    g_samples_queued = 0;
     g_dry = 0;
     g_initialized = 1;
     SDL_PauseAudioDevice(g_dev, 0);
@@ -171,6 +173,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         return 0;
     }
     g_frames_written++;
+    g_samples_queued += (uint64_t)num_samples;
     return 1;
 }
 
@@ -221,6 +224,17 @@ void xa2_expect_drain(void)
 unsigned xa2_underruns(void)
 {
     return g_underruns;
+}
+
+/* What the device thread has pulled off the queue; it pulls one device
+ * buffer per callback, so this leads the speaker by up to one buffer. */
+uint64_t xa2_samples_played(void)
+{
+    uint64_t queued;
+
+    if (!g_initialized || !g_dev) return 0;
+    queued = SDL_GetQueuedAudioSize(g_dev) / (SDLA_CHANNELS * sizeof(int16_t));
+    return g_samples_queued > queued ? g_samples_queued - queued : 0;
 }
 
 #endif /* !_WIN32 */

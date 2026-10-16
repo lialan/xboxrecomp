@@ -549,8 +549,38 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
  * renders nothing (front end trapped) spends none. */
 void mcpx_apu_pace_rendered(MCPXAPUState *d);
 
+/* Host starvation accounting (RECOMP_AUDIO_HOST; see apu_core.c). The
+ * deficit is the wall clock since the baseline, in samples, less what the
+ * device consumed; ref is the part of it already accounted for, as
+ * reported loss or as jitter and clock drift. Only a device that ran dry
+ * (its queue seen empty: an underrun) can have inserted silence, so a rise
+ * with no dry spell behind it is the device's clock, never loss. */
+typedef struct {
+    int64_t  t0_us;             /* baseline wall time */
+    uint64_t played0;           /* device samples consumed at the baseline */
+    int64_t  deficit;           /* at the last step, samples */
+    double   ref;               /* deficit accounted for, samples */
+    int64_t  ref_us;            /* last step */
+    int      dry;               /* ran dry since the last report */
+} ApuStarve;
+void apu_starve_rebase(ApuStarve *s, int64_t now_us, uint64_t played);
+/* One submit: the samples of silence the device inserted since the last
+ * report, once they exceed `jitter` (one device buffer), else 0. `dry`: the
+ * device ran dry since the previous step. */
+int64_t apu_starve_step(ApuStarve *s, int64_t now_us, uint64_t played,
+                        int jitter, int dry);
+
 /* Debug globals */
 extern MCPXAPUState *g_state;
 extern struct McpxApuDebug g_dbg, g_dbg_cache;
 extern int g_dbg_voice_monitor;
 extern uint64_t g_dbg_muted_voices[4];
+
+/* RECOMP_APU_TRACE: idle-voice traps against the frames that ran. Traps are
+ * counted under the APU lock, the rest by the frame thread. */
+typedef struct {
+    unsigned traps;             /* front-end traps latched (fe_method) */
+    unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
+    unsigned fe_trapped_frames; /* frames that found FECTL trapped */
+} ApuIrqStats;
+extern ApuIrqStats apu_irq_stats;

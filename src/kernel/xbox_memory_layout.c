@@ -780,6 +780,7 @@ static void ac97_arm_write_trap(void)
  * crash. They only re-route: each model's own handler does the work.
  */
 #include "apu/apu.h"
+#include "apu/apu_wav.h"
 #include "usb/ohci.h"
 
 #define MMIO_APU_BASE 0xFE800000u   /* what MemoryLayoutInit unmaps for the APU */
@@ -2374,6 +2375,10 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                     (unsigned)hi, (unsigned)lo);
         fflush(stderr);
     }
+    /* _exit skips atexit: finalise a RECOMP_AUDIO_WAV dump here, or up to
+     * its last second is past the header. Bounded, in case the frame
+     * thread is wedged inside a write. */
+    apu_wav_close_nowait(500);
     _exit(3);
     return 0;
 }
