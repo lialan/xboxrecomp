@@ -161,6 +161,12 @@ v0.14.0's resolver.
   system (Cmd going down releases the held keys).
 - Face buttons, shoulders and triggers read 255 held, 0 released; stick keys
   give full deflection, and opposite keys cancel.
+- Every key a binding can name is recorded, not only the map's (Space,
+  F-keys, the keypad, punctuation, Alt), and so are the mouse buttons the
+  window receives. A left or right Shift, Ctrl or Alt is recorded both as
+  its side's code (`VK_LSHIFT` ...) and as the either-side one (`VK_SHIFT`
+  ...), which, as before, goes up when either side does. None of these
+  extra keys is in the map, so the pad does not change.
 - `RECOMP_KEY_TRACE=1` logs the first 40 key-downs as `[KEY] down vk=0x..`.
 
 | Key | Guest control |
