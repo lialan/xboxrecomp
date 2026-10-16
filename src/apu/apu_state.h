@@ -487,6 +487,10 @@ struct MCPXAPUState {
 
     uint32_t regs[0x20000];
 
+    /* The sequencer's sample counter (what XGSCNT reads back). Resets when
+     * the title writes XGSCNT; advances 48 kHz while the sequencer runs. */
+    uint64_t sample_count;
+
     int ep_frame_div;
     int sleep_acc_us;
     int frame_count;
