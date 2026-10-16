@@ -39,6 +39,7 @@ int  xa2_get_buffer_size(void) { return 512; }
 int  xa2_get_buffer_count(void) { return 4; }
 unsigned xa2_underruns(void)   { return 0; }
 int  xa2_queued_samples(void)  { return 0; }
+uint64_t xa2_samples_played(void) { return 0; }
 void xa2_expect_drain(void)    {}
 int  xa2_submit_samples(const int16_t *s, int n) { (void)s; (void)n; return 1; }
 
