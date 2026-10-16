@@ -10,7 +10,9 @@
  * differ, and it has to keep moving.
  *
  * Also: the default map as binding text, which is what a port that lets the
- * player rebind starts from.
+ * player rebind starts from; and how the Win32 window turns key and mouse
+ * messages into side-specific and mouse-button codes (keyboard.c, so it is
+ * checked on every host).
  */
 #include "keyboard.h"
 #include "input_map.h"
@@ -244,10 +246,72 @@ static void test_bindings_text(void)
     }
 }
 
+/* ── the Win32 window's side-specific modifiers and mouse buttons ──────── */
+
+/* lParam as WM_KEYDOWN builds it: repeat count 1, scan code, extended flag. */
+static uint32_t key_lparam(unsigned scan, int extended)
+{
+    return 1u | (scan << 16) | ((uint32_t)extended << 24);
+}
+
+static void test_win32_messages(void)
+{
+    static const struct { int vk; unsigned scan; int ext; int side; } keys[] = {
+        { 0x10, 0x2A, 0, 0xA0 },    /* left Shift */
+        { 0x10, 0x36, 0, 0xA1 },    /* right Shift: its own scan code */
+        { 0x11, 0x1D, 0, 0xA2 },    /* left Ctrl (and AltGr's fake Ctrl) */
+        { 0x11, 0x1D, 1, 0xA3 },    /* right Ctrl: extended */
+        { 0x12, 0x38, 0, 0xA4 },    /* left Alt */
+        { 0x12, 0x38, 1, 0xA5 },    /* right Alt / AltGr: extended */
+        { 'A',  0x1E, 0, 0 },
+        { 0x0D, 0x1C, 1, 0 },       /* keypad Enter */
+        { 0x2E, 0x53, 1, 0 },       /* Delete */
+        { 0xA0, 0x2A, 0, 0 },       /* already a side code */
+    };
+    static const struct { unsigned msg; uint32_t wparam; int vk, down; } mouse[] = {
+        { 0x0201, 0x0001, 0x01, 1 }, { 0x0202, 0x0000, 0x01, 0 },
+        { 0x0204, 0x0002, 0x02, 1 }, { 0x0205, 0x0000, 0x02, 0 },
+        { 0x0207, 0x0010, 0x04, 1 }, { 0x0208, 0x0000, 0x04, 0 },
+        { 0x020B, 0x00010020, 0x05, 1 }, { 0x020C, 0x00010000, 0x05, 0 },
+        { 0x020B, 0x00020040, 0x06, 1 }, { 0x020C, 0x00020000, 0x06, 0 },
+        { 0x020B, 0x00030000, 0, -1 },  /* no such X button */
+        { 0x0200, 0x0000, 0, -1 },      /* WM_MOUSEMOVE */
+        { 0x0203, 0x0001, 0, -1 },      /* WM_LBUTTONDBLCLK: not a press here */
+        { 0x0100, 0x0041, 0, -1 },      /* WM_KEYDOWN */
+    };
+
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        int got = xbox_InputWin32SideVk(keys[i].vk, key_lparam(keys[i].scan, keys[i].ext));
+        CHECK(got == keys[i].side, "vk 0x%02X scan 0x%02X ext %d -> 0x%02X, want 0x%02X",
+              keys[i].vk, keys[i].scan, keys[i].ext, got, keys[i].side);
+        /* The key-up's lParam also has the previous-state and transition
+         * bits set; the side does not change. */
+        got = xbox_InputWin32SideVk(keys[i].vk, key_lparam(keys[i].scan, keys[i].ext) | 0xC0000000u);
+        CHECK(got == keys[i].side, "key-up vk 0x%02X -> 0x%02X", keys[i].vk, got);
+    }
+    for (size_t i = 0; i < sizeof mouse / sizeof mouse[0]; i++) {
+        int down = -1;
+        int vk = xbox_InputWin32MouseVk(mouse[i].msg, mouse[i].wparam, &down);
+        CHECK(vk == mouse[i].vk, "msg 0x%04X -> 0x%02X, want 0x%02X", mouse[i].msg, vk, mouse[i].vk);
+        if (mouse[i].down >= 0)
+            CHECK(down == mouse[i].down, "msg 0x%04X down %d", mouse[i].msg, down);
+    }
+
+    /* As the window records them: the side code beside wParam, and every
+     * side code and mouse button has a binding name. */
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++)
+        if (keys[i].side)
+            CHECK(xbox_InputMap_KeyName(keys[i].side) != NULL, "side 0x%02X unnamed", keys[i].side);
+    for (size_t i = 0; i < sizeof mouse / sizeof mouse[0]; i++)
+        if (mouse[i].vk)
+            CHECK(xbox_InputMap_KeyName(mouse[i].vk) != NULL, "button 0x%02X unnamed", mouse[i].vk);
+}
+
 int main(void)
 {
     test_equivalence();
     test_bindings_text();
+    test_win32_messages();
     printf("input_keyboard_map: %lu states compared, %d checks, %d failed\n",
            g_compared, g_checks, g_fail);
     return g_fail ? 1 : 0;

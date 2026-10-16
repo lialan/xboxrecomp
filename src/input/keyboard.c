@@ -37,6 +37,45 @@ void xbox_InputKeysClear(void)
     memset((void *)s_key_down, 0, sizeof s_key_down);
 }
 
+int xbox_InputWin32SideVk(int vk, uint32_t lparam)
+{
+    unsigned scan = (lparam >> 16) & 0xFF;
+    int extended = (lparam >> 24) & 1;
+
+    switch (vk) {
+    case XBOX_VK_SHIFT:
+        /* Right Shift is its own scan code, not an extended key. */
+        return scan == 0x36 ? XBOX_VK_RSHIFT : XBOX_VK_LSHIFT;
+    case XBOX_VK_CONTROL:
+        return extended ? XBOX_VK_RCONTROL : XBOX_VK_LCONTROL;
+    case XBOX_VK_MENU:
+        return extended ? XBOX_VK_RMENU : XBOX_VK_LMENU;
+    }
+    return 0;
+}
+
+int xbox_InputWin32MouseVk(unsigned msg, uint32_t wparam, int *down)
+{
+    /* winuser.h's message numbers; no window header here. */
+    switch (msg) {
+    case 0x0201: *down = 1; return XBOX_VK_LBUTTON;   /* WM_LBUTTONDOWN */
+    case 0x0202: *down = 0; return XBOX_VK_LBUTTON;   /* WM_LBUTTONUP */
+    case 0x0204: *down = 1; return XBOX_VK_RBUTTON;   /* WM_RBUTTONDOWN */
+    case 0x0205: *down = 0; return XBOX_VK_RBUTTON;   /* WM_RBUTTONUP */
+    case 0x0207: *down = 1; return XBOX_VK_MBUTTON;   /* WM_MBUTTONDOWN */
+    case 0x0208: *down = 0; return XBOX_VK_MBUTTON;   /* WM_MBUTTONUP */
+    case 0x020B:                                      /* WM_XBUTTONDOWN */
+    case 0x020C:                                      /* WM_XBUTTONUP */
+        *down = msg == 0x020B;
+        switch (wparam >> 16) {                       /* GET_XBUTTON_WPARAM */
+        case 1: return XBOX_VK_XBUTTON1;
+        case 2: return XBOX_VK_XBUTTON2;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 int xbox_FramebufferKeyDown(int vk)
 {
     if ((unsigned)vk > 255)

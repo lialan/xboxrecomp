@@ -89,6 +89,19 @@ extern "C" {
 void xbox_InputKeySet(int vk, int down);
 /* Release every key (focus lost). */
 void xbox_InputKeysClear(void);
+
+/* For the Win32 window (fb_present.c), here so every host tests them.
+ *
+ * WM_KEYDOWN reports both Shifts as VK_SHIFT, both Ctrls as VK_CONTROL and
+ * both Alts as VK_MENU. The side-specific code (VK_LSHIFT ...) for such a
+ * message, from its lParam (scan code in bits 16-23, extended-key flag in
+ * bit 24), or 0 for any other key. The window records it beside wParam, so
+ * a binding to "lshift" can be held. */
+int  xbox_InputWin32SideVk(int vk, uint32_t lparam);
+/* A WM_[LRMX]BUTTONDOWN/UP message as its VK (VK_LBUTTON ...), with *down
+ * set, or 0 for any other message. wparam is the message's wParam, whose
+ * high word says which X button. */
+int  xbox_InputWin32MouseVk(unsigned msg, uint32_t wparam, int *down);
 /* Non-zero while that virtual key is held in the game's window. Always zero
  * when there is no window, which is the right answer: with nothing to focus
  * there is nothing to type into. Kept under its old name for usb_gamepad.c's
