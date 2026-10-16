@@ -1107,8 +1107,9 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     size_t block_size;
 
     int adpcm_block_index = -1;
-    uint32_t adpcm_block[36 * 2 / 4];
-    int16_t adpcm_decoded[65 * 2];
+    /* Room for the largest block the MCPX accepts (see the check below). */
+    uint32_t adpcm_block[36 * ADPCM_MAX_BLOCKS / 4];
+    int16_t adpcm_decoded[65 * ADPCM_MAX_BLOCKS * 2];
 
     voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_NEW_VOICE, 0);
@@ -1167,6 +1168,17 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         (container_size_index == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM);
 
     if (adpcm) {
+        /* The block is 36 bytes per channel times the descriptor's 5-bit
+         * samples-per-block field, read into the fixed buffers above. A
+         * value past what they hold overran the stack. */
+        if (samples_per_block > ADPCM_MAX_BLOCKS) {
+            static int warned;
+            if (!warned++)
+                fprintf(stderr, "[APU] voice %u: ADPCM samples per block %u "
+                        "is above %d; voice skipped\n",
+                        v, samples_per_block, ADPCM_MAX_BLOCKS);
+            return -1;
+        }
         block_size = 36;
     } else {
         block_size = container_size;
