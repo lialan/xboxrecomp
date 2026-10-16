@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(nv2a_pvideo_test C)
+if(NOT WIN32)
+    message(FATAL_ERROR "The PVIDEO hook is Windows-only")
+endif()
 set(CMAKE_C_STANDARD 11)
 add_subdirectory(../.. runtime)
 add_executable(nv2a_pvideo_test test_main.c)
