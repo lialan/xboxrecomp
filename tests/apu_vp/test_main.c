@@ -7,6 +7,8 @@
  *     voice already at two).
  *   - voice_lock_*: VOICE_LOCK took d->lock, which the frame thread holds for
  *     a whole frame of voices, so a title's lock waited out the frame.
+ *   - gain_*: a volume change stepped at the frame boundary instead of
+ *     ramping across the frame.
  *
  * Run with: ctest --test-dir <build> */
 #include "../../src/apu/apu_vp.c"
@@ -160,6 +162,52 @@ static void voice_lock_waits_only_for_its_voice(void)
     CHECK(is_voice_locked(d, 3), "voice 3 is not locked");
 }
 
+/* Voice 100 (not 3D, so no HRTF) in multipass mode: its input is mixbin 20,
+ * held at 1.0, and only bin 1 is audible. Full volume for a frame, then
+ * silent: the second frame must fall from the first's level to nothing. */
+static void gain_ramps_across_a_frame(void)
+{
+    static MCPXAPUState d;
+    static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    const uint16_t v = 100;
+    const uint32_t vola_silent = 0xFFFFFFFFu;  /* every volume 0xFFF: off */
+    const uint32_t vola_full = vola_silent & ~NV_PAVS_VOICE_TAR_VOLA_VOLUME0;
+
+    memset(s_ram, 0, RAM_SIZE);
+    memset(&d, 0, sizeof(d));
+    d.regs[NV_PAPU_VPVADDR] = VOICE_BASE;
+    set_voice_reg(v, NV_PAVS_VOICE_CFG_FMT,
+                  NV_PAVS_VOICE_CFG_FMT_MULTIPASS | (20u << 16));
+    set_voice_reg(v, NV_PAVS_VOICE_PAR_STATE,
+                  NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);  /* envelopes off: 1.0 */
+    set_voice_reg(v, NV_PAVS_VOICE_CFG_VBIN, 1);              /* V0BIN = 1 */
+    set_voice_reg(v, NV_PAVS_VOICE_TAR_VOLB, 0xFFFFFFFFu);
+    set_voice_reg(v, NV_PAVS_VOICE_TAR_VOLC, 0xFFFFFFFFu);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+        mixbins[20][i] = 1.0f;
+
+    set_voice_reg(v, NV_PAVS_VOICE_TAR_VOLA, vola_full);
+    voice_process(&d, mixbins, d.vp.sample_buf, v, 0);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+        if (mixbins[1][i] != 1.0f) {
+            CHECK(0, "frame 1 sample %d is %f, expected the voice's level 1.0",
+                  i, mixbins[1][i]);
+            break;
+        }
+
+    memset(mixbins[1], 0, sizeof(mixbins[1]));
+    set_voice_reg(v, NV_PAVS_VOICE_TAR_VOLA, vola_silent);
+    voice_process(&d, mixbins, d.vp.sample_buf, v, 0);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        float expect = 1.0f - (float)(i + 1) / NUM_SAMPLES_PER_FRAME;
+        if (fabsf(mixbins[1][i] - expect) > 1e-6f) {
+            CHECK(0, "frame 2 sample %d is %f, expected the ramp's %f",
+                  i, mixbins[1][i], expect);
+            break;
+        }
+    }
+}
+
 int main(void)
 {
     s_ram = (uint8_t *)calloc(1, RAM_SIZE);
@@ -168,6 +216,7 @@ int main(void)
     voice_lock_waits_only_for_its_voice();
     adpcm_wide_block_decodes();
     adpcm_too_wide_block_is_refused();
+    gain_ramps_across_a_frame();
 
     free(s_ram);
     if (s_failures) {
@@ -175,6 +224,7 @@ int main(void)
         return 1;
     }
     puts("PASS: ADPCM blocks up to the hardware limit decode, wider ones are "
-         "refused, and VOICE_LOCK waits only for its own voice.");
+         "refused, VOICE_LOCK waits only for its own voice, and volume "
+         "changes ramp across a frame.");
     return 0;
 }

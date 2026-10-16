@@ -71,6 +71,7 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
+    d->vp.filters[v].gain_valid = false;     /* a new voice starts at its level */
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
     if (d->vp.filters[v].resampler) {
         src_reset(d->vp.filters[v].resampler);
@@ -1588,10 +1589,20 @@ static void voice_process(MCPXAPUState *d,
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
         g *= attenuate(vol[b]) / hr;
+        /* The volumes are target registers: the hardware moves the level
+         * toward them rather than jumping. Stepping to each frame's level
+         * every 32 samples turned a voice whose volume the title changes
+         * every frame (an engine that follows the revs) into a buzz at the
+         * frame rate. Ramp from the gain the last frame ended on. */
+        MCPXAPUVoiceFilter *f = &d->vp.filters[v];
+        float g0 = f->gain_valid ? f->gain_prev[b] : g;
+        float step = (g - g0) / NUM_SAMPLES_PER_FRAME;
+        f->gain_prev[b] = g;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            mixbins[bin[b]][i] += g * samples[i][b % channels];
+            mixbins[bin[b]][i] += (g0 + step * (i + 1)) * samples[i][b % channels];
         }
     }
+    d->vp.filters[v].gain_valid = true;
 
     /* VP monitor mix */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {

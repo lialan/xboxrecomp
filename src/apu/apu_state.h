@@ -387,6 +387,8 @@ typedef struct MCPXAPUVoiceFilter {
     int   rs_have;
     sv_filter svf[2];
     HrtfFilter hrtf;
+    float gain_prev[8];     /* each bin's gain at the end of the last frame */
+    bool gain_valid;
 } MCPXAPUVoiceFilter;
 
 typedef struct VoiceWorkItem {
