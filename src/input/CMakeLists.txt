@@ -23,3 +23,6 @@ if(MSVC)
 else()
     target_compile_options(xbox_input PRIVATE -Wall -Wextra -O2)
 endif()
+
+# The mapping rules (bindings, remapping, deadzones), also buildable alone.
+add_subdirectory(mapping)
