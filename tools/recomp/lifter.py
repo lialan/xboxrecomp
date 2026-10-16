@@ -3840,22 +3840,24 @@ class Lifter:
         #
         # These are exact-enough mappings onto libm. The 80-bit intermediates of
         # real x87 are not reproduced -- fp_stack is double -- which is the same
-        # approximation every other op here already makes.
+        # approximation every other op here already makes. fsin, fcos, fsincos
+        # and fptan go through the recomp_x87_* helpers, which reduce with the
+        # x87's 66-bit pi as the hardware does, inside the 2^63 range check.
         if m == "fsin":
-            return ["if (recomp_fp_trig_in_range(fp_top())) fp_top() = sin(fp_top()); /* fsin */"]
+            return ["if (recomp_fp_trig_in_range(fp_top())) fp_top() = recomp_x87_sin(fp_top()); /* fsin */"]
         if m == "fcos":
-            return ["if (recomp_fp_trig_in_range(fp_top())) fp_top() = cos(fp_top()); /* fcos */"]
+            return ["if (recomp_fp_trig_in_range(fp_top())) fp_top() = recomp_x87_cos(fp_top()); /* fcos */"]
         if m == "fsincos":
             # Replaces st0 with sin, then pushes cos. Order matters: the push
             # must see the sine already stored.
-            return [f"if (recomp_fp_trig_in_range(fp_top())) {{ double _a = fp_top(); fp_top() = sin(_a);"
-                    f" fp_push(cos(_a)); }} /* fsincos */"]
+            return ["if (recomp_fp_trig_in_range(fp_top())) { double _c;"
+                    " fp_top() = recomp_x87_sincos(fp_top(), &_c); fp_push(_c); } /* fsincos */"]
         if m == "fptan":
             # st0 = tan(st0), then push 1.0. The constant push is not decoration:
             # callers use it as the denominator of a subsequent fdiv.
             # An infinite or NaN operand pushes a NaN, not 1.0.
             return ["if (recomp_fp_trig_in_range(fp_top())) { double _a = fp_top();"
-                    " fp_top() = tan(_a); fp_push(isfinite(_a) ? 1.0 : _a - _a); } /* fptan */"]
+                    " fp_top() = recomp_x87_tan(_a); fp_push(isfinite(_a) ? 1.0 : _a - _a); } /* fptan */"]
         if m == "fpatan":
             # st1 = atan2(st1, st0), pop. Argument order is st1 over st0.
             return [f"{{ fp_st1() = atan2(fp_st1(), fp_top()); fp_pop(); }}"

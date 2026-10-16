@@ -399,6 +399,73 @@ static inline int recomp_fp_trig_in_range(double value) {
     return 1;
 }
 
+/* x87 FSIN, FCOS, FSINCOS and FPTAN values, for an operand that
+ * recomp_fp_trig_in_range has let through.
+ *
+ * The x87 reduces the operand modulo pi/4 with a 66-bit pi,
+ * 0xC90FDAA22168C234C * 2^-66, not the true pi libm reduces with. The
+ * reduced argument is off by k * (pi - pi66) / 4 for k eighth-turns removed,
+ * so the hardware returns f(x * (1 + D)), D = (pi - pi66) / pi66, where libm
+ * returns f(x). At x = 1e10 the two cosines differ in the 11th digit, and the
+ * x87's fsin(pi) is 1.2246063538223773e-16, not 1.2246467991473532e-16. A
+ * title that runs sin() on an accumulated, never-wrapped angle drifts from
+ * libm that way on a Pentium III, so the recompiled one has to drift too.
+ *
+ * 1 + D rounds to 1, so the shift is applied as a correction to libm's s and
+ * c by angle addition, in the versine form (v = 1 - cos e = 2 sin^2(e/2)):
+ * the correction stays small next to s and the sum rounds once, which keeps a
+ * result near a zero of the function accurate. Below |e| = 2^-26 (|x| under
+ * about 1.16e13) sin e is e and v is below half an ulp, so that costs no
+ * libm call beyond the other one of the pair. tests/x87_trig/model.py derives
+ * the vectors and the error budget (a third of the conformance tolerance).
+ * tan = sin/cos loses relative accuracy as cos(x * (1 + D)) nears 0, as the
+ * hardware's own tan does there; the budget sweep leaves out |cos| < 1e-2.
+ *
+ * For |x| <= pi/4 the hardware does no reduction and libm's value is
+ * returned as it is. No precision-control rounding: PC only narrows FADD,
+ * FSUB, FMUL, FDIV and FSQRT, and the transcendentals always deliver 64 bits.
+ * Inf and NaN give NaN (invalid is masked), as libm's do. */
+#define RECOMP_X87_PI66_D 1.2874146789751208e-21 /* 0x1.8518e2da2e893p-70 */
+static inline int recomp_x87_reduces(double x) {
+    return isfinite(x) && fabs(x) > 0.78539816339744830962;
+}
+static inline void recomp_x87_sincos_pi66(double x, double *s, double *c) {
+    double e = x * RECOMP_X87_PI66_D, se, v, sx = sin(x), cx = cos(x);
+    if (fabs(e) < 1.4901161193847656e-08) { /* 2^-26 */
+        se = e; v = 0.0;
+    } else {
+        double h = sin(0.5 * e);
+        se = sin(e); v = 2.0 * h * h;
+    }
+    *s = sx + (cx * se - sx * v);
+    *c = cx - (sx * se + cx * v);
+}
+static inline double recomp_x87_sin(double x) {
+    double s, c;
+    if (!recomp_x87_reduces(x)) return sin(x);
+    recomp_x87_sincos_pi66(x, &s, &c);
+    return s;
+}
+static inline double recomp_x87_cos(double x) {
+    double s, c;
+    if (!recomp_x87_reduces(x)) return cos(x);
+    recomp_x87_sincos_pi66(x, &s, &c);
+    return c;
+}
+/* Returns the sine; *c is the cosine FSINCOS then pushes. */
+static inline double recomp_x87_sincos(double x, double *c) {
+    double s;
+    if (!recomp_x87_reduces(x)) { *c = cos(x); return sin(x); }
+    recomp_x87_sincos_pi66(x, &s, c);
+    return s;
+}
+static inline double recomp_x87_tan(double x) {
+    double s, c;
+    if (!recomp_x87_reduces(x)) return tan(x);
+    recomp_x87_sincos_pi66(x, &s, &c);
+    return s / c;
+}
+
 static inline double recomp_fscale(double value, double scale) {
     if (isnan(value) || isnan(scale)) return value + scale;
     if (scale == INFINITY)
