@@ -39,5 +39,8 @@ else()
     )
     find_package(Threads REQUIRED)
     target_link_libraries(platform PUBLIC Threads::Threads recomp_exit_hook)
+    if(NOT APPLE)
+        target_link_libraries(platform PUBLIC m)   # feclearexcept etc.; libSystem has them on macOS
+    endif()
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()

@@ -94,6 +94,10 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
         s_fb_pitch = pitch;
 }
 
+/* ponytail: the SDL window shows the surface unscaled; 2x2 anti-aliased
+ * surfaces (#162) come through at twice the height until it honours this. */
+void xbox_FramebufferWindowSetAA(uint32_t sy) { (void)sy; }
+
 /* The window is opened by xbox_HostWindowMain, on the main thread. */
 void xbox_FramebufferWindowStart(void) {}
 

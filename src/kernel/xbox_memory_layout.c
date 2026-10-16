@@ -12,6 +12,9 @@
  * 4. Set memory protection (read-only for .rdata)
  */
 
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* glibc declares dladdr/Dl_info (RECOMP_WATCH) only under it */
+#endif
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "guest_vmem.h"
