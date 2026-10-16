@@ -1018,10 +1018,18 @@ static inline int recomp_parity8(uint32_t x) {
 }
 #define RECOMP_PARITY8(x) recomp_parity8((uint32_t)(x))
 
-/** Pop a 32-bit value from the simulated stack. */
+/**
+ * Pop a 32-bit value from the simulated stack.
+ * Writes dst AFTER incrementing sp: for `pop esp` (dst == sp) x86 leaves ESP
+ * equal to the popped value, not popped value + 4 (Intel SDM, POP). The old
+ * read-then-increment order left every lifted `pop esp` 4 bytes high, so the
+ * round-to-int idiom `push esp; push eax; ...; pop eax; pop esp` drifted the
+ * stack and later pops read the wrong slots.
+ */
 #define POP32(sp, dst) do { \
-    (dst) = MEM32(sp); \
+    uint32_t _pv = MEM32(sp); \
     (sp) += 4; \
+    (dst) = _pv; \
 } while(0)
 
 /* ================================================================
