@@ -440,6 +440,7 @@ _EFLAGS_PRESERVE = frozenset({
     # popfd does NOT -- see _FLAGS_UNDEFINED.
     "pushfd", "pushal", "pushad", "popal", "popad",
     "sgdt", "ljmp", "sfence",
+    "stmxcsr", "ldmxcsr",
     # SSE scalar float
     "movss", "movsd",
     "addss", "subss", "mulss", "divss",
@@ -1668,6 +1669,17 @@ class Lifter:
                  "movmskps",
                  "pand", "pandn", "por", "pxor", "pcmpgtd")                 or m in _SSE_CMP_NAMED:
             return self._lift_sse(insn, m, ops)
+
+        # ── SSE control and status ──
+        # Guest state like the x87 control word: a title reads MXCSR back
+        # to check the rounding mode (JSRF refuses to run a routine unless
+        # RC is nearest), so the store must not be dropped.
+        if m in ("stmxcsr", "ldmxcsr"):
+            if not ops or ops[0].type != "mem":
+                return self._unimplemented(insn, m)
+            if m == "stmxcsr":
+                return [f"MEM32({_fmt_mem(ops[0])}) = g_mxcsr; /* stmxcsr {insn.op_str} */"]
+            return [f"g_mxcsr = MEM32({_fmt_mem(ops[0])}); /* ldmxcsr {insn.op_str} */"]
 
         # ── FPU ──
         if m.startswith("f"):
@@ -3355,18 +3367,26 @@ class Lifter:
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
+        # CVTSS2SI/CVTSD2SI round by MXCSR.RC, the CVTT forms truncate; a
+        # C cast truncated both, and is undefined out of range.
         if m in ("cvtss2si", "cvttss2si"):
             if nops >= 2:
-                trunc = int(m == "cvttss2si")
-                return [_fmt_operand_write(ops[0], f"MMX_CVT_F2I({_sse_read(ops[1])}, {trunc})") + f" /* {m} */"]
+                trunc = 1 if m == "cvttss2si" else 0
+                return [_fmt_operand_write(
+                    ops[0], f"(uint32_t)recomp_cvt_si32((double){_sse_read(ops[1])}, g_mxcsr, {trunc})")
+                        + f" /* {m} */"]
         if m == "cvtsi2sd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(double)(int32_t){src}") + " /* cvtsi2sd */"]
         if m in ("cvtsd2si", "cvttsd2si"):
             if nops >= 2:
-                trunc = int(m == "cvttsd2si")
-                return [_fmt_operand_write(ops[0], f"recomp_sse_d2i({_sse_read(ops[1])}, {trunc})") + f" /* {m} */"]
+                trunc = 1 if m == "cvttsd2si" else 0
+                # The source is a double: lane 0 of an xmm register is .d[0].
+                src = f"{ops[1].reg}.d[0]" if _is_xmm(ops[1]) else _sse_read(ops[1])
+                return [_fmt_operand_write(
+                    ops[0], f"(uint32_t)recomp_cvt_si32({src}, g_mxcsr, {trunc})")
+                        + f" /* {m} */"]
         if m in ("cvtps2dq", "cvttps2dq") and nops >= 2:
             src = _packed_read(ops[1])
             return [_packed_write(ops[0], f"XMM_CVT_PS2DQ({src}, {int(m == 'cvttps2dq')})") + f" /* {m} */"]
