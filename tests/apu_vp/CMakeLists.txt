@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(apu_vp_test C)
+if(NOT WIN32)
+    message(FATAL_ERROR "The voice-lock checks use Windows threads")
+endif()
 set(CMAKE_C_STANDARD 11)
 add_subdirectory(../.. runtime)
 # test_main.c compiles apu_vp.c itself, to reach its static helpers, and

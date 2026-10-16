@@ -5,6 +5,8 @@
  *   - adpcm_*: the decode buffers held two 36-byte blocks' worth, so a
  *     wider samples-per-block value overran them on the stack (a mono
  *     voice already at two).
+ *   - voice_lock_*: VOICE_LOCK took d->lock, which the frame thread holds for
+ *     a whole frame of voices, so a title's lock waited out the frame.
  *
  * Run with: ctest --test-dir <build> */
 #include "../../src/apu/apu_vp.c"
@@ -105,11 +107,65 @@ static void adpcm_too_wide_block_is_refused(void)
           ADPCM_MAX_BLOCKS + 1, n);
 }
 
+static MCPXAPUState s_lock_d;
+static volatile LONG s_lock_done;
+
+static DWORD WINAPI lock_voice_3(LPVOID arg)
+{
+    (void)arg;
+    voice_lock(&s_lock_d, 3, true);
+    InterlockedExchange(&s_lock_done, 1);
+    return 0;
+}
+
+static int lock_finishes_within(DWORD ms)
+{
+    HANDLE t;
+    DWORD r;
+
+    InterlockedExchange(&s_lock_done, 0);
+    t = CreateThread(NULL, 0, lock_voice_3, NULL, 0, NULL);
+    r = WaitForSingleObject(t, ms);
+    CloseHandle(t);
+    return r == WAIT_OBJECT_0 && s_lock_done;
+}
+
+static void voice_lock_waits_only_for_its_voice(void)
+{
+    MCPXAPUState *d = &s_lock_d;
+    HANDLE t;
+
+    qemu_mutex_init(&d->lock);
+    qemu_cond_init(&d->cond);
+
+    /* The frame thread holds d->lock for a whole frame of voices. */
+    qemu_mutex_lock(&d->lock);
+    CHECK(lock_finishes_within(1000),
+          "VOICE_LOCK waited for d->lock, which the frame holds");
+    qemu_mutex_unlock(&d->lock);
+    CHECK(is_voice_locked(d, 3), "voice 3 is not locked");
+    CHECK(!is_voice_locked(d, 4), "voice 4 is locked");
+
+    /* While the processor mixes voice 3, a lock on it waits for that. */
+    voice_lock(d, 3, false);
+    voice_spin_lock(d, 3);
+    InterlockedExchange(&s_lock_done, 0);
+    t = CreateThread(NULL, 0, lock_voice_3, NULL, 0, NULL);
+    CHECK(WaitForSingleObject(t, 200) == WAIT_TIMEOUT,
+          "VOICE_LOCK did not wait while voice 3 was being mixed");
+    voice_spin_unlock(d, 3);
+    CHECK(WaitForSingleObject(t, 1000) == WAIT_OBJECT_0,
+          "VOICE_LOCK did not finish once voice 3 was mixed");
+    CloseHandle(t);
+    CHECK(is_voice_locked(d, 3), "voice 3 is not locked");
+}
+
 int main(void)
 {
     s_ram = (uint8_t *)calloc(1, RAM_SIZE);
     if (!s_ram) return 2;
 
+    voice_lock_waits_only_for_its_voice();
     adpcm_wide_block_decodes();
     adpcm_too_wide_block_is_refused();
 
@@ -119,6 +175,6 @@ int main(void)
         return 1;
     }
     puts("PASS: ADPCM blocks up to the hardware limit decode, wider ones are "
-         "refused.");
+         "refused, and VOICE_LOCK waits only for its own voice.");
     return 0;
 }

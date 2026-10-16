@@ -143,27 +143,34 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
+/* Per voice, as in xemu. A title's VOICE_LOCK arrives on its own thread while
+ * the frame thread holds d->lock across every voice of a frame, so taking
+ * d->lock here made each lock wait out the whole frame. The title only has to
+ * wait while the voice processor is working on the voice it locks. */
+static void voice_spin_lock(MCPXAPUState *d, uint16_t v)
+{
+    while (InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
+        SwitchToThread();
+}
+
+static void voice_spin_unlock(MCPXAPUState *d, uint16_t v)
+{
+    InterlockedExchange(&d->vp.voice_spin[v], 0);
+}
+
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    qemu_mutex_lock(&d->lock);
-
-    uint64_t mask = 1ULL << (v % 64);
-    if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
-    } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
-    }
-
+    voice_spin_lock(d, v);
+    d->vp.voice_locked[v] = lock;
+    voice_spin_unlock(d, v);
     qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    uint64_t mask = 1ULL << (v % 64);
-    return (qatomic_read(&d->vp.voice_locked[v / 64]) & mask) != 0;
+    return d->vp.voice_locked[v] != 0;
 }
 
 /* ============================================================
@@ -1675,7 +1682,9 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                     fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
                 /* Process voice directly (single-threaded) */
+                voice_spin_lock(d, v);
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                voice_spin_unlock(d, v);
             }
             d->regs[current] = d->regs[next];
         }
@@ -1744,7 +1753,7 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     memset(d->vp.ssl, 0, sizeof(d->vp.ssl));
     memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
-    memset(d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
+    memset((void *)d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         hrtf_filter_init(&d->vp.filters[v].hrtf);
     }
