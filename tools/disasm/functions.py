@@ -143,6 +143,11 @@ class FunctionDetector:
             self.functions.clear()
             self._build_functions(sections)
 
+        # A function that begins immediately after an embedded switch table.
+        if self._pass_jump_table_followers(sections):
+            self.functions.clear()
+            self._build_functions(sections)
+
         # A function that begins immediately after a ret, with no padding.
         if self._pass_gap_prologues(sections):
             self.functions.clear()
@@ -186,6 +191,222 @@ class FunctionDetector:
                   f"{len(self._alias_entries)} aliases")
             self.functions.clear()
             self._build_functions(sections)
+
+    # MSVC's alignment fillers: int3, nop, `mov edi, edi`, and `lea r, [r]`
+    # in its 3-, 4-, 6- and 7-byte encodings.
+    _PADDING = (bytes.fromhex("8da42400000000"), bytes.fromhex("8d9b00000000"),
+                bytes.fromhex("8d642400"), bytes.fromhex("8d4900"),
+                bytes.fromhex("8bff"), b"\xcc", b"\x90")
+
+    def _skip_padding(self, addr: int, limit: int = 16) -> int:
+        """First address at or after `addr` that is not alignment padding.
+
+        Reads bytes rather than decoded instructions: after a table the
+        sweep's decode is often out of phase, and an instruction that starts
+        inside the table can swallow the padding."""
+        data = self.image.read_bytes_at_va(addr, limit + 7) or b""
+        off = 0
+        while off < limit:
+            for pad in self._PADDING:
+                # `mov edi, edi` is also the first instruction of a hot-patch
+                # function. As table padding it fills exactly two bytes up to
+                # a dword boundary, so it only sits 2 bytes past one. A
+                # function start is aligned, so the two never coincide.
+                if pad == b"\x8b\xff" and (addr + off) % 4 != 2:
+                    continue
+                if data.startswith(pad, off):
+                    off += len(pad)
+                    break
+            else:
+                break
+        return addr + off
+
+    # Frame setups that end an index-table walk early: `push ebp; mov ebp,
+    # esp`, with or without the hot-patch pad in front.
+    _FRAME_STARTS = (bytes.fromhex("558bec"), bytes.fromhex("8bff558bec"))
+
+    def _index_table_end(self, addr: int, arms: int) -> Optional[int]:
+        """End of the byte index table at `addr` feeding `arms` dword entries,
+        or None when it cannot be sized safely.
+
+        The bound check in front of the load gives the length exactly; see
+        engine.index_table_length. Without it, the entries are known only to
+        be below `arms`, and the first byte that is not marks the end. That is
+        safe only when no opcode that starts a function is below `arms`. For a
+        switch of 16 arms or fewer it is: such bytes are `add` and `or`. For a
+        larger one a walk can run into the next function. A 96-arm switch
+        walks over `push ebp` (0x55) and starts the function one byte late,
+        without its frame. So a large walk also stops at a frame setup or a
+        known start, and otherwise is trusted only when padding or another
+        dword table follows it.
+        """
+        data = self.image.read_bytes_at_va(addr, 1024) or b""
+        length = self.engine.index_table_length(addr)
+        if length is not None:
+            if length == 0 or length > len(data):
+                return None
+            if any(b >= arms for b in data[:length]):
+                return None                 # not the table the bound guards
+            return addr + length
+        off = 0
+        stopped = False
+        while off < len(data) and data[off] < arms:
+            if arms > 0x0F and off and (
+                    any(data.startswith(f, off) for f in self._FRAME_STARTS)
+                    or addr + off in self._candidates):
+                stopped = True
+                break
+            off += 1
+        if off == 0:
+            return None
+        end = addr + off
+        if arms <= 0x0F or stopped:
+            return end
+        if self._skip_padding(end) != end:
+            return end
+        if end % 4 == 0 and (end in self.engine.jump_tables
+                             or self.engine.is_jump_table_ref(end)):
+            return end
+        return None
+
+    def _past_switch_data(self, addr: int, arms: int) -> Optional[int]:
+        """Skip the padding and switch tables that follow a measured table.
+
+        The tables of several switches in one function sit together after
+        its last ret. Each dword table may have a byte index table after it,
+        and padding goes between them. Some dword tables have fewer than 3
+        entries, so resync_jump_tables did not measure them, but a
+        `jmp [reg*4 + disp]` still names them. Returns the first address past
+        all of that, or None when the bytes cannot be sized.
+        """
+        for _ in range(16):
+            addr = self._skip_padding(addr)
+            if addr in self.engine.jump_tables:
+                end = self.engine.jump_tables[addr]
+                arms = (end - addr) // 4
+                addr = end
+                continue
+            if self.engine.is_jump_table_ref(addr):
+                section = self.image.get_section_at_va(addr)
+                if section is None:
+                    return None
+                lo = section.virtual_addr
+                hi = lo + section.virtual_size
+                arms = 0
+                while arms < 512:
+                    value = self.image.read_u32_at_va(addr + arms * 4)
+                    if value is None or not (lo <= value < hi):
+                        break
+                    arms += 1
+                if arms == 0:
+                    return None
+                addr += arms * 4
+                continue
+            data = self.image.read_bytes_at_va(addr, 2) or b""
+            # An index table: one a load names, or two bytes below `arms`
+            # when nothing does. Those are a table even when no instruction
+            # names them: a switch whose lowest case is not 0 folds
+            # the bias into the displacement, so the reference points a few
+            # bytes before the table instead of at it.
+            #
+            # Only for a small switch, though: a byte below `arms` has to be
+            # implausible as the start of a function, and 0x0F and 0x33
+            # (`movzx`, `xor eax, eax`) are not.
+            if addr in self.engine.byte_tables or (
+                    arms <= 0x0F and len(data) >= 2
+                    and data[0] < arms and data[1] < arms):
+                end = self._index_table_end(addr, arms)
+                if end is None:
+                    return None
+                addr = end
+                continue
+            return addr
+        return None
+
+    def _pass_jump_table_followers(self, sections: List[SectionInfo]) -> bool:
+        """A function that starts right after an embedded switch table.
+
+        MSVC parks a function's jump table after its last ret, aligned with
+        int3 or `mov edi, edi`, and the linker packs the next function straight
+        after the table. Nothing marks that start. _pass_cc_boundaries wants
+        a ret or jmp in front of an int3 run, and finds a table instead;
+        _pass_gap_prologues looks only after a ret. A function whose address
+        is only ever stored into a callback slot is reached by no call or jmp
+        either. A frameless callback packed after a four-entry table is that
+        shape, and it needed a hand seed before this pass.
+
+        The address is the first byte past the table and anything packed
+        after it: padding, further dword tables, and byte index tables. It
+        becomes a start when it is in a gap, is not a switch arm, and decodes
+        to a terminator, the same test a realigned call target gets. The gap
+        is the important test. A table in the middle of a function is followed
+        by more of that function, and that function's body already covers the
+        address. The data is the main risk: index tables decode as `add` and
+        reach a `retf` soon enough. They are stepped over or refused, never
+        probed.
+
+        On one title this finds 37 starts. 35 were reachable before only as
+        aliases inside a false function that _pass_gap_prologues had started
+        on the `mov edi, edi` in front of a table.
+
+        Returns whether anything was added, so the caller can rebuild.
+        """
+        if not self.engine.jump_tables:
+            return False
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+        code_ranges = [(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+                       for sec in sections]
+
+        def in_a_gap(addr: int) -> bool:
+            i = bisect.bisect_right(starts, addr) - 1
+            return not (i >= 0 and addr < bounds[i][1])
+
+        # A switch arm is code of the function that dispatches to it, and
+        # MSVC's memcpy keeps arms straight after a table. A start there
+        # clamps the function it belongs to, so arms are never followers.
+        arms = set()
+        for tbl in self.engine.jump_tables:
+            arms.update(self.engine.jump_table_entries(tbl))
+
+        found = 0
+        for tbl, end in sorted(self.engine.jump_tables.items()):
+            addr = self._past_switch_data(end, (end - tbl) // 4)
+            if addr is None or addr in arms:
+                continue
+            # Opcodes 0x00-0x0E are `add`, `or` and segment pushes. No function
+            # starts with one, but every index table does, because its bytes
+            # are small arm numbers. This catches the ones the walk above could
+            # not size.
+            first = self.image.read_bytes_at_va(addr, 1)
+            if not first or first[0] < 0x0F:
+                continue
+            if addr in self._candidates or addr in self.functions:
+                continue
+            if not any(lo <= addr < hi for lo, hi in code_ranges):
+                continue
+            if not in_a_gap(addr):
+                continue
+            # The sweep may have decoded the tables as code and run across
+            # this address. A decode that starts inside the tables says
+            # nothing. One that starts before them does, as it does for an
+            # immediate.
+            covering = self.engine.instruction_covering(addr)
+            if (covering is not None and covering.address < tbl
+                    and not self.engine.probes_as_prologue(addr)):
+                continue
+            if not self.engine.probes_as_function_body(addr):
+                continue
+            if addr not in self.engine.instructions \
+                    and not self.engine.decode_at(addr):
+                continue
+            self._add_candidate(addr, config.CONFIDENCE_CC_BOUNDARY,
+                                "jump_table_follower")
+            found += 1
+
+        if found:
+            print(f"  {found} function(s) found right after a switch table")
+        return found > 0
 
     def _pass_gap_prologues(self, sections: List[SectionInfo]) -> bool:
         """A function that starts right after a ret, with no padding between.
