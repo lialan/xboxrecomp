@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from . import config
 from .engine import DisasmEngine, Instruction
-from .loader import BinaryImage, SectionInfo
+from .loader import MAX_INSN_LEN, BinaryImage, SectionInfo
 from .xrefs import XRefTracker
 from .labels import LabelManager, Label, LabelType
 
@@ -1333,12 +1333,27 @@ class FunctionDetector:
             if not (i >= 0 and addr < bodies[i][1]) and section is not None:
                 # Only the backed bytes are code; a virtual tail past them
                 # is zero-filled, and reading on reaches the next section.
+                # The section data carries just enough of that fill to finish
+                # an instruction cut by raw_size (Spartan's D3DX `ret 0x10`),
+                # and none starts in it, so its length is the bound.
+                # The file bytes that are also inside the virtual range.
+                backed_end = section.virtual_addr + min(section.virtual_size,
+                                                        section.raw_size)
                 end = min(end, section.virtual_addr
-                          + min(section.virtual_size, section.raw_size))
+                          + len(self.image.get_section_data(section)))
                 body_end = self._find_function_end(addr, end, end)
                 k = bisect.bisect_left(starts, max(body_end, addr + 1))
                 if k < len(starts):
                     end = min(end, starts[k])
+                # An alias that runs to the section bound owns the fill only
+                # as far as the instruction it finishes, not all 14 bytes.
+                # Only an instruction starting within one instruction length
+                # of the cut can cross it.
+                if end > backed_end:
+                    lo = max(addr, backed_end - (MAX_INSN_LEN - 1))
+                    end = min(end, max([backed_end] + [
+                        insn.end_address for insn in
+                        self.engine.get_instructions_in_range(lo, backed_end)]))
             insns = self.engine.get_instructions_in_range(addr, end)
             if not insns:
                 continue

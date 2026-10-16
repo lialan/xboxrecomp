@@ -76,6 +76,32 @@ class Instruction:
         return d
 
 
+def _file_end(section, data) -> int:
+    """VA where a section's file bytes end.
+
+    get_section_data appends a little of the loader's zero fill so that an
+    instruction starting in the file bytes can finish (BinaryImage
+    .get_section_data says why). No instruction may start in that fill:
+    decoding it would hand every title zeros dressed up as code.
+
+    linear_sweep and decode_at are the only places that insert into
+    `instructions`, so they are the only ones that need this bound. The
+    other readers of get_section_data only test bytes: the prologue-shape
+    and terminator helpers here decode zeros as `add [eax], al`, which is
+    neither; the prologue and CC-padding passes in functions.py match
+    nothing in zeros and only add candidates at addresses already decoded.
+    labels.py's string scan reads .rdata, which XBEs flag executable, so it
+    gets the fill too: a string running up to .rdata's raw end now finds
+    its terminator in the fill and gets a label, as the loaded image would
+    have it. The gap-alias clamp in functions.py ends an alias past raw_size
+    only at the end of the instruction that crosses it, or at raw_size.
+    """
+    raw = getattr(section, "raw_size", None)
+    if raw is None:
+        raw = len(data)
+    return section.virtual_addr + min(raw, len(data))
+
+
 class DisasmEngine:
     """
     x86-32 disassembly engine backed by Capstone.
@@ -219,7 +245,8 @@ class DisasmEngine:
             return 0
 
         va_start = section.virtual_addr
-        total = len(data)
+        file_end = _file_end(section, data)
+        total = file_end - va_start
         count = 0
         offset = 0
 
@@ -230,6 +257,8 @@ class DisasmEngine:
             last_end_offset = offset
 
             for cs_insn in self._cs.disasm(chunk, chunk_va):
+                if cs_insn.address >= file_end:
+                    break  # the loader's zero fill finishes, never starts, code
                 insn = self._classify_instruction(cs_insn)
                 self.instructions[insn.address] = insn
                 count += 1
@@ -453,12 +482,15 @@ class DisasmEngine:
             return 0
 
         offset = addr - section.virtual_addr
-        if offset < 0 or offset >= len(data):
+        file_end = _file_end(section, data)
+        if offset < 0 or addr >= file_end:
             return 0
 
         added = 0
         overlaps = set()
         for cs_insn in self._cs.disasm(data[offset:], addr):
+            if cs_insn.address >= file_end:
+                break
             if cs_insn.address != addr and cs_insn.address in self.instructions:
                 break  # resynced with the existing stream
             if replace_overlaps:
