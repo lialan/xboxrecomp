@@ -148,6 +148,12 @@ virtual-key codes, and the SDL window on macOS and Linux turns SDL keycodes
 into the same codes (`keyboard_sdl.c`). `tests/input_keyboard` checks every
 row against an independent copy of this table.
 
+The map is resolved by the mapping rules below (`input_map.c`), as the
+bindings `xbox_InputKeyboardBindings` builds from it, so a named binding and
+the map read the same table. The pad is the same as before the map used them:
+`tests/input_keyboard_map` compares it, byte for byte, with a frozen copy of
+v0.14.0's resolver.
+
 - Keys are read only while the game's window has the focus. Losing the
   focus (and on SDL, hiding or minimising the window) releases every key.
 - Letters follow the keyboard layout (the key labelled Z), not the physical
@@ -183,6 +189,12 @@ row against an independent copy of this table.
 | K | Right stick down |
 | J | Right stick left |
 | L | Right stick right |
+
+As binding text (`xbox_InputMap_BindingsFormat`), the same map is
+`dpad_up = up`, `start = enter`, `back = backspace`, `left_thumb = shift`,
+`right_thumb = ctrl`, `a = Z` ... `white = Q`, `left_trigger = 1`,
+`left_stick_up = W, Numpad8` and so on: a port that lets the player rebind
+starts from that.
 
 ## Bindings, remapping and deadzones
 

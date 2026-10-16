@@ -8,6 +8,9 @@
  * (fb_present_sdl.c). Reader: xbox_InputGetState() for port 0, through
  * xbox_InputKeyboardPoll().
  *
+ * The map is resolved by the mapping rules of input_map.h, which read this
+ * same table, so named bindings and the map share one key space.
+ *
  * No window or SDL header here, so tests/input_keyboard checks the map on
  * every host.
  */
@@ -92,9 +95,14 @@ void xbox_InputKeysClear(void);
  * diagnostic. */
 int  xbox_FramebufferKeyDown(int vk);
 
-/* The pad the held keys make, through the one map. Moves the packet number
- * on every call, as the title looks for edges. */
+/* The pad the held keys make, through the one map, resolved by the mapping
+ * rules (input_map.h). Moves the packet number on every call, as the title
+ * looks for edges. */
 void xbox_InputKeyboardState(XBOX_INPUT_STATE *out);
+/* The map below as bindings (input_map.h): what xbox_InputKeyboardState
+ * resolves, and what xbox_InputMap_BindingsFormat writes as text. */
+struct InputBindings;
+void xbox_InputKeyboardBindings(struct InputBindings *b);
 /* 0 when RECOMP_KEYBOARD is off, else 1 with *out filled by
  * xbox_InputKeyboardState(). */
 int  xbox_InputKeyboardPoll(XBOX_INPUT_STATE *out);
