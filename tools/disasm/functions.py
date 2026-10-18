@@ -68,8 +68,11 @@ class FunctionDetector:
     """
 
     def __init__(self, engine: DisasmEngine, image: BinaryImage,
-                 xrefs: XRefTracker, labels: LabelManager):
+                 xrefs: XRefTracker, labels: LabelManager,
+                 skip_library_immediates: bool = False):
         self.engine = engine
+        # Off by default. See _pass_imm_ref_targets.
+        self.skip_library_immediates = skip_library_immediates
         self.image = image
         self.xrefs = xrefs
         self.labels = labels
@@ -610,6 +613,21 @@ class FunctionDetector:
         def in_code_section(addr: int) -> bool:
             return any(lo <= addr < hi for lo, hi in code_ranges)
 
+        # Optional (skip_library_immediates): an immediate that sits in a
+        # library section (D3D, DSOUND, XPP...) never names a function of the
+        # title's own .text. The XDK's D3D code is full of NV2A register
+        # constants that happen to equal .text addresses. Each one becomes a
+        # function start and cuts the real function it lands in (NFSU1: two D3D
+        # immediates start a function at 0x100A20 inside sub_001009C0, a
+        # jump-table switch, and the alias passes then add two more starts).
+        # Library to library references stay, as DSOUND storing a DOLBY
+        # function pointer.
+        def section_name(addr: int) -> str:
+            for sec in sections:
+                if sec.virtual_addr <= addr < sec.virtual_addr + sec.virtual_size:
+                    return sec.name
+            return ""
+
         targets = set()
         for insn in self.engine.instructions.values():
             target = insn.imm_ref
@@ -617,6 +635,10 @@ class FunctionDetector:
                 continue
             if (target in claimed or target in self._alias_entries
                     or inside_a_function(target) or not in_code_section(target)):
+                continue
+            if (self.skip_library_immediates
+                    and section_name(target) == ".text"
+                    and section_name(insn.address) != ".text"):
                 continue
             targets.add(target)
 
