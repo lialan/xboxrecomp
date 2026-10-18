@@ -796,14 +796,24 @@ class FunctionDetector:
         # 2's static initialisers are addresses inside another function and
         # nowhere else. Excluding them left those constructors with no body at
         # all, and _initterm silently skipped every one.
+        # Code sections are scanned too, but only the words no function body
+        # covers. XDK libraries link their data into their own executable
+        # section: Fallout: Brotherhood of Steel's D3D keeps its 30-entry
+        # render-state handler table at 0x000B39F0, inside D3D, between two
+        # functions. Three of those handlers have no direct caller, so
+        # skipping code sections left them with no body and every SetRenderState
+        # that deferred to one was an unresolved indirect call. Inside a body
+        # a word is an operand or an instruction, not a table.
         targets = set()
         for sec in self.image.sections:
-            if sec.name in code_names:
-                continue                    # scan data, not code
             data = self.image.get_section_data(sec)
             if not data:
                 continue
+            is_code = sec.name in code_names
             for off in range(0, len(data) - 3, 4):
+                if is_code and (inside_a_function(sec.virtual_addr + off) or
+                                inside_a_function(sec.virtual_addr + off + 3)):
+                    continue
                 value = int.from_bytes(data[off:off + 4], "little")
                 if in_code_section(value):
                     targets.add(value)
