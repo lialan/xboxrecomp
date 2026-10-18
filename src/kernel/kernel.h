@@ -620,6 +620,14 @@ ULONG   __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG P
 /* Name contended CRT locks by index instead of by address. */
 void xbox_SetCrtLockTable(uint32_t table_va, uint32_t count);
 
+/* Deliver file I/O APCs (ReadFileEx/WriteFileEx completions) at the issuing
+ * thread's next alertable wait, which then returns STATUS_USER_APC, instead of
+ * inline at the request. That is what the hardware does, and a title whose
+ * completion routine clears a flag it sets *after* issuing the read needs it.
+ * Off by default: the inline path is what every other title was brought up
+ * on. Call before the guest runs. */
+void xbox_SetDeferredIoApc(int on);
+
 VOID    __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
