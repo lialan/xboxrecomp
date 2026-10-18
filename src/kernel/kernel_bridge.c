@@ -3704,13 +3704,21 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
     if (!fn) fn = recomp_lookup_manual(apc_routine);
     if (!fn) fn = recomp_lookup_kernel(apc_routine);
     if (fn) {
-        /* VOID ApcRoutine(PVOID ApcContext, PIO_STATUS_BLOCK, ULONG) */
+        /* VOID NTAPI ApcRoutine(PVOID ApcContext, PIO_STATUS_BLOCK, ULONG)
+         *
+         * Restore esp from before the frame rather than adding a fixed amount
+         * back. The routine is stdcall and pops its own 16 bytes (a kernel
+         * thunk does the same), so the old `g_esp += 12` left the caller 12
+         * bytes high. Callers ending in `leave` never noticed; FBoS's wait
+         * wrapper sub_000907CB does `pop esi` first and came back with a
+         * stack address in its caller's esi. */
+        uint32_t saved_esp = g_esp;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
         fn();
-        g_esp += 12;
+        g_esp = saved_esp;
     } else {
         uint32_t ord = 0;
         if (apc_routine >= KERNEL_VA_BASE && apc_routine < KERNEL_VA_END) {
