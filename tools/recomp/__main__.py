@@ -271,6 +271,12 @@ def main():
     parser.add_argument("--coalesce-functions", metavar="JSON", action="append",
                         help="Explicit owner bounds and false interior starts "
                              "to merge before translation; repeatable")
+    parser.add_argument("--entry-stubs", action="store_true",
+                        help="Stub an unresolved target that lies inside a "
+                             "known function with a copy of that function "
+                             "entered at the target, instead of a plain "
+                             "return. Each target is a full copy, so it can "
+                             "grow the generated code a lot. Off by default")
     parser.add_argument("--back-edge-yield", action="store_true",
                         help="Call RECOMP_BACK_EDGE, the guest CPU's quantum "
                              "check, at every loop back edge. The guest CPU "
@@ -356,6 +362,7 @@ def main():
             os.path.dirname(os.path.abspath(__file__)), "output",
             "icall_sites.json"),
         back_edge_yield=args.back_edge_yield,
+        entry_stubs=args.entry_stubs,
     )
 
     t_load = time.time() - t0

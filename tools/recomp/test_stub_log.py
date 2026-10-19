@@ -34,6 +34,9 @@ class _FakeTranslator:
     def _stub_ret_bytes(self, addr):
         return 8
 
+    def _stub_epilogue(self, addr):
+        return None
+
 
 def _emit(output_dir):
     batch = BatchTranslator.__new__(BatchTranslator)

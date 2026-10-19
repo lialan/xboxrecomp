@@ -3218,16 +3218,21 @@ class FunctionTranslator:
 class BatchTranslator:
     """Translates multiple functions and writes C source files."""
 
+    entry_stubs = False     # --entry-stubs; see translate_batch_split
+
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
-                 icall_sites_json_path=None, back_edge_yield=False):
+                 icall_sites_json_path=None, back_edge_yield=False,
+                 entry_stubs=False):
         """back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
-        (--back-edge-yield; off by default)."""
+        (--back-edge-yield; off by default). entry_stubs: an unresolved
+        target inside a function enters a copy of it (--entry-stubs)."""
         self.xbe_path = xbe_path
         self.back_edge_yield = back_edge_yield
+        self.entry_stubs = entry_stubs
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
         self.icall_sites = {}
@@ -3776,7 +3781,11 @@ class BatchTranslator:
             ]
             entry_n = 0
             for addr in sorted(unresolved):
-                code = self.translator.entry_stub(addr, unresolved[addr])
+                # --entry-stubs: re-emit the containing function from addr.
+                # Opt-in: each target is a full copy of its function, so a
+                # title with many targets in one function grows by that much.
+                code = (self.translator.entry_stub(addr, unresolved[addr])
+                        if self.entry_stubs else None)
                 if code:
                     stub_lines.append(code)
                     entry_n += 1
@@ -3790,7 +3799,8 @@ class BatchTranslator:
                                     for r in regs)
                     note = "; ".join(f"pop {r}" for r in regs) + f"; ret {n}"
                     stub_lines.append(
-                        f"void {unresolved[addr]}(void) {{ {body} g_esp += {4 + n}; "
+                        f"void {unresolved[addr]}(void) {{ "
+                        f"RECOMP_STUB_HIT(0x{addr:08X}u); {body} g_esp += {4 + n}; "
                         f"/* 0x{addr:08X}: {note} */ }}"
                     )
                     continue
@@ -3807,8 +3817,8 @@ class BatchTranslator:
             generated_files.append(stub_path)
 
             if verbose:
-                print(f"  Wrote {stub_path} ({len(unresolved)} stubs)",
-                      file=sys.stderr)
+                print(f"  Wrote {stub_path} ({len(unresolved)} stubs, "
+                      f"{entry_n} entry)", file=sys.stderr)
 
         # Generate dispatch table.
         #
