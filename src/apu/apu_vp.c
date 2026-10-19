@@ -1569,8 +1569,14 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
-    /* HRTF processing for 3D voices */
-    if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
+    /* HRTF processing for 3D voices. RECOMP_APU_HRTF=0 turns it off: it is
+     * on by default (xemu's), and so far checked on one title. */
+    static int hrtf_on = -1;
+    if (hrtf_on < 0) {
+        const char *e = getenv("RECOMP_APU_HRTF");
+        hrtf_on = !(e && e[0] == '0');
+    }
+    if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf && hrtf_on) {
         uint16_t hrtf_handle =
             (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
