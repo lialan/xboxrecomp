@@ -770,6 +770,30 @@ class FunctionDetector:
             print(f"  {found} function address(es) installed into"
                   f" indirect-call slots")
 
+    def _is_byte_table(self, addr: int) -> bool:
+        """Is the word at `addr` a byte index table, not code?
+
+        MSVC's two-level switch maps a sparse case value to a dense arm
+        number through a byte table, `movzx eax, byte ptr [eax + table]`,
+        parked right after the dword table. Its bytes are small arm numbers,
+        and they decode: `00 02 02 00` is `add [edx], al ; add al, [edx] ;
+        ...`, a run of adds that can wander into a proven exit. Two signs
+        say data. A movzx names the address as a byte table, which the
+        sweep recorded. And the first byte is below 0x0F: `add`, `or` and
+        the segment pushes, which no function starts with (the rule
+        _pass_jump_table_followers uses).
+
+        The word that names such a table is the movzx's own displacement,
+        scanned as a table word while the function holding it is still an
+        unclaimed gap. Jet Set Radio Future had eleven of these accepted as
+        entries once indirect tails could close a body, and v0.15.0 itself
+        accepts eight.
+        """
+        if addr in self.engine.byte_tables:
+            return True
+        first = self.image.read_bytes_at_va(addr, 1)
+        return bool(first) and first[0] < 0x0F
+
     def _probes_as_escaping_body(self, target, starts, bounds, sections,
                                  tails, depth: int = 8) -> bool:
         """A table word's body that closes only through code outside its gap.
@@ -798,6 +822,8 @@ class FunctionDetector:
             section = next((sec for sec in sections if sec.virtual_addr <= entry
                             < sec.virtual_addr + sec.virtual_size), None)
             if section is None or entry not in self.engine.instructions:
+                return False
+            if self._is_byte_table(entry):
                 return False
             j = bisect.bisect_right(starts, entry) - 1
             if j >= 0 and bounds[j][0] < entry < bounds[j][1]:
@@ -1214,6 +1240,8 @@ class FunctionDetector:
                     continue
                 first = self.engine.instructions[target]
                 if first.mnemonic.lower() in ("int3", "nop"):
+                    continue
+                if self._is_byte_table(target):
                     continue
                 i = bisect.bisect_right(starts, target)
                 sec = self.image.get_section_at_va(target)
