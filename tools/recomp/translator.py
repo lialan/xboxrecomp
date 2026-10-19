@@ -1730,7 +1730,8 @@ class FunctionTranslator:
                 cc = m[3:]
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
-            if (cc in FunctionTranslator._CARRY_CC
+            # lahf rebuilds CF in AH through a `jb` probe of the setter.
+            if ((cc in FunctionTranslator._CARRY_CC or m == "lahf")
                     and (last_setter in CF_TRACKED
                          or last_setter in ("inc", "dec")
                          or last_setter in BT_MODIFY
