@@ -456,6 +456,21 @@ static RECOMP_TLS int g_is_spawned_thread = 0;
  * path is the rare one. */
 static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 
+/* Deferred file I/O APCs; see xbox_SetDeferredIoApc and deliver_one_apc.
+ *
+ * Per thread, because an APC belongs to the thread that issued the request and
+ * runs only when that thread waits alertably. 16 is generous: a title waits
+ * between batches of reads, and an overflowing request is delivered inline
+ * (the old behaviour) rather than dropped. */
+static int g_defer_io_apc = 0;
+#define IO_APC_QUEUE 16
+static RECOMP_TLS uint32_t g_io_apc[IO_APC_QUEUE][3];   /* routine, ctx, iosb */
+static RECOMP_TLS int g_io_apc_count = 0;
+
+void xbox_SetDeferredIoApc(int on) { g_defer_io_apc = on; }
+
+static int bridge_run_io_apcs(uint32_t alertable, uint32_t wait_mode);
+
 struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top, obj_va, tls_size;
@@ -2068,6 +2083,8 @@ static void bridge_NtWaitForSingleObject(void)
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
 
+    if (bridge_run_io_apcs(alertable, 1))
+        return;
     g_eax = (uint32_t)xbox_NtWaitForSingleObject(
         handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
 }
@@ -2130,6 +2147,8 @@ static void bridge_NtWaitForSingleObjectEx(void)
         fflush(stderr);
     }
 
+    if (bridge_run_io_apcs(alertable, wait_mode))
+        return;
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
@@ -2179,7 +2198,6 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     uint32_t alertable   = STACK_ARG(4);
     uint32_t timeout_ptr = STACK_ARG(5);
 
-    (void)wait_mode;
     HANDLE   handles[MAXIMUM_WAIT_OBJECTS];
     uint32_t i;
 
@@ -2202,6 +2220,8 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
         }
     }
 
+    if (bridge_run_io_apcs(alertable, wait_mode))
+        return;
     g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
         count, handles, wait_type, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
@@ -2283,6 +2303,8 @@ static void bridge_KeDelayExecutionThread(void)
     uint32_t interval_ptr = STACK_ARG(2);
 
 
+    if (bridge_run_io_apcs(alertable, wait_mode))
+        return;
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(interval_ptr));
@@ -4364,12 +4386,13 @@ static void bridge_NtOpenFile(void)
  * cache-partition setup does exactly that, gives up after its 5-second SleepEx,
  * and asserts "setup for new cache file failed (#0)".
  *
- * ponytail: the APC runs inline here rather than at the next alertable wait.
+ * ponytail: by default the APC runs inline here rather than at the next
+ * alertable wait (xbox_SetDeferredIoApc(1) defers it, as the hardware does).
  * The data really is ready by then, so the observable result matches; a title
- * that depends on the APC *not* having run yet would notice. A per-thread
- * deferred queue drained at alertable waits was tried for Halo's map streamer
- * and made no difference (it still issues one 14 KB batch and stops), so it was
- * dropped rather than risk changing this shared path for the other titles.
+ * that depends on the APC *not* having run yet would notice, and Fallout:
+ * Brotherhood of Steel does (see bridge_run_io_apcs). Deferral made no
+ * difference to Halo's map streamer (it still issues one 14 KB batch and
+ * stops), so it stays opt-in until the other titles have been checked.
  */
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 
@@ -4384,7 +4407,15 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
     if (!fn) fn = recomp_lookup_manual(apc_routine);
     if (!fn) fn = recomp_lookup_kernel(apc_routine);
     if (fn) {
-        /* VOID ApcRoutine(PVOID ApcContext, PIO_STATUS_BLOCK, ULONG) */
+        /* VOID NTAPI ApcRoutine(PVOID ApcContext, PIO_STATUS_BLOCK, ULONG)
+         *
+         * Restore esp from before the frame rather than adding a fixed amount
+         * back. The routine is stdcall and pops its own 16 bytes (a kernel
+         * thunk does the same), so the old `g_esp += 12` left the caller 12
+         * bytes high. Callers ending in `leave` never noticed; FBoS's wait
+         * wrapper sub_000907CB does `pop esi` first and came back with a
+         * stack address in its caller's esi. */
+        uint32_t saved_esp = g_esp;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
@@ -4395,7 +4426,7 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
             fn();
             xbox_GuestCpuLeaveCallback(took);
         }
-        g_esp += 12;
+        g_esp = saved_esp;
     } else {
         uint32_t ord = 0;
         if (apc_routine >= KERNEL_VA_BASE && apc_routine < KERNEL_VA_END) {
@@ -4417,8 +4448,36 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
         if (ev) SetEvent(ev);
     }
     if (apc_routine) {
-        deliver_one_apc(apc_routine, apc_context, iostatus);
+        if (g_defer_io_apc && g_io_apc_count < IO_APC_QUEUE) {
+            uint32_t *q = g_io_apc[g_io_apc_count++];
+            q[0] = apc_routine; q[1] = apc_context; q[2] = iostatus;
+        } else {
+            deliver_one_apc(apc_routine, apc_context, iostatus);
+        }
     }
+}
+
+/* An alertable user-mode wait with APCs queued runs them all and returns
+ * STATUS_USER_APC without waiting, as the real kernel does. Fallout: Brotherhood
+ * of Steel's streamer (sub_00038EE0) marks a slot busy after ReadFileEx and
+ * waits on the file handle for the completion to clear it; run inline, the
+ * completion cleared the flag before it was set and the wait never ended.
+ *
+ * The queue is copied out first: a completion routine may issue the next read,
+ * which queues again, and that one belongs to the next wait. */
+static int bridge_run_io_apcs(uint32_t alertable, uint32_t wait_mode)
+{
+    uint32_t q[IO_APC_QUEUE][3];
+    int n = g_io_apc_count, i;
+
+    if (!alertable || wait_mode != 1 /* UserMode */ || n == 0)
+        return 0;
+    memcpy(q, g_io_apc, sizeof(q[0]) * n);
+    g_io_apc_count = 0;
+    for (i = 0; i < n; i++)
+        deliver_one_apc(q[i][0], q[i][1], q[i][2]);
+    g_eax = 0x000000C0u;                 /* STATUS_USER_APC */
+    return 1;
 }
 
 /* -- XeLoadSection / XeUnloadSection (ordinals 327/328, 1 arg = 4 bytes) --
