@@ -456,6 +456,12 @@ class FunctionDetector:
             if not insn.is_ret:
                 continue
             nxt = insn.end_address
+            # Past nop padding too: _pass_cc_boundaries knows only int3, and
+            # Panzer Dragoon Orta pads with nop, so its vtable-only COM
+            # forwarders sat in gaps unfound. A start past padding is aligned.
+            padded = self._skip_padding(nxt)
+            if padded != nxt and padded % 16 == 0:
+                nxt = padded
             if nxt in self._candidates or nxt in self.functions:
                 continue
             section = self.image.get_section_at_va(nxt)
