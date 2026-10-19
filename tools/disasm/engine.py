@@ -329,6 +329,13 @@ class DisasmEngine:
             hi = lo + home.virtual_size
             entries = 0
             while entries < max_entries:
+                # MSVC's two-level switch parks the byte index table straight
+                # after the dword table. Its first bytes, small arm numbers
+                # such as `00 02 02 00`, read as a dword are an address low
+                # in the section, so the walk would take them as one more
+                # arm. A `movzx` names that byte table; stop in front of it.
+                if tbl + entries * 4 in self.byte_tables:
+                    break
                 target = self.image.read_u32_at_va(tbl + entries * 4)
                 if target is None or not (lo <= target < hi):
                     break
