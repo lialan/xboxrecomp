@@ -2800,8 +2800,16 @@ static int xf_clip_poly(const Nv2aVshOutput *in, int n, int pl,
         float dp = xf_clip_dist(p, pl), dq = xf_clip_dist(q, pl);
         if (dp >= 0.0f)
             out[m++] = *p;
-        if ((dp >= 0.0f) != (dq >= 0.0f))
-            xf_lerp(p, q, dp / (dp - dq), &out[m++]);
+        if ((dp >= 0.0f) != (dq >= 0.0f)) {
+            Nv2aVshOutput *v = &out[m++];
+            xf_lerp(p, q, dp / (dp - dq), v);
+            /* Exactly on the plane: at w in the 1e4s the lerp's rounding is
+             * bigger than NV_CLIP_W, and a w <= 0 divides to inf/NaN. */
+            if (pl == 0)
+                v->pos[3] = NV_CLIP_W;
+            else
+                v->pos[2] = s_xf_o[2] * v->pos[3];
+        }
     }
     return m;
 }
