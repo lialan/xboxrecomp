@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_io_apc_test C)
+if(NOT WIN32)
+    message(FATAL_ERROR "kernel_io_apc drives the Win32 file API: Windows only")
+endif()
 set(CMAKE_C_STANDARD 11)
 add_subdirectory(../.. runtime)
 add_executable(kernel_io_apc_test test_main.c)

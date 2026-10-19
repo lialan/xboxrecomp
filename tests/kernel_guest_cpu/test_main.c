@@ -15,6 +15,9 @@
  *    by the pinned thread (the kernel timer thread is made that way);
  *  - GetProcessAffinityMask stays the process's on a pinned caller.
  */
+#ifndef _WIN32
+#define _GNU_SOURCE     /* nftw, pthread_getaffinity_np under -std=c11 */
+#endif
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 

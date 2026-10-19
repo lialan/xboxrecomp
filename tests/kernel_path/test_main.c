@@ -14,6 +14,9 @@
  * Cross-platform: Win32 backend on Windows and Proton, POSIX elsewhere, so
  * both forms of each rule (sub_win, sub_posix) are checked by the same cases.
  */
+#ifndef _WIN32
+#define _GNU_SOURCE     /* nftw, pthread_getaffinity_np under -std=c11 */
+#endif
 #include "kernel.h"
 
 #include <stdio.h>
