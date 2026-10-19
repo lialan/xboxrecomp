@@ -460,7 +460,8 @@ class FunctionDetector:
             # Panzer Dragoon Orta pads with nop, so its vtable-only COM
             # forwarders sat in gaps unfound. A start past padding is aligned.
             padded = self._skip_padding(nxt)
-            if padded != nxt and padded % 16 == 0:
+            past_padding = padded != nxt and padded % 16 == 0
+            if past_padding:
                 nxt = padded
             if nxt in self._candidates or nxt in self.functions:
                 continue
@@ -486,7 +487,8 @@ class FunctionDetector:
             # return path, and splitting one of those would cut a function in
             # half -- but those are covered, so they are not in a gap.
             if not (self.engine.probes_as_prologue(nxt)
-                    or self.engine.probes_as_constant_stub(nxt)):
+                    or self.engine.probes_as_constant_stub(nxt)
+                    or (past_padding and self._closed_body_in_gap(nxt, starts))):
                 continue
             self._add_candidate(nxt, config.CONFIDENCE_CC_BOUNDARY,
                                 "gap_prologue")
@@ -495,6 +497,15 @@ class FunctionDetector:
         if added:
             print("  functions recovered that follow a ret with no padding")
         return added
+
+    def _closed_body_in_gap(self, addr: int, starts) -> bool:
+        """ret, padding, then a closed CFG: the evidence _pass_cc_boundaries
+        takes after int3. A forwarder ending `jmp [ecx+0x18]` has no prologue."""
+        i = bisect.bisect_right(starts, addr)
+        section = self.image.get_section_at_va(addr)
+        upper = starts[i] if i < len(starts) else (section.virtual_addr + section.virtual_size)
+        return self.engine.probes_as_callback_body(
+            addr, upper, tail_targets=self._candidates, allow_indirect_tails=True)
 
     def _pass_seed_aliases(self) -> None:
         """

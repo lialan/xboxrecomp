@@ -67,6 +67,11 @@ class _Engine:
     def probes_as_constant_stub(self, addr):
         return self._stub
 
+    bodies = ()
+
+    def probes_as_callback_body(self, addr, upper, **kw):
+        return addr in self.bodies
+
 
 def _detector(insns, functions, prologues):
     det = FunctionDetector.__new__(FunctionDetector)
@@ -150,6 +155,20 @@ class GapPrologueTest(unittest.TestCase):
         det = self._padded(0x0026B62C, 0x0026B630)
         self.assertTrue(det._pass_gap_prologues([]))
         self.assertEqual(det.added, [(0x0026B630, "gap_prologue")])
+
+    def test_a_closed_body_past_nop_padding_is_a_function(self):
+        # The forwarder ends `jmp [ecx+0x18]`: no prologue, no constant stub.
+        det = self._padded(0x0026B62C, 0x0026B630)
+        det.engine._prologues = set()
+        det.engine.bodies = {0x0026B630}
+        self.assertTrue(det._pass_gap_prologues([]))
+        self.assertEqual(det.added, [(0x0026B630, "gap_prologue")])
+
+    def test_a_closed_body_with_no_padding_in_front_is_not_enough(self):
+        det = self._padded(0x0026B630, 0x0026B630)
+        det.engine._prologues = set()
+        det.engine.bodies = {0x0026B630}
+        self.assertFalse(det._pass_gap_prologues([]))
 
     def test_nops_that_reach_no_alignment_are_not_padding(self):
         det = self._padded(0x0026B62C, 0x0026B62E)
