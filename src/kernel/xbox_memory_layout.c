@@ -4118,10 +4118,44 @@ static void contig_take(uint32_t first, uint32_t n)
         g_contig_first_free++;
 }
 
+/* Whether page q may start or extend a new block.
+ *
+ * The first pass also keeps out of the loaded image's physical range. Here
+ * the window and the RAM the image sits in are separate storage, so a block
+ * placed at an image page gives one physical number two meanings, and a
+ * device model holding only the number has to guess. Darkwatch's XPP lost
+ * that guess both ways: a 1200 KB block at 0x0045C000 covered its .data
+ * control-transfer buffer (0x004C20D4), and its OHCI descriptors, allocated
+ * inside the block, resolved to the image and read back zero, so the pad
+ * never enumerated. The console never has the overlap: its kernel keeps the
+ * image's pages out of the pool. The second pass allows them, because an
+ * image whose BSS runs past 48 MB would otherwise leave almost no window.
+ *
+ * Opt-in (RECOMP_CONTIG_AVOID_IMAGE=1): it moves every block above the
+ * image, and game glue names some of them by address (a DSP doorbell, say). */
+static int contig_avoid_image(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CONTIG_AVOID_IMAGE");
+        on = e && atoi(e) != 0;
+    }
+    return on;
+}
+
+static int contig_page_free(uint32_t q, int avoid_image)
+{
+    if (g_contig_used[q])
+        return 0;
+    return !(avoid_image && g_xbox_image_hi
+             && q >= g_xbox_image_lo / CONTIG_PAGE
+             && q < (g_xbox_image_hi + CONTIG_PAGE - 1) / CONTIG_PAGE);
+}
+
 uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
                                 uint32_t phys_lo, uint32_t phys_hi)
 {
-    uint32_t n, align_pages, lo_page, limit, p, q, result = 0;
+    uint32_t n, align_pages, lo_page, limit, p, q, pass, result = 0;
 
     if (alignment < CONTIG_PAGE) alignment = CONTIG_PAGE;
     if (alignment & (alignment - 1)) {            /* round up to a power of 2 */
@@ -4140,24 +4174,27 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
 
     contig_lock();
     if (lo_page < g_contig_first_free) lo_page = g_contig_first_free;
-    p = (lo_page + align_pages - 1) & ~(align_pages - 1);
-    while ((uint64_t)p + n <= limit) {
-        /* A request free to go above 16 MB steps over the low reserve. */
-        if (limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
-                && p + n > CONTIG_LOW_RESERVE_START) {
-            p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
-            continue;
+    for (pass = contig_avoid_image() ? 0 : 1; pass < 2 && !result; pass++) {
+        int avoid = pass == 0;
+        p = (lo_page + align_pages - 1) & ~(align_pages - 1);
+        while ((uint64_t)p + n <= limit) {
+            /* A request free to go above 16 MB steps over the low reserve. */
+            if (limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
+                    && p + n > CONTIG_LOW_RESERVE_START) {
+                p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
+                continue;
+            }
+            for (q = p; q < p + n && contig_page_free(q, avoid); q++)
+                ;
+            if (q == p + n) {
+                contig_take(p, n);
+                result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
+                break;
+            }
+            /* Skip the run that stopped us, then realign. */
+            while (q < limit && !contig_page_free(q, avoid)) q++;
+            p = (q + align_pages - 1) & ~(align_pages - 1);
         }
-        for (q = p; q < p + n && !g_contig_used[q]; q++)
-            ;
-        if (q == p + n) {
-            contig_take(p, n);
-            result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
-            break;
-        }
-        /* Skip the used run that stopped us, then realign. */
-        while (q < limit && g_contig_used[q]) q++;
-        p = (q + align_pages - 1) & ~(align_pages - 1);
     }
     if (result) {
         g_contig_allocs++;
