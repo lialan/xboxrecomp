@@ -12,7 +12,7 @@ static int g_failed;
 static int g_checks;
 #define CHECK(cond) do { g_checks++; if (!(cond)) { \
     printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); g_failed++; } } while (0)
-#define NEAR(a, b, tol) (abs((int)(a) - (int)(b)) <= (tol))
+#define CLOSE_TO(a, b, tol) (abs((int)(a) - (int)(b)) <= (tol))
 
 /* Every name the first version of this module (d9a0a38) wrote or read, with
  * the Windows virtual-key code it means, from winuser.h, written out here
@@ -308,13 +308,13 @@ static void test_deadzone(void)
     xbox_InputMap_ApplyStick(-32768, 0, 15, &x, &y);
     CHECK(x == -32767 && y == 0);
     xbox_InputMap_ApplyStick(16383, 0, 15, &x, &y);         /* (16383-4915)/(32767-4915) */
-    CHECK(NEAR(x, 13491, 2) && y == 0);
+    CHECK(CLOSE_TO(x, 13491, 2) && y == 0);
     xbox_InputMap_ApplyStick(0, -16383, 15, &x, &y);
-    CHECK(x == 0 && NEAR(y, -13491, 2));
+    CHECK(x == 0 && CLOSE_TO(y, -13491, 2));
     xbox_InputMap_ApplyStick(20000, 20000, 15, &x, &y);     /* direction preserved */
     CHECK(x == y && x > 0 && x < 32767);
     xbox_InputMap_ApplyStick(32767, 32767, 15, &x, &y);     /* beyond the circle clamps to it */
-    CHECK(NEAR(x, 23170, 3) && NEAR(y, 23170, 3));
+    CHECK(CLOSE_TO(x, 23170, 3) && CLOSE_TO(y, 23170, 3));
     xbox_InputMap_ApplyStick(500, 0, 0, &x, &y);            /* no deadzone passes through */
     CHECK(x == 500 && y == 0);
     xbox_InputMap_ApplyStick(0, 0, 15, &x, &y);
@@ -325,7 +325,7 @@ static void test_deadzone(void)
     CHECK(xbox_InputMap_ApplyTrigger(0, 5) == 0);
     CHECK(xbox_InputMap_ApplyTrigger(12, 5) == 0);          /* 5% of 255 is 12 */
     CHECK(xbox_InputMap_ApplyTrigger(255, 5) == 255);
-    CHECK(NEAR(xbox_InputMap_ApplyTrigger(134, 5), 128, 1));
+    CHECK(CLOSE_TO(xbox_InputMap_ApplyTrigger(134, 5), 128, 1));
     CHECK(xbox_InputMap_ApplyTrigger(100, 0) == 100);
     CHECK(xbox_InputMap_ApplyTrigger(300, 5) == 255);
 }
@@ -360,7 +360,7 @@ static void test_padmap(void)
     CHECK(p.bAnalogButtons[XBOX_BUTTON_BLACK] == 255 && p.bAnalogButtons[XBOX_BUTTON_WHITE] == 0);
     CHECK(p.wButtons == (XBOX_GAMEPAD_START | XBOX_GAMEPAD_DPAD_LEFT));
     CHECK(p.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 255);
-    CHECK(NEAR(p.bAnalogButtons[XBOX_BUTTON_LTRIGGER], 128, 8));   /* analog, with the threshold applied */
+    CHECK(CLOSE_TO(p.bAnalogButtons[XBOX_BUTTON_LTRIGGER], 128, 8));   /* analog, with the threshold applied */
 
     /* A button below the press threshold does not count; at it, does. */
     memset(&r, 0, sizeof(r));

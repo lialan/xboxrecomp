@@ -317,6 +317,13 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             int side = xbox_InputWin32SideVk((int)w, (uint32_t)l);
             if (side)
                 xbox_InputKeySet(side, 0);
+            /* With both Shifts down Windows sends one key-up, for the
+             * last released, so the other side would stay held. Autorepeat
+             * sets a Shift still down again. */
+            if (w == VK_SHIFT) {
+                xbox_InputKeySet(VK_LSHIFT, 0);
+                xbox_InputKeySet(VK_RSHIFT, 0);
+            }
         }
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
 
