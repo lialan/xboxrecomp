@@ -303,7 +303,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
          * 8 reserved, std/dlt bias, language, video, audio, parental x3,
          * online x4, misc, DVD region -- the same values as the single
          * queries above. Answering it with zeroes put every title in UTC. */
-        uint8_t blk[0x5C];
+        uint8_t blk[0x60];
         memset(blk, 0, sizeof blk);
         memcpy(blk + 0x04, &s_tz.bias, 4);
         memcpy(blk + 0x08, s_tz.std_name, 4);
@@ -314,12 +314,15 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
         { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
         { ULONG v = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV; memcpy(blk + 0x34, &v, 4); }
-        { ULONG v = 1; memcpy(blk + 0x58, &v, 4); }                       /* DVD region 1 */
-        memcpy(Value, blk, ValueLength < sizeof blk ? ValueLength : sizeof blk);
+        /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
+        { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */
+        if (Type) *Type = 3;
+        if (ResultLength) *ResultLength = sizeof blk;
+        if (ValueLength < sizeof blk)
+            return 0xC0000023L;                       /* STATUS_BUFFER_TOO_SMALL */
+        memcpy(Value, blk, sizeof blk);
         if (ValueLength > sizeof blk)
             memset((uint8_t *)Value + sizeof blk, 0, ValueLength - sizeof blk);
-        if (Type) *Type = 3;
-        if (ResultLength) *ResultLength = ValueLength < sizeof blk ? ValueLength : sizeof blk;
         break;
     }
 

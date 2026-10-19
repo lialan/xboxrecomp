@@ -46,7 +46,7 @@ int main(void)
     }
     memset(blk, 0xCC, sizeof blk);
     if (xbox_ExQueryNonVolatileSetting(XC_MAX_OS, &type, blk, sizeof blk, &len)
-        || type != 3 || len != 0x5C) {
+        || type != 3 || len != 0x60) {
         fprintf(stderr, "FAIL: XC_MAX_OS type %lu length %lu\n", (unsigned long)type, (unsigned long)len);
         return 1;
     }
@@ -58,7 +58,7 @@ int main(void)
     {
         static const struct { ULONG index, off; } f[] = {
             {XC_TZ_STD_BIAS, 0x28}, {XC_TZ_DLT_BIAS, 0x2C}, {XC_LANGUAGE, 0x30},
-            {XC_VIDEO, 0x34}, {XC_AUDIO, 0x38}, {XC_MISC, 0x54}, {XC_DVD_REGION, 0x58},
+            {XC_VIDEO, 0x34}, {XC_AUDIO, 0x38}, {XC_MISC, 0x58}, {XC_DVD_REGION, 0x5C},
         };
         for (i = 0; i < sizeof f / sizeof f[0]; i++) {
             memcpy(&v, blk + f[i].off, 4);
@@ -70,7 +70,17 @@ int main(void)
             }
         }
     }
-    for (i = 0x5C; i < sizeof blk; i++)
+    {
+        uint8_t small[4];
+        len = 0;
+        if (xbox_ExQueryNonVolatileSetting(XC_MAX_OS, &type, small, sizeof small, &len)
+                != (NTSTATUS)0xC0000023L || len != 0x60) {
+            fprintf(stderr, "FAIL: XC_MAX_OS into 4 bytes: want BUFFER_TOO_SMALL and 0x60
+");
+            return 1;
+        }
+    }
+    for (i = 0x60; i < sizeof blk; i++)
         if (blk[i]) {
             fprintf(stderr, "FAIL: byte 0x%02X past the block is 0x%02X\n", (unsigned)i, blk[i]);
             return 1;
