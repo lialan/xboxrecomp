@@ -75,8 +75,7 @@ int main(void)
         len = 0;
         if (xbox_ExQueryNonVolatileSetting(XC_MAX_OS, &type, small, sizeof small, &len)
                 != (NTSTATUS)0xC0000023L || len != 0x60) {
-            fprintf(stderr, "FAIL: XC_MAX_OS into 4 bytes: want BUFFER_TOO_SMALL and 0x60
-");
+            fprintf(stderr, "FAIL: XC_MAX_OS into 4 bytes: want BUFFER_TOO_SMALL and 0x60\n");
             return 1;
         }
     }
