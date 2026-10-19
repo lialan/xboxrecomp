@@ -1081,6 +1081,15 @@ class FunctionDetector:
         # skipping code sections left them with no body and every SetRenderState
         # that deferred to one was an unresolved indirect call. Inside a body
         # a word is an operand or an instruction, not a table.
+        # A switch's jump table also sits between functions, right after its
+        # own; its words are case labels, not callables.
+        tables = sorted(self.engine.jump_tables.items())
+        table_starts = [t for t, _ in tables]
+
+        def in_jump_table(addr: int) -> bool:
+            i = bisect.bisect_right(table_starts, addr) - 1
+            return i >= 0 and addr < tables[i][1]
+
         targets = set()
         for sec in self.image.sections:
             data = self.image.get_section_data(sec)
@@ -1088,8 +1097,9 @@ class FunctionDetector:
                 continue
             is_code = sec.name in code_names
             for off in range(0, len(data) - 3, 4):
-                if is_code and (inside_a_function(sec.virtual_addr + off) or
-                                inside_a_function(sec.virtual_addr + off + 3)):
+                va = sec.virtual_addr + off
+                if is_code and (inside_a_function(va) or
+                                inside_a_function(va + 3) or in_jump_table(va)):
                     continue
                 value = int.from_bytes(data[off:off + 4], "little")
                 if in_code_section(value):

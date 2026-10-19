@@ -48,3 +48,21 @@ def test_word_inside_a_function_body_is_not_a_table():
     body += HANDLER
     detector = _detect(body)
     assert BASE + 16 not in detector._alias_entries
+
+
+def test_switch_table_in_a_gap_is_not_a_table_of_functions():
+    # Same layout as the first test, but the engine knows +16 is a switch's
+    # jump table: its words are case labels, not callables.
+    body = b"\xc3" + b"\xcc" * 15
+    body += struct.pack("<I", BASE + 32) + b"\xcc" * 12
+    body += HANDLER
+    text = SectionInfo('D3D', BASE, len(body), 0, len(body), False, True, '')
+    image = BinaryImage('synthetic', body, 0, 0x20000, BASE, 0, [text])
+    engine = DisasmEngine(image)
+    engine.linear_sweep(text)
+    engine.jump_tables[BASE + 16] = BASE + 20
+    detector = FunctionDetector(engine, image, None, LabelManager())
+    detector._pass_known_addresses()
+    detector._build_functions([text])
+    detector._pass_data_ptr_targets([text])
+    assert BASE + 32 not in detector._alias_entries
