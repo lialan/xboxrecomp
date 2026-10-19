@@ -444,6 +444,25 @@ class FunctionDetector:
         than made, so eax kept a stale value that the caller then used as a
         string pointer.
         """
+        # Past nop padding first, then straight after a ret, with the bodies
+        # rebuilt in between. _pass_cc_boundaries knows only int3, and Panzer
+        # Dragoon Orta pads with nop, so its vtable-only COM forwarders sat in
+        # gaps unfound. Found in one sweep with the ret case, a forwarder's own
+        # `mov eax, 0x80070057; ret 0xc` error return still looked like a gap
+        # and was split off as a constant stub, orphaning the branch past it:
+        # that became an unresolved stub, and the forwarder's caller lost 12
+        # bytes of stack.
+        added = self._gap_prologue_sweep(past_padding_only=True)
+        if added:
+            self.functions.clear()
+            self._build_functions(sections)
+        if self._gap_prologue_sweep(past_padding_only=False):
+            added = True
+        if added:
+            print("  functions recovered that follow a ret with no padding")
+        return added
+
+    def _gap_prologue_sweep(self, past_padding_only: bool) -> bool:
         bounds = sorted((f.start, f.end) for f in self.functions.values())
         starts = [b[0] for b in bounds]
 
@@ -456,13 +475,13 @@ class FunctionDetector:
             if not insn.is_ret:
                 continue
             nxt = insn.end_address
-            # Past nop padding too: _pass_cc_boundaries knows only int3, and
-            # Panzer Dragoon Orta pads with nop, so its vtable-only COM
-            # forwarders sat in gaps unfound. A start past padding is aligned.
-            padded = self._skip_padding(nxt)
-            past_padding = padded != nxt and padded % 16 == 0
-            if past_padding:
-                nxt = padded
+            # A start past padding is aligned.
+            past_padding = False
+            if past_padding_only:
+                padded = self._skip_padding(nxt)
+                if padded == nxt or padded % 16:
+                    continue
+                nxt, past_padding = padded, True
             if nxt in self._candidates or nxt in self.functions:
                 continue
             section = self.image.get_section_at_va(nxt)
@@ -493,9 +512,6 @@ class FunctionDetector:
             self._add_candidate(nxt, config.CONFIDENCE_CC_BOUNDARY,
                                 "gap_prologue")
             added = True
-
-        if added:
-            print("  functions recovered that follow a ret with no padding")
         return added
 
     def _closed_body_in_gap(self, addr: int, starts) -> bool:
