@@ -44,6 +44,12 @@ void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
 void xbox_Nv2aFrameCounterFlip(void) {}
+/* The flip hold (#192, nv2a_flip_hold.c, linked in): no vblank moves here,
+ * so the executor never holds a flip. */
+int nv2a_pb_scan_in_call(void) { return 0; }
+uint32_t xbox_VblankCount(void) { return 0; }
+uint64_t xbox_HostNowNs(void) { return 0; }
+uint32_t xbox_Nv2aFrameCountersOwned(void) { return 0; }
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset) { (void)offset; return NULL; }
 
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
