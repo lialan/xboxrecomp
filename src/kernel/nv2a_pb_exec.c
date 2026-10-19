@@ -351,7 +351,8 @@ static struct {
     uint32_t zeta_offset, zstencil_clear;
     /* SET_CLEAR_RECT_HORIZONTAL / _VERTICAL (x0 | x1 << 16, inclusive):
      * the area CLEAR_SURFACE covers on a swizzled surface (clear_surface).
-     * clear_rect_set: whether the title has sent them at all. */
+     * clear_rect_set: bit 0 horizontal, bit 1 vertical sent; the rect
+     * applies once both have been. */
     uint32_t clear_rect_h, clear_rect_v;
     int clear_rect_set;
     /* Fixed-function transform: the composite matrix (world * view *
@@ -931,7 +932,7 @@ static void clear_surface(uint32_t param)
         uint16_t v16 = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
                                 | ((s_gpu.clear_color >> 5) & 0x07E0)
                                 | ((s_gpu.clear_color >> 3) & 0x001F));
-        if (s_gpu.clear_rect_set) {
+        if ((s_gpu.clear_rect_set & 3) == 3) {
             x0 = s_gpu.clear_rect_h & 0xFFFF; x1 = (s_gpu.clear_rect_h >> 16) + 1;
             y0 = s_gpu.clear_rect_v & 0xFFFF; y1 = (s_gpu.clear_rect_v >> 16) + 1;
         }
@@ -1475,6 +1476,11 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
         return;
     if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
+        return;
+    /* A swizzled target is 1<<log on a side, whatever the clip says: past
+     * it the swizzle index wraps onto other texels (xemu bounds it too). */
+    if (s_swz_on && ((uint32_t)x >> ((s_gpu.format >> 16) & 0xF)
+                     || (uint32_t)y >> ((s_gpu.format >> 24) & 0xF)))
         return;
     s_gpu.pixels++;
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
@@ -3869,11 +3875,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case 0x1D98:                       /* SET_CLEAR_RECT_HORIZONTAL */
         s_gpu.clear_rect_h = param;
-        s_gpu.clear_rect_set = 1;
+        s_gpu.clear_rect_set |= 1;
         break;
     case 0x1D9C:                       /* SET_CLEAR_RECT_VERTICAL */
         s_gpu.clear_rect_v = param;
-        s_gpu.clear_rect_set = 1;
+        s_gpu.clear_rect_set |= 2;
         break;
     case NV097_SET_SURFACE_PITCH:
         s_gpu.pitch = param & 0xFFFF;      /* colour pitch; zeta is the top half */
