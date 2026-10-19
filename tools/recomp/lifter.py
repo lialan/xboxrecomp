@@ -717,7 +717,7 @@ def _make_condition(jcc, flag_setter, flag_ops):
             a, b, r, same_sign = "(_fa + _fb)", "_fb", "_fa", False
         elif flag_setter == "add" and rhs == "_fb":
             a, b, r, same_sign = "(_fa - _fb)", "_fb", "_fa", True
-        elif flag_setter in ("and", "or", "xor"):
+        elif flag_setter in ("and", "or", "xor", "test"):
             return "0"
         else:
             return None
