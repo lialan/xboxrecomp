@@ -210,7 +210,9 @@ int gpu_present_frame(const uint32_t *pixels)
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_srv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_samp);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
-    return IDXGISwapChain_Present(s_chain, (UINT)s_vsync, 0) == S_OK;
+    /* Paced only when Present waited for the vblank: with RECOMP_PRESENT_VSYNC=0
+     * the caller keeps its own 16 ms sleep instead of spinning a core. */
+    return IDXGISwapChain_Present(s_chain, (UINT)s_vsync, 0) == S_OK && s_vsync;
 }
 
 void gpu_present_shutdown(void)

@@ -7,7 +7,8 @@
 
 int  gpu_present_enabled(void);                 /* RECOMP_D3D_PRESENT=1 */
 int  gpu_present_init(HWND hwnd, uint32_t width, uint32_t height);
-/* width*height B8G8R8A8; returns 0 when nothing was shown (occluded). */
+/* width*height B8G8R8A8; returns 1 only when the present waited for vsync
+ * (so the caller need not sleep), 0 when unpaced or nothing was shown. */
 int  gpu_present_frame(const uint32_t *pixels);
 int  gpu_present_active(void);
 void gpu_present_shutdown(void);
