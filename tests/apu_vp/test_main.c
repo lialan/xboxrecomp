@@ -98,15 +98,12 @@ static void adpcm_wide_block_decodes(void)
     }
 }
 
-static void adpcm_too_wide_block_is_refused(void)
+static void adpcm_whole_field_fits(void)
 {
-    static MCPXAPUState d;
-    float samples[NUM_SAMPLES_PER_FRAME][2];
-
-    setup_adpcm_voice(&d, ADPCM_MAX_BLOCKS + 1);
-    int n = voice_get_samples(&d, 0, samples, NUM_SAMPLES_PER_FRAME);
-    CHECK(n == -1, "%d blocks: got %d samples, expected the voice refused",
-          ADPCM_MAX_BLOCKS + 1, n);
+    /* samples-per-block is 5 bits plus one: the buffers hold every value
+     * the descriptor can name, so adpcm_wide_block_decodes covers them all
+     * and no voice is ever refused. */
+    CHECK(ADPCM_MAX_BLOCKS >= 0x1F + 1, "ADPCM_MAX_BLOCKS %d < 32", ADPCM_MAX_BLOCKS);
 }
 
 static MCPXAPUState s_lock_d;
@@ -215,7 +212,7 @@ int main(void)
 
     voice_lock_waits_only_for_its_voice();
     adpcm_wide_block_decodes();
-    adpcm_too_wide_block_is_refused();
+    adpcm_whole_field_fits();
     gain_ramps_across_a_frame();
 
     free(s_ram);
@@ -223,8 +220,8 @@ int main(void)
         fprintf(stderr, "%d check(s) failed\n", s_failures);
         return 1;
     }
-    puts("PASS: ADPCM blocks up to the hardware limit decode, wider ones are "
-         "refused, VOICE_LOCK waits only for its own voice, and volume "
+    puts("PASS: every ADPCM block count the descriptor can name decodes, "
+         "VOICE_LOCK waits only for its own voice, and volume "
          "changes ramp across a frame.");
     return 0;
 }
