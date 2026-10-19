@@ -770,6 +770,52 @@ class FunctionDetector:
             print(f"  {found} function address(es) installed into"
                   f" indirect-call slots")
 
+    def _probes_as_escaping_body(self, target, starts, bounds, sections,
+                                 tails, depth: int = 8) -> bool:
+        """A table word's body that closes only through code outside its gap.
+
+        A virtual method compiled as `test eax, eax; je done; ...; jmp [eax+N]`
+        (a guarded vcall tail) or `mov eax, [ecx+N]; jmp [eax*4+table]` (a
+        dispatcher whose arms are other methods) never reaches a ret inside
+        its own gap, and a method whose error path is a direct `jmp` to a
+        helper nobody has found yet leaves the gap by a branch. Jet Set Radio
+        Future's vtables name 103 such methods, every one 16-byte aligned
+        behind padding; three of them stopped its attract demo. They are
+        proven as a closed CFG whose exits are indirect tails through memory,
+        proven entries, or direct destinations that are themselves proven
+        the same way, in their own gaps, to a bounded depth. A destination
+        inside a known body is not this shape and refuses.
+        """
+        proven = set()
+        pending = [target]
+        while pending:
+            entry = pending.pop()
+            if entry in proven or entry in tails:
+                continue
+            if depth <= 0:
+                return False
+            depth -= 1
+            section = next((sec for sec in sections if sec.virtual_addr <= entry
+                            < sec.virtual_addr + sec.virtual_size), None)
+            if section is None or entry not in self.engine.instructions:
+                return False
+            j = bisect.bisect_right(starts, entry) - 1
+            if j >= 0 and bounds[j][0] < entry < bounds[j][1]:
+                return False        # inside a body: not this shape
+            upper = section.virtual_addr + section.virtual_size
+            i = bisect.bisect_right(starts, entry)
+            if i < len(starts):
+                upper = min(upper, starts[i])
+            lower = bounds[j][1] if j >= 0 else section.virtual_addr
+            escapes = set()
+            if not self.engine.probes_as_callback_body(
+                    entry, upper, lower, tail_targets=tails | proven,
+                    allow_indirect_tails="mem", escapes=escapes):
+                return False
+            proven.add(entry)
+            pending.extend(escapes - proven)
+        return target in proven
+
     def _probes_as_tail_body(self, target, starts, sections, *, entry_frame=False) -> bool:
         """Prove a callback's direct tail dependencies in their bounded gaps."""
         proven = set(self.functions) | self._alias_entries.keys()
@@ -1178,7 +1224,9 @@ class FunctionDetector:
                 lower = bounds[j][1] if j >= 0 else sec.virtual_addr
                 if not (self.engine.probes_as_callback_body(
                             target, end, lower, tail_targets=tails)
-                        or self.engine.probes_as_vcall_thunk(target)):
+                        or self.engine.probes_as_vcall_thunk(target)
+                        or self._probes_as_escaping_body(
+                            target, starts, bounds, sections, tails)):
                     if not self._probes_as_tail_body(target, starts, sections):
                         continue
             if end <= target:
