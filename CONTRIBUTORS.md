@@ -403,6 +403,9 @@ direction.
 - **Scoped the macOS port (#19)** — an accurate, specific list of what stands
   in the way (`MAP_FIXED_NOREPLACE`, `memfd_create`, `GlobalMemoryStatusEx`,
   SDL2/epoxy) rather than a request, which is the useful kind of issue.
+  And closed the loop on it: a fresh macOS install of v0.15.0 ran
+  Burnout 3 through boot, the EA, Criterion and RenderWare logos to its title
+  screen, with the keyboard working.
 
 - **The Xbox memory model on a POSIX host (#60)** — and five bugs found by
   making it actually run. The sentinel bug: `for (i = 0; try_bases[i] != 0 || i
@@ -911,6 +914,14 @@ Found on *Jet Set Radio Future*.
 - **Branches out of alias bodies (#199)** — a vtable-only dispatcher branched
   past its own `ret` into a gap the disassembler never claimed, and each call came
   back 12 bytes short on the stack.
+- **Vtable methods that never reach a `ret` in their own gap (#236)** — 103 of
+  JSRF's methods were refused by the closed-body proof: guarded vcall tails,
+  dispatchers whose switch arms are other methods, and error paths that leave
+  by a `jmp` to a helper nobody had found. Three of them stopped the attract
+  demo. Each refusal was measured and sorted by shape before any code changed.
+  Along the way: MSVC's byte index table, parked after a dword jump table,
+  was read as one more arm, and v0.15.0 had accepted eight such data words as
+  function entries.
 
 ### LeandroSSB — [@LeandroSSB](https://github.com/LeandroSSB)
 Found while bringing up *Black* (Criterion, XDK 5849).
@@ -967,6 +978,17 @@ Found while bringing up *SSX 3* (PAL); see
   `--skip-library-immediates` stops it.
 - **NOTICE entries for the xemu-derived NV2A core, NV2A state and APU
   headers (#233).**
+
+### bertibertig — [@bertibertig](https://github.com/bertibertig)
+Found on *SSX 3* (PAL) on Linux.
+
+- **The POSIX file backend ignored `RootDirectory` (#237).** XAPI's save code
+  opens the save directory, then each file in it by its bare name
+  (`Data.ssx`). The Win32 backend joined the name to the handle's path; the
+  POSIX one sent it through the path table alone, so overwriting a save
+  failed with `STATUS_OBJECT_PATH_NOT_FOUND` and the game said "Unable to
+  save". Came with a cross-platform test that fails 3 of 9 checks without
+  the fix.
 
 ---
 

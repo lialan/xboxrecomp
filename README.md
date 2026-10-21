@@ -22,7 +22,7 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 ### Recent Changes
 
-**Current version: v0.15.0 — _"Second Reading"_ (October 2026).**
+**Current version: v0.16.0 — _"Small Print"_ (October 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
@@ -442,7 +442,7 @@ definitions — they are the real proof for the shift, flag and x87 work, and
 each is paired with a negative control that feeds the harness the pre-fix
 expression and requires it to fail. They need a C compiler on `PATH`, and
 **skip rather than fail without one**, so check the skip count: a clean run is
-916 passed / 0 skipped. If clang is installed but not on `PATH`:
+936 passed / 0 skipped. If clang is installed but not on `PATH`:
 
 ```bash
 export PATH="/c/Program Files/LLVM/bin:$PATH"   # Git Bash
@@ -560,6 +560,80 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.16.0 — *"Small Print"* (October 2026)
+
+*Four PRs, every one about a few bytes the tools read past or read too wide.
+A `push cx` moved the stack by four bytes where the CPU moves it by two. An
+MSVC byte index table, `00 02 02 00`, was read as one more dword arm of the
+switch in front of it. Functions behind `nop` padding went unnoticed because
+only `int3` counted as padding. And a save file opened by its bare name,
+`Data.ssx`, lost the directory handle that said where it lived. Each was
+small, and each stopped a game: Jet Set Radio Future's attract demo, SSX 3's
+saves on Linux, and Panzer Dragoon Orta's first boot.*
+
+**Contributed: disassembler**
+
+- **Vtable methods that never reach a `ret` inside their own gap are found.**
+  The closed-body proof refused 103 of JSRF's methods. They were guarded vcall
+  tails (`test eax, eax ; je done ; … ; jmp [eax+N]`), dispatchers whose
+  switch arms are other methods, and error paths that leave by a direct `jmp`
+  to a helper nobody had found yet. A body may now close through an indirect
+  tail via memory, through a proven entry, or through a direct branch whose
+  destination is proven the same way in its own gap, eight levels deep. A
+  byte index table is never taken as an entry: v0.15.0 had accepted eight
+  such data words as functions. A measured jump table also stops in front of
+  the byte table packed after it. On JSRF, 111 of the 113 methods are now
+  entries, up from 10, and the attract demo's three are all found —
+  *[@nworkers](https://github.com/nworkers)* (#236)
+
+**Contributed: kernel**
+
+- **The POSIX file backend opens names relative to a `RootDirectory`
+  handle**, as the Win32 backend already did. XAPI's save code opens the save
+  directory, then each file in it by its bare name. On Linux, overwriting an
+  SSX 3 save failed with "Unable to save" (`STATUS_OBJECT_PATH_NOT_FOUND`).
+  `NtCreateFile`, `NtOpenFile`, `NtDeleteFile` and
+  `NtQueryFullAttributesFile` all take the join. A new cross-platform test,
+  `tests/kernel_file_relative`, covers it —
+  *[@bertibertig](https://github.com/bertibertig)* (#237)
+
+**Maintainer: found by Panzer Dragoon Orta**
+
+- **16-bit `push` and `pop` move esp by 2.** `pop cx` emitted `POP32(esp,
+  cx)`, which did not compile. `push cx` compiled but pushed four bytes,
+  leaving the stack two bytes off. A pop to memory now writes after the
+  increment, as x86 does —
+  *[@sp00nznet](https://github.com/sp00nznet)* (#238)
+- **Functions past `nop` padding are gap functions.** `_pass_cc_boundaries`
+  only knew `int3` padding, so Orta's COM forwarders, reached only through
+  vtables, went unfound, and the first one called at boot was an unresolved
+  indirect call. The gap pass now sweeps the addresses past padding first,
+  then the ones straight after a `ret`. Doing both in one sweep split a
+  forwarder's own error return off as a function. On Orta: 17,764 → 17,933
+  functions, unresolved call stubs 71 → 41, and it boots to the SEGA and
+  Smilebit logos —
+  *[@sp00nznet](https://github.com/sp00nznet)* (#239)
+
+**Testing**
+
+- [@dplewis](https://github.com/dplewis) ran a fresh macOS install of
+  v0.15.0: Burnout 3 boots through the EA, Criterion and RenderWare logos to
+  its title screen, with the keyboard working (#19).
+- `tests/kernel_file_relative` and `tests/kernel_file_status` build and pass
+  under MSVC x64 and on Linux (WSL, GCC 14).
+- **Half-Life 2, regenerated and rebuilt on this release.** It finds 51,114
+  functions (51,104 before), lifts every one, reaches its title screen, and
+  runs 90 s with no faults and no unresolved indirect calls. MSVC pads with
+  `int3`, so #239 finds little there, as expected.
+- A clean run is now **936 passed / 0 skipped**, up from 916, plus 6,368
+  conformance vectors with no mismatches on an AMD host.
+
+**Known issue**
+
+- Burnout 3 (sp00nznet/burnout3) built against `main` stops before its first
+  draw. The break is somewhere in `afeb69f..fb09636`, before v0.15.0, and is
+  being bisected; `burnout3` pins `afeb69f` until then (#240).
 
 ### v0.15.0 — *"Second Reading"* (October 2026)
 
