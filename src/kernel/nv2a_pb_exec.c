@@ -786,7 +786,7 @@ static struct {
     int on;
     uint64_t start, ff, vp, clip, draw, raw, flip, batch;
     uint32_t ff_n, vp_n, raw_n, draw_n;
-} s_prof = { -1 };
+} s_prof = { .on = -1 };
 
 static int prof_on(void)
 {
@@ -2369,40 +2369,52 @@ static void backend_texture(int st, Nv2aTexture *tex)
  * part of it. `use_rc`: the batch came through the program path, whose pixels
  * the software rasteriser shades with the register combiners (xf_rows), so
  * the back end gets their state and inputs too. */
+/* What every batch handed to a back end carries besides its geometry: the
+ * render state, stage-0 texture, visibility counter and combiner state. The
+ * structures it points into are the caller's. */
+static void backend_batch_init(Nv2aBatch *batch, Nv2aSurface *surf,
+                               Nv2aRenderState *rs, Nv2aTexture *tex,
+                               Nv2aTexture stex[4], int textured, int use_rc)
+{
+    int st;
+
+    current_surface(surf);
+    current_render_state(rs);
+    memset(batch, 0, sizeof *batch);
+    batch->texture = NULL;
+    batch->state = rs;
+    if (textured && s_gpu.texs[0].valid) {
+        backend_texture(0, tex);
+        batch->texture = tex;
+    }
+    if (s_gpu.zpass_enable)
+        batch->zpass_out = &s_gpu.zpass_count;
+    if (use_rc) {
+        batch->rc = &s_gpu.rc;
+        batch->fog_color = s_gpu.fog_color;
+        for (st = 0; st < 4; st++) {
+            if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F) || !s_gpu.texs[st].valid)
+                continue;
+            backend_texture(st, &stex[st]);
+            batch->stage[st] = &stex[st];
+        }
+    }
+}
+
 static void backend_flush(int textured, int use_rc)
 {
     Nv2aSurface surf;
     Nv2aRenderState rs;
     Nv2aTexture tex, stex[4];
     Nv2aBatch batch;
-    int st;
 
     if (!s_bcount)
         return;
-    current_surface(&surf);
-    current_render_state(&rs);
-    memset(&batch, 0, sizeof batch);
+    backend_batch_init(&batch, &surf, &rs, &tex, stex, textured, use_rc);
     batch.vertices = s_bverts;
     batch.count = s_bcount;
-    batch.texture = NULL;
-    batch.state = &rs;
-    if (textured && s_gpu.texs[0].valid) {
-        backend_texture(0, &tex);
-        batch.texture = &tex;
-    }
-    if (s_gpu.zpass_enable)
-        batch.zpass_out = &s_gpu.zpass_count;
-    if (use_rc) {
-        batch.rc = &s_gpu.rc;
+    if (use_rc)
         batch.ext = s_bext;
-        batch.fog_color = s_gpu.fog_color;
-        for (st = 0; st < 4; st++) {
-            if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F) || !s_gpu.texs[st].valid)
-                continue;
-            backend_texture(st, &stex[st]);
-            batch.stage[st] = &stex[st];
-        }
-    }
     if (prof_on()) {
         uint64_t t0 = xbox_HostNowNs();
         s_backend->draw(&surf, &batch);
@@ -3265,19 +3277,26 @@ static int xf_clip_poly(const Nv2aVshOutput *in, int n, int pl,
     return m;
 }
 
-static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
-                              const Nv2aVshOutput *c)
+/* Clip at the near plane too, unless RECOMP_CLIP_NEAR_Z=0. */
+static int clip_near_z(void)
 {
     static int near_z = -1;
-    const Nv2aVshOutput *in[3];
-    Nv2aVshOutput p0[8], p1[8];
-    int n = 3, i, j, pl, planes, inside = 1;
 
     if (near_z < 0) {
         const char *e = getenv("RECOMP_CLIP_NEAR_Z");
         near_z = !(e && e[0] == '0');
     }
-    planes = near_z ? 2 : 1;
+    return near_z;
+}
+
+static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+                              const Nv2aVshOutput *c)
+{
+    const Nv2aVshOutput *in[3];
+    Nv2aVshOutput p0[8], p1[8];
+    int n = 3, i, j, pl, planes, inside = 1;
+
+    planes = clip_near_z() ? 2 : 1;
     in[0] = a; in[1] = b; in[2] = c;
     for (i = 0; i < 3; i++) {
         p0[i] = *in[i];
@@ -3372,10 +3391,447 @@ static void xf_set_viewport(void)
     s_xf_o[2] = of[2];
 }
 
+/* The report's per-batch tallies, for either transform path: blend pairs,
+ * attribute formats, texture use. */
+static void batch_note_state(void)
+{
+    uint32_t i;
+
+    if (s_gpu.blend_enable) {
+        uint32_t pair = s_gpu.blend_sfactor << 16 | (s_gpu.blend_dfactor & 0xFFFF);
+        int j;
+        for (j = 0; j < s_gpu.blend_npairs && s_gpu.blend_pairs[j] != pair; j++)
+            ;
+        if (j == s_gpu.blend_npairs && j < 16)
+            s_gpu.blend_pairs[s_gpu.blend_npairs++] = pair;
+    }
+    for (i = 0; i < NV2A_VSH_INPUTS; i++) {
+        const VertexAttr *at = &s_gpu.attr[i];
+        uint32_t f = at->type | (at->size << 4) | (i << 8), j;
+        if (!at->size || !at->stride)
+            continue;
+        for (j = 0; j < (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_fmt[j] != f; j++)
+            ;
+        if (j == (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_nfmt < 16)
+            s_gpu.xf_fmt[s_gpu.xf_nfmt++] = f;
+    }
+    if (s_gpu.texs[0].valid)
+        note_texture_use();
+}
+
+/* ---- Raw draws: the back end transforms (Nv2aRawGeometry) ----------------
+ *
+ * RECOMP_GPU_XF=1 (or ff) offers fixed-function batches to a back end's
+ * draw_raw() untransformed; unset or 0, none are. Whatever the back end
+ * declines, and every batch while it is off, goes through the CPU transform
+ * below as before. Vertex-program batches always do. */
+enum { RAW_D_PRIM, RAW_D_RANGE, RAW_D_SPAN, RAW_D_BACKEND, RAW_D_N };
+static const char *const k_raw_decline[RAW_D_N] = {
+    "points/lines", "index range", "attribute span", "back end"
+};
+static struct {
+    uint32_t ff_batches, ff_tris, ff_verts, cpu_batches;
+    uint32_t declined[RAW_D_N];
+    /* RECOMP_GPU_XF_CHECK */
+    uint32_t checked, check_verts, mismatch_batches, mismatch_verts, cpu_aborts;
+    uint32_t eye_plane;
+} s_raw;
+
+static int raw_xf_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_XF");
+        on = e && (e[0] == '1' || !strcmp(e, "ff"));
+        if (on)
+            fprintf(stderr, "[GPU] raw draws (RECOMP_GPU_XF=%s): the back end"
+                    " transforms fixed-function batches\n", e);
+    }
+    return on && s_backend && s_backend->draw_raw;
+}
+
+/* Can fetch_attr read this attribute at all (array batches)? */
+static int attr_usable(const VertexAttr *a)
+{
+    if (!a->size || !a->stride || !a->offset)
+        return 0;
+    switch (a->type) {
+    case 0: case 1: case 2: case 4: case 5: case 6:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Describe attribute slot `a` for the vertices min..max: the guest stream,
+ * or the constant fetch_attr's failure leaves (0,0,0,1). Returns 0 when the
+ * stream is there but [min, max] runs outside guest memory -- the CPU path
+ * fails such vertices one at a time, which a stream cannot express. */
+static int raw_attrib(uint32_t a, uint32_t min, uint32_t max, Nv2aAttrib *out)
+{
+    const VertexAttr *va = &s_gpu.attr[a];
+    uint64_t at;
+    uint32_t bytes;
+
+    memset(out, 0, sizeof *out);
+    out->value[3] = 1.0f;
+    if (!attr_usable(va))
+        return 1;
+    at = (uint64_t)va->offset + (uint64_t)min * va->stride;
+    bytes = (max - min) * va->stride + attr_elem_bytes(va);
+    if (!guest_span_ok(at, bytes))
+        return 0;
+    out->data = (const uint8_t *)xbox_GetMemoryOffset() + at;
+    out->guest_va = (uint32_t)at;
+    out->type = va->type;
+    out->size = va->size < 4 ? va->size : 4;
+    out->stride = va->stride;
+    out->bytes = bytes;
+    return 1;
+}
+
+/* Everything ffp_vertex() decides per vertex that is in fact fixed for the
+ * batch -- which matrix, which env switch, which attribute is the colour --
+ * decided once here, so the back end's shader holds no policy. Kept in step
+ * with ffp_vertex, ffp_skinned_clip, ffp_eye, lit_color and ffp_texgen. */
+static void ffp_pack_state(Nv2aFixedState *f)
+{
+    static int skin_off = -1, unskinned_composite = -1, methods_only = -1;
+    const float *p = (const float *)&s_reg[0x0440 / 4];
+    uint32_t mode = s_reg[0x0328 / 4], mask = s_reg[0x03BC / 4];
+    uint32_t colmat = s_reg[0x0298 / 4], st, c;
+    int i, k;
+
+    if (skin_off < 0) {
+        const char *e = getenv("RECOMP_FFP_SKIN");
+        skin_off = e && e[0] == '0';
+        unskinned_composite = getenv("RECOMP_FFP_MVP") == NULL;
+        methods_only = getenv("RECOMP_FFP_CMAT_METHODS") != NULL;
+    }
+    memset(f, 0, sizeof *f);
+    if (methods_only)
+        memcpy(f->composite, s_gpu.composite, sizeof f->composite);
+    else
+        for (i = 0; i < 4; i++)
+            memcpy(&f->composite[4 * i], nv2a_vsh_constant((uint32_t)i), 16);
+    for (k = 0; k < 4; k++)
+        memcpy(f->mv[k], &s_reg[(0x0480 + 0x40 * k) / 4], sizeof f->mv[k]);
+    /* As ffp_skinned_clip: an all-zero projection means the composite's. */
+    for (i = 0; i < 16 && p[i] == 0.0f; i++)
+        ;
+    if (i == 16)
+        for (i = 0; i < 4; i++)
+            memcpy(&f->proj[4 * i], nv2a_vsh_constant((uint32_t)i), 16);
+    else
+        memcpy(f->proj, p, sizeof f->proj);
+    memcpy(f->c59, nv2a_vsh_constant(59), sizeof f->c59);
+    f->use_composite = mode > 6 || skin_off || (!mode && unskinned_composite);
+    f->skin_mode = mode <= 6 ? mode : 0;
+
+    f->color_slot = (uint32_t)(color_attr() - s_gpu.attr);
+    f->tex0_slot = (uint32_t)(texcoord_attr() - s_gpu.attr);
+    f->has_normal = attr_usable(&s_gpu.attr[2]);
+    f->has_color = attr_usable(&s_gpu.attr[f->color_slot]);
+
+    f->lighting = s_reg[0x0314 / 4] && f->has_normal;
+    f->colmat_amb = ((colmat >> 2) & 3) == 1;
+    f->colmat_dif = ((colmat >> 4) & 3) == 1;
+    f->flip_normals = (uint32_t)ffp_flip_normals();
+    f->scene_amb[0] = reg_f(0x0A10);
+    f->scene_amb[1] = reg_f(0x0A14);
+    f->scene_amb[2] = reg_f(0x0A18);
+    f->mat_alpha = reg_f(0x03B4);
+    for (i = 0; i < NV_LIGHTS; i++) {
+        uint32_t b = 0x1000 + (uint32_t)i * 0x80;
+        float *l = f->light[i];
+        f->light_kind[i] = (mask >> (2 * i)) & 3;
+        for (k = 0; k < 3; k++) {
+            l[0 + k]  = reg_f(b + 0x00 + 4 * (uint32_t)k);     /* ambient */
+            l[4 + k]  = reg_f(b + 0x0C + 4 * (uint32_t)k);     /* diffuse */
+            l[8 + k]  = reg_f(b + 0x34 + 4 * (uint32_t)k);     /* infinite direction */
+            l[12 + k] = reg_f(b + 0x5C + 4 * (uint32_t)k);     /* local position */
+            l[16 + k] = reg_f(b + 0x68 + 4 * (uint32_t)k);     /* attenuation */
+        }
+        l[3] = reg_f(b + 0x24);                                /* range */
+    }
+    for (st = 0; st < 4; st++) {
+        int any = 0;
+        for (c = 0; c < 4; c++) {
+            uint32_t m = s_reg[(0x03C0 + 0x10 * st + 4 * c) / 4];
+            f->texgen[st][c] = m;
+            if (m == 0x8511 || m == 0x8512 || m == 0x2402)
+                any = 1;
+        }
+        f->texgen_on[st] = any && f->has_normal;
+        f->texmat_on[st] = s_reg[(0x0420 + 4 * st) / 4] != 0;
+        memcpy(f->texmat[st], &s_reg[(0x06C0 + 0x40 * st) / 4], sizeof f->texmat[st]);
+    }
+}
+
+static void raw_dump_state(const Nv2aFixedState *f)
+{
+    int i;
+
+    fprintf(stderr, "[XFCHK]   ff: skin %u composite %u lighting %u (colmat %u/%u flip %u)"
+            " colour v%u%s tex0 v%u normal %u texgen %u%u%u%u texmat %u%u%u%u"
+            " c59 %g %g %g %g\n",
+            f->skin_mode, f->use_composite, f->lighting, f->colmat_amb, f->colmat_dif,
+            f->flip_normals, f->color_slot, f->has_color ? "" : "(none)", f->tex0_slot,
+            f->has_normal, f->texgen_on[0], f->texgen_on[1], f->texgen_on[2],
+            f->texgen_on[3], f->texmat_on[0], f->texmat_on[1], f->texmat_on[2],
+            f->texmat_on[3], f->c59[0], f->c59[1], f->c59[2], f->c59[3]);
+    for (i = 0; i < 4; i++)
+        fprintf(stderr, "[XFCHK]   comp %9.4g %9.4g %9.4g %9.4g | proj %9.4g %9.4g %9.4g %9.4g"
+                " | mv0 %9.4g %9.4g %9.4g %9.4g\n",
+                f->composite[4 * i], f->composite[4 * i + 1], f->composite[4 * i + 2],
+                f->composite[4 * i + 3], f->proj[4 * i], f->proj[4 * i + 1],
+                f->proj[4 * i + 2], f->proj[4 * i + 3], f->mv[0][4 * i],
+                f->mv[0][4 * i + 1], f->mv[0][4 * i + 2], f->mv[0][4 * i + 3]);
+}
+
+static int raw_close(float a, float b, float rel, float abs_tol)
+{
+    float d = fabsf(a - b), m = fabsf(a) > fabsf(b) ? fabsf(a) : fabsf(b);
+
+    if (a != a || b != b)
+        return a != a && b != b;
+    return d <= abs_tol || d <= rel * m;
+}
+
+/* RECOMP_GPU_XF_CHECK: transform the batch on the CPU as well and compare,
+ * vertex by vertex, with what the back end's shader produced (check_out):
+ * a translation bug shows here apart from any rasterisation difference. */
+static void raw_check(const Nv2aRawGeometry *g, const float *gpu)
+{
+    static int logged_batches;
+    uint32_t i, k, bad = 0;
+    int logged = 0;
+
+    if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
+        return;
+    s_raw.checked++;
+    for (i = 0; i < s_gpu.idx_count; i++)
+        if (!transform_vertex(s_gpu.idx[i], &s_xf[i])) {
+            /* The CPU drops the whole batch for one vertex at w = 0; the
+             * shader clips only the triangles touching it. */
+            s_raw.cpu_aborts++;
+            return;
+        }
+    for (i = 0; i < s_gpu.idx_count; i++) {
+        const Nv2aVshOutput *c = &s_xf[i];
+        const float *o = gpu + (size_t)(s_gpu.idx[i] - g->min_index) * NV2A_RAW_CHECK_FLOATS;
+        float want[NV2A_RAW_CHECK_FLOATS];
+        int ok = 1;
+
+        memcpy(&want[0], c->pos, 16);
+        memcpy(&want[4], c->d0, 16);
+        memcpy(&want[8], c->d1, 16);
+        want[12] = fog_factor(c->fog[0]);
+        memcpy(&want[13], c->tex, 64);
+        s_raw.check_verts++;
+        /* Position: pixels, z, w. A vertex at the eye plane (|w| small,
+         * clipped away by both) divides float rounding in the matrix rows
+         * -- 1e9 terms cancelling in VC3's composite -- into millions of
+         * pixels; it is counted, not compared. */
+        if (fabsf(want[3]) < 1e-2f || fabsf(o[3]) < 1e-2f)
+            s_raw.eye_plane++;
+        else
+            for (k = 0; k < 4 && ok; k++)
+                ok = raw_close(o[k], want[k], 1e-4f, k < 2 ? 1e-2f : 1e-6f);
+        for (k = 4; k < 13 && ok; k++)         /* colours, fog: 8 bits */
+            ok = raw_close(o[k], want[k], 0.0f, 1.0f / 255.0f);
+        for (k = 13; k < NV2A_RAW_CHECK_FLOATS && ok; k++)
+            ok = raw_close(o[k], want[k], 1e-4f, 1e-5f);
+        if (ok)
+            continue;
+        bad++;
+        if (logged_batches < 16 && logged < 3) {
+            logged++;
+            fprintf(stderr, "[XFCHK] batch %u index %u (vertex %u):\n", s_raw.ff_batches,
+                    i, s_gpu.idx[i]);
+            fprintf(stderr, "[XFCHK]   cpu pos %g %g %g %g d0 %g %g %g %g fog %g"
+                    " t0 %g %g %g %g t1 %g %g %g %g\n", want[0], want[1], want[2], want[3],
+                    want[4], want[5], want[6], want[7], want[12], want[13], want[14],
+                    want[15], want[16], want[17], want[18], want[19], want[20]);
+            fprintf(stderr, "[XFCHK]   gpu pos %g %g %g %g d0 %g %g %g %g fog %g"
+                    " t0 %g %g %g %g t1 %g %g %g %g\n", o[0], o[1], o[2], o[3],
+                    o[4], o[5], o[6], o[7], o[12], o[13], o[14], o[15], o[16], o[17],
+                    o[18], o[19], o[20]);
+        }
+    }
+    if (bad) {
+        s_raw.mismatch_batches++;
+        s_raw.mismatch_verts += bad;
+        if (logged_batches++ < 16) {
+            fprintf(stderr, "[XFCHK] batch %u: %u of %u vertices differ\n",
+                    s_raw.ff_batches, bad, s_gpu.idx_count);
+            raw_dump_state(g->ff);
+        }
+    }
+}
+
+/* Offer the batch to the back end untransformed. Returns 1 when it has been
+ * drawn, 0 to transform it on the CPU instead. */
+static int try_draw_raw(void)
+{
+    static uint16_t *ridx;
+    static float *check_buf;
+    static int check_n = -1;
+    uint32_t n = s_gpu.idx_count, i, lo, hi, prim, count = 0, tris;
+    Nv2aFixedState ff;
+    Nv2aRawGeometry g;
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    Nv2aTexture tex, stex[4];
+    Nv2aBatch batch;
+    const VertexAttr *tc;
+    int check = 0;
+    uint64_t t0 = prof_on() ? xbox_HostNowNs() : 0;
+
+    if (!ridx && !(ridx = (uint16_t *)malloc((NV_MAX_INDICES / 4 * 6 + 8) * sizeof *ridx)))
+        return 0;
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+    case NV_PRIM_QUADS:
+    case NV_PRIM_QUAD_STRIP:     prim = NV_PRIM_TRIANGLES;      break;
+    case NV_PRIM_TRIANGLE_STRIP: prim = NV_PRIM_TRIANGLE_STRIP; break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:        prim = NV_PRIM_TRIANGLE_FAN;   break;
+    default:
+        s_raw.declined[RAW_D_PRIM]++;
+        return 0;
+    }
+    /* The position must be readable, or the CPU path drops the batch. */
+    if (!attr_usable(&s_gpu.attr[0])) {
+        s_raw.declined[RAW_D_SPAN]++;
+        return 0;
+    }
+    lo = hi = s_gpu.idx[0];
+    for (i = 1; i < n; i++) {
+        uint32_t v = s_gpu.idx[i];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    if (hi - lo >= 65536u) {
+        s_raw.declined[RAW_D_RANGE]++;
+        return 0;
+    }
+    /* Indices rebased to lo; quads split as raster_batch_program splits them. */
+    if (s_gpu.prim == NV_PRIM_QUADS) {
+        for (i = 0; i + 3 < n; i += 4) {
+            ridx[count++] = (uint16_t)(s_gpu.idx[i] - lo);
+            ridx[count++] = (uint16_t)(s_gpu.idx[i + 1] - lo);
+            ridx[count++] = (uint16_t)(s_gpu.idx[i + 2] - lo);
+            ridx[count++] = (uint16_t)(s_gpu.idx[i] - lo);
+            ridx[count++] = (uint16_t)(s_gpu.idx[i + 2] - lo);
+            ridx[count++] = (uint16_t)(s_gpu.idx[i + 3] - lo);
+        }
+    } else if (s_gpu.prim == NV_PRIM_QUAD_STRIP) {
+        for (i = 0; i + 3 < n; i += 2) {
+            ridx[count++] = (uint16_t)(s_gpu.idx[i] - lo);
+            ridx[count++] = (uint16_t)(s_gpu.idx[i + 1] - lo);
+            ridx[count++] = (uint16_t)(s_gpu.idx[i + 3] - lo);
+            ridx[count++] = (uint16_t)(s_gpu.idx[i] - lo);
+            ridx[count++] = (uint16_t)(s_gpu.idx[i + 3] - lo);
+            ridx[count++] = (uint16_t)(s_gpu.idx[i + 2] - lo);
+        }
+    } else {
+        count = prim == NV_PRIM_TRIANGLES ? n / 3 * 3 : n;
+        for (i = 0; i < count; i++)
+            ridx[i] = (uint16_t)(s_gpu.idx[i] - lo);
+    }
+    if (count < 3) {
+        s_raw.declined[RAW_D_PRIM]++;
+        return 0;
+    }
+    tris = prim == NV_PRIM_TRIANGLES ? count / 3 : count - 2;
+
+    ffp_pack_state(&ff);
+    memset(&g, 0, sizeof g);
+    for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+        int used = i == 0 || (i == 1 && ff.skin_mode) || (i == 2 && ff.has_normal)
+                || i == ff.color_slot || i == ff.tex0_slot || (i >= 10 && i <= 12);
+        if (!raw_attrib(i, lo, hi, &g.attr[i])) {
+            if (used) {
+                s_raw.declined[RAW_D_SPAN]++;
+                return 0;
+            }
+            memset(&g.attr[i], 0, sizeof g.attr[i]);
+            g.attr[i].value[3] = 1.0f;
+        }
+    }
+    g.prim = prim;
+    g.indices = ridx;
+    g.index_count = count;
+    g.min_index = lo;
+    g.max_index = hi;
+    g.kind = NV2A_RAW_FIXED;
+    g.ff = &ff;
+    g.aa_sx = s_gpu.aa_sx;
+    g.aa_sy = s_gpu.aa_sy;
+    g.vp_off_z = ff.c59[2];
+    g.near_z = (uint32_t)clip_near_z();
+    g.fog_enable = s_gpu.fog_enable;
+    g.fog_mode = s_gpu.fog_mode;
+    g.fog_param[0] = s_gpu.fog_param[0];
+    g.fog_param[1] = s_gpu.fog_param[1];
+    g.uv_scale0[0] = g.uv_scale0[1] = 1.0f;
+    if (tex_size_from_format(s_gpu.texs[0].color)) {
+        g.uv_scale0[0] = (float)s_gpu.texs[0].width;
+        g.uv_scale0[1] = (float)s_gpu.texs[0].height;
+    }
+
+    if (check_n < 0) {
+        const char *e = getenv("RECOMP_GPU_XF_CHECK");
+        check_n = e ? atoi(e) : 0;
+    }
+    if (check_n > 0 && (s_raw.ff_batches < (uint32_t)check_n
+                        || s_raw.ff_batches % 1000 == 0)) {
+        if (!check_buf)
+            check_buf = (float *)malloc((size_t)65536 * NV2A_RAW_CHECK_FLOATS
+                                        * sizeof *check_buf);
+        if (check_buf) {
+            g.check_out = check_buf;
+            check = 1;
+        }
+    }
+
+    /* As raster_batch_program: no texture coordinates, no texture. */
+    tc = texcoord_attr();
+    s_xf_no_tex = !(tc->offset && tc->stride);
+    backend_batch_init(&batch, &surf, &rs, &tex, stex, !s_xf_no_tex, backend_use_rc());
+    batch.raw = &g;
+    if (!s_backend->draw_raw(&surf, &batch)) {
+        s_raw.declined[RAW_D_BACKEND]++;
+        return 0;
+    }
+    if (check)
+        raw_check(&g, check_buf);
+    s_raw.ff_batches++;
+    s_raw.ff_tris += tris;
+    s_raw.ff_verts += hi - lo + 1;
+    s_gpu.batches_ffp++;
+    batch_note_state();
+    s_gpu.tris_drawn += tris;
+    note_drawn();
+    if (t0) {
+        s_prof.raw += xbox_HostNowNs() - t0;
+        s_prof.raw_n++;
+    }
+    return 1;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
-    uint64_t t0 = prof_on() ? xbox_HostNowNs() : 0, t1 = 0;
+    uint64_t t0, t1 = 0;
+
+    if (!batch_uses_program() && raw_xf_enabled() && try_draw_raw())
+        return;
+    if (!batch_uses_program())
+        s_raw.cpu_batches++;
+    t0 = prof_on() ? xbox_HostNowNs() : 0;
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
@@ -3431,14 +3887,6 @@ static void raster_batch_program(void)
             }
         }
     }
-    if (s_gpu.blend_enable) {
-        uint32_t pair = s_gpu.blend_sfactor << 16 | (s_gpu.blend_dfactor & 0xFFFF);
-        int j;
-        for (j = 0; j < s_gpu.blend_npairs && s_gpu.blend_pairs[j] != pair; j++)
-            ;
-        if (j == s_gpu.blend_npairs && j < 16)
-            s_gpu.blend_pairs[s_gpu.blend_npairs++] = pair;
-    }
     {
         /* RECOMP_VSH_TRACE=<n>: print n program batches -- attribute setup,
          * raw inputs, key constants, and what came out. */
@@ -3477,18 +3925,7 @@ static void raster_batch_program(void)
                         s_xf[i].pos[3]);
         }
     }
-    for (i = 0; i < NV2A_VSH_INPUTS; i++) {
-        const VertexAttr *at = &s_gpu.attr[i];
-        uint32_t f = at->type | (at->size << 4) | (i << 8), j;
-        if (!at->size || !at->stride)
-            continue;
-        for (j = 0; j < (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_fmt[j] != f; j++)
-            ;
-        if (j == (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_nfmt < 16)
-            s_gpu.xf_fmt[s_gpu.xf_nfmt++] = f;
-    }
-    if (s_gpu.texs[0].valid)
-        note_texture_use();
+    batch_note_state();
 
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
@@ -4986,6 +5423,20 @@ void nv2a_pb_exec_report(void)
     if (s_gpu.batches_ffp)
         fprintf(stderr, "[GPU] fixed-function transform: %u batches\n",
                 s_gpu.batches_ffp);
+    if (s_raw.ff_batches || (s_raw.cpu_batches && raw_xf_enabled())) {
+        fprintf(stderr, "[GPU]   on the back end: %u batches, %u triangles, %u vertices;"
+                " on the CPU %u; declined:", s_raw.ff_batches, s_raw.ff_tris,
+                s_raw.ff_verts, s_raw.cpu_batches);
+        for (i = 0; i < RAW_D_N; i++)
+            fprintf(stderr, " %s %u", k_raw_decline[i], s_raw.declined[i]);
+        fputc(10, stderr);
+        if (s_raw.checked)
+            fprintf(stderr, "[GPU]   check: %u batches (%u vertices), %u batches with"
+                    " %u differing vertices, %u the CPU dropped whole, %u vertices at"
+                    " the eye plane\n", s_raw.checked, s_raw.check_verts,
+                    s_raw.mismatch_batches, s_raw.mismatch_verts, s_raw.cpu_aborts,
+                    s_raw.eye_plane);
+    }
     fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
                     " %u drawn; pixels %llu written, %llu depth-failed;"
                     " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",

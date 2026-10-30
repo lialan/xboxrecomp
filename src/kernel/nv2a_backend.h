@@ -18,7 +18,9 @@
  * same way: the executor transforms fixed-function vertices itself, runs
  * vertex programs on the CPU (nv2a_vsh_interp.c) and clips at the near plane,
  * so a back end only ever sees surface pixels. Blend, depth, alpha, cull and
- * stencil state arrive in Nv2aRenderState.
+ * stencil state arrive in Nv2aRenderState. The exception is a back end with
+ * draw_raw(), which is offered fixed-function batches untransformed
+ * (Nv2aRawGeometry, below) under RECOMP_GPU_XF.
  *
  * ponytail: register-combiner state and texture stages 1-3 are not passed on:
  * a back end sees stage 0 and the diffuse colour. Extend Nv2aBatch when that
@@ -97,6 +99,87 @@ typedef struct {
     float    tex[4][4];
 } Nv2aVertexEx;
 
+/* ---- Raw geometry: a back end that transforms vertices itself -------------
+ *
+ * Transforming every vertex on the CPU, once per index and with no vertex
+ * cache, then expanding each triangle into Nv2aVertex + Nv2aVertexEx, is most
+ * of the executor thread's time in a 3D scene. A back end with a draw_raw()
+ * entry point is offered the batch untransformed instead: the attribute
+ * streams as the title laid them out, the index list, and the transform state
+ * with every executor quirk and switch already resolved (Nv2aFixedState), so
+ * the back end's shader is pure arithmetic. It must produce what the CPU path
+ * would: the same screen position, colours and texture coordinates per
+ * vertex, clipped at w = 1e-3 and (near_z) at the near plane.
+ *
+ * Fixed function only (NV2A_RAW_FIXED): it carries nearly all of a 3D
+ * scene's vertices. Vertex-program batches -- a few vertices each, HUD and
+ * composite quads in VC3 -- stay on the CPU. */
+
+#define NV2A_RAW_FIXED   2
+
+/* One NV2A vertex attribute as the title set it. */
+typedef struct {
+    const void *data;       /* host pointer to element min_index; NULL: constant */
+    uint32_t guest_va;      /* guest address of the same (0 when constant) */
+    uint32_t type, size, stride;   /* NV097 encodings (type nibble, 1-4); bytes */
+    uint32_t bytes;         /* readable span from data: (max-min)*stride + element */
+    float    value[4];      /* the value when data is NULL: 0,0,0,1 */
+} Nv2aAttrib;
+
+/* Fixed-function transform, lighting and texgen, as the executor's CPU path
+ * (ffp_vertex) evaluates it. Matrices are as the methods deliver them:
+ * row-major, result[i] = sum_j m[4i+j] * v[j]. */
+typedef struct {
+    float composite[16];          /* clip = composite * pos when use_composite */
+    float mv[4][16];              /* model-view k (0x0480 + 0x40k) */
+    float proj[16];               /* 0x0440, or constants 0-3 when that is empty */
+    float texmat[4][16];
+    float c59[4];                 /* viewport offset */
+    /* SET_SKIN_MODE as the title set it (0 when out of range): the blend
+     * weights for the eye-space position and normal texgen reads, and -- unless
+     * use_composite -- for the clip position. */
+    uint32_t skin_mode;
+    uint32_t use_composite;       /* unskinned (or skinning off): composite */
+    uint32_t lighting;            /* lighting on and a usable normal */
+    uint32_t light_kind[8];       /* 0 off, 1 infinite, 2+ local */
+    uint32_t colmat_amb, colmat_dif;   /* COLOR_MATERIAL takes them from d0 */
+    uint32_t flip_normals;        /* RECOMP_FFP_FLIP_NORMALS */
+    float    scene_amb[4];
+    float    mat_alpha;
+    /* Per light, five vec4s: ambient.rgb range | diffuse.rgb - | direction - |
+     * position - | attenuation 0,1,2 - */
+    float    light[8][20];
+    uint32_t texgen[4][4];        /* SET_TEXGEN_S/T/R/Q per stage */
+    uint32_t texgen_on[4];        /* a mode texgen implements, and a normal */
+    uint32_t texmat_on[4];
+    /* Attribute slots, as the executor's heuristics picked them
+     * (color_attr, texcoord_attr). Absent streams are constants in attr[]. */
+    uint32_t color_slot, tex0_slot;
+    uint32_t has_normal, has_color;   /* 0: no normal stream / white diffuse */
+} Nv2aFixedState;
+
+typedef struct {
+    /* NV_PRIM_TRIANGLES (5), _TRIANGLE_STRIP (6) or _TRIANGLE_FAN (7); quads
+     * arrive already split into triangles, points and lines never. */
+    uint32_t prim;
+    const uint16_t *indices;      /* rebased: 0 is min_index */
+    uint32_t index_count, min_index, max_index;
+    Nv2aAttrib attr[16];
+    uint32_t kind;                /* NV2A_RAW_FIXED */
+    const Nv2aFixedState *ff;
+    /* Screen space: surface pixels = (clip.xy / w + c59.xy) * aa. */
+    float aa_sx, aa_sy;
+    float vp_off_z;               /* c59.z: the near plane is z = vp_off_z */
+    uint32_t near_z;              /* clip at it (RECOMP_CLIP_NEAR_Z) */
+    uint32_t fog_enable, fog_mode;  /* fog_factor() of the fog coordinate */
+    float fog_param[2];
+    float uv_scale0[2];           /* stage 0 in texels: (w, h); else (1, 1) */
+    /* RECOMP_GPU_XF_CHECK: when set, also write each vertex min..max as the
+     * shader computed it, 29 floats: screen x y z w, d0 rgba, d1 rgba,
+     * fog factor, then T0-T3 (s t r q). */
+    float *check_out;
+} Nv2aRawGeometry;
+
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
@@ -116,7 +199,13 @@ typedef struct {
      * The count answers GET_REPORT, the visibility test titles cull with;
      * left at 0, everything they test is "hidden" and never drawn. */
     uint32_t           *zpass_out;
+    /* draw_raw() only: the untransformed batch. vertices and ext are NULL and
+     * count is 0; texture, state, rc, stage, fog_color and zpass_out mean the
+     * same as above. */
+    const Nv2aRawGeometry *raw;
 } Nv2aBatch;
+
+#define NV2A_RAW_CHECK_FLOATS 29
 
 typedef struct {
     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
@@ -125,6 +214,10 @@ typedef struct {
                   uint32_t flags, uint32_t argb, uint32_t zstencil);
     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
     void (*flip)(void);
+    /* Optional: draw b->raw, transforming on the back end. Returns 0 to
+     * decline, and the executor then transforms the batch itself. A back end
+     * initialised as { clear, draw, flip } leaves it NULL. */
+    int  (*draw_raw)(const Nv2aSurface *s, const Nv2aBatch *b);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
