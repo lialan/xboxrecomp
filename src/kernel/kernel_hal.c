@@ -1442,6 +1442,26 @@ NTSTATUS __stdcall xbox_NtSetSystemTime(PLARGE_INTEGER SystemTime, PLARGE_INTEGE
 static ULONG g_av_saved_data_address = 0;
 static ULONG g_av_display_mode = 0;
 
+/* The AV pack this console reports. HDTV by default; RECOMP_AV_PACK picks
+ * another (a number, or "vga"). Sega Chihiro titles need VGA: their modes
+ * (Virtua Cop 3 runs at 1024x768) exist only in the VGA rows of D3D's mode
+ * table, so on an HDTV pack device creation fails with E_FAIL. */
+static ULONG xbox_AvPack(void)
+{
+    static ULONG pack;
+    if (!pack) {
+        const char *v = getenv("RECOMP_AV_PACK");
+        pack = AV_PACK_HDTV;
+        if (v && *v)
+            pack = (v[0] == 'v' || v[0] == 'V') ? AV_PACK_VGA
+                                                : (ULONG)strtoul(v, NULL, 0);
+        if (pack != AV_PACK_HDTV)
+            fprintf(stderr, "[HAL] AV pack %lu (RECOMP_AV_PACK)\n",
+                    (unsigned long)pack);
+    }
+    return pack;
+}
+
 ULONG __stdcall xbox_AvGetSavedDataAddress(void)
 {
     return g_av_saved_data_address;
@@ -1473,7 +1493,7 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
          * HDTV pack keeps 480p/720p available to titles that offer them;
          * NTSC-M and 60Hz are the North American retail default, and match
          * the region reported by ExQueryNonVolatileSetting. */
-        *Result = AV_PACK_HDTV
+        *Result = xbox_AvPack()
                 | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
                 | AV_REFRESH_60Hz;
         break;
@@ -1578,8 +1598,8 @@ NTSTATUS __stdcall xbox_HalReadSMBusValue(
             *DataValue = 0x60;
             break;
         case SMC_CMD_AV_PACK:
-            /* HDTV/Component pack */
-            *DataValue = AV_PACK_HDTV;
+            /* HDTV/Component pack unless RECOMP_AV_PACK says otherwise */
+            *DataValue = xbox_AvPack();
             break;
         case SMC_CMD_CPU_TEMP:
             *DataValue = 40; /* 40 degrees C */
