@@ -20,6 +20,7 @@
 #include "guest_vmem.h"
 #include "kernel_missing.h"
 #include "nv2a_flip_hold.h"
+#include "host_time.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1439,7 +1440,24 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    /* Idle back-off: after IDLE_SPINS passes with nothing new to walk and
+     * no flip held, each pass sleeps RECOMP_ACK_IDLE_US (default 100 us; 0:
+     * spin as before) instead of only yielding. Spinning kept a core at full
+     * speed between frames -- most of this thread's time on the Quest, heat
+     * that throttles a long session -- for latency nothing needs: work is
+     * picked up within the sleep, and the title's own waits are paced by
+     * vblanks of 16.7 ms. */
+    enum { IDLE_SPINS = 200 };
+    static long idle_us = -1;
+    uint32_t idle = 0;
+    if (idle_us < 0) {
+        const char *e = getenv("RECOMP_ACK_IDLE_US");
+        idle_us = e ? atol(e) : 100;
+        if (idle_us < 0 || idle_us > 2000)
+            idle_us = 100;
+    }
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        int worked = 0;
         /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
          * nothing, leaves DMA_GET where it is and acknowledges no PFB flush,
          * which is how the title feels the console's FLIP_STALL. Nothing is
@@ -1504,6 +1522,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             if (!flip_held
                     && (put != last_put || (now_ms - last_put_ms) > 2000)) {
+                worked = put != last_put;
                 /* Survey the segment the title just submitted, once. */
                 {
                     extern void nv2a_pb_scan(uint32_t);
@@ -1637,7 +1656,14 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
-        Sleep(0);  /* yield; the waiter is spinning on another core */
+        if (worked || flip_held)
+            idle = 0;
+        else if (idle < IDLE_SPINS)
+            idle++;
+        if (idle >= IDLE_SPINS && idle_us > 0)
+            xbox_HostSleepNs((uint64_t)idle_us * 1000u);
+        else
+            Sleep(0);  /* yield; the waiter is spinning on another core */
     }
     return 0;
 }
