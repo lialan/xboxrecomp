@@ -4653,6 +4653,32 @@ static void flip_hold_report(void)
  * otherwise takes nothing and returns 0, and the walker goes word by word. */
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 
+/* A run of vertex-program or constant words (TRANSFORM_PROGRAM 0x0B00,
+ * TRANSFORM_CONSTANT 0x0B80; inc: the method steps by 4 a word), from the
+ * walker: VC3 sends a program and its constants with nearly every vertex-
+ * program batch, each word through the switch and a chain of range checks
+ * before reaching these two calls. Takes the run when every word is one of
+ * them; returns 0 and takes nothing otherwise. */
+int nv2a_pb_exec_vsh_run(uint32_t subch, uint32_t method, int inc, const uint32_t *p,
+                         uint32_t count)
+{
+    uint32_t i, last = inc ? method + 4 * (count - 1) : method;
+
+    if (subch != 0 || !count || s_ftrace == 2 || method < 0x0B00 || last >= 0x0C00)
+        return 0;
+    if (method < 0x0B80 && last >= 0x0B80)
+        return 0;                           /* crosses from program to constants */
+    for (i = 0; i < count; i++) {
+        uint32_t m = inc ? method + 4 * i : method;
+        s_reg[m / 4] = p[i];
+        if (m < 0x0B80)
+            nv2a_vsh_program_word(p[i]);
+        else
+            nv2a_vsh_constant_word(p[i]);
+    }
+    return 1;
+}
+
 int nv2a_pb_exec_data_run(uint32_t subch, uint32_t method, const uint32_t *p, uint32_t count)
 {
     uint32_t i;

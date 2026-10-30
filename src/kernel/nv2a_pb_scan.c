@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -45,6 +46,8 @@ static uint32_t s_tot_calls;
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern int nv2a_pb_exec_data_run(uint32_t subch, uint32_t method, const uint32_t *p,
                                  uint32_t count);
+extern int nv2a_pb_exec_vsh_run(uint32_t subch, uint32_t method, int inc, const uint32_t *p,
+                                uint32_t count);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
@@ -74,6 +77,13 @@ static uint16_t s_seen_slot[8][0x2000 / 4];
 
 static void note(uint32_t subch, uint32_t method)
 {
+    /* The inventory is only reported with RECOMP_PB_SCAN; kept otherwise, it
+     * was a table update for every word of every frame's push buffer. */
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!on)
+        return;
     uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
 
     if (*slot) {
@@ -527,6 +537,21 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                     continue;
                 }
             }
+            /* vertex-program and constant uploads: the run in one call */
+            if (method >= 0x0B00 && method < 0x0C00 && s_exec_enabled && data_run) {
+                uint32_t n = count;
+                if ((end_va - va) / 4 < n)
+                    n = (end_va - va) / 4;
+                if (n && n == count
+                    && nv2a_pb_exec_vsh_run(subch, method, !noninc,
+                                            (const uint32_t *)(mem + va), n)) {
+                    for (uint32_t i = 0; i < n; i++)
+                        note(subch, noninc ? method : method + i * 4);
+                    va += 4 * n;
+                    words += n;
+                    continue;
+                }
+            }
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
@@ -556,7 +581,34 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
         extern void nv2a_pb_exec_walk_begin(void);
         nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
     }
-    words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
+    {
+        /* RECOMP_PROF: the walk's own time a second -- all of the executor's
+         * push-buffer work, draws included -- and its words */
+        static int prof = -1;
+        static uint64_t acc_ns, t0, acc_words;
+        struct timespec ta, tb;
+        if (prof < 0)
+            prof = getenv("RECOMP_PROF") != NULL;
+        if (prof)
+            clock_gettime(CLOCK_MONOTONIC, &ta);
+        words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
+        if (prof) {
+            uint64_t a_ns, b_ns;
+            clock_gettime(CLOCK_MONOTONIC, &tb);
+            a_ns = (uint64_t)ta.tv_sec * 1000000000ull + (uint64_t)ta.tv_nsec;
+            b_ns = (uint64_t)tb.tv_sec * 1000000000ull + (uint64_t)tb.tv_nsec;
+            acc_ns += b_ns - a_ns;
+            acc_words += words;
+            if (!t0)
+                t0 = a_ns;
+            if (b_ns - t0 >= 1000000000ull) {
+                fprintf(stderr, "[PROF] walk %.0f ms, %llu words\n", acc_ns / 1e6,
+                        (unsigned long long)acc_words);
+                acc_ns = acc_words = 0;
+                t0 = b_ns;
+            }
+        }
+    }
 
     s_tot_words += words;
     s_tot_unknown += unknown;
