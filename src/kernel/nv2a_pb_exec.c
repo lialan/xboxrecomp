@@ -4182,7 +4182,10 @@ static void draw_primitive(void)
         }
     }
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    static int prim_verbose = -1;   /* cached: this runs for every draw */
+    if (prim_verbose < 0)
+        prim_verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    if (prim_verbose) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -4640,6 +4643,71 @@ static void flip_hold_report(void)
     h->holds = h->timeouts = h->clock_stops = h->nonop = 0;
     h->iv[0] = h->iv[1] = h->iv[2] = h->iv[3] = 0;
     h->held_ns = 0;
+}
+
+/* A run of parameter words to one non-incrementing method, from the walker
+ * (nv2a_pb_scan.c): index lists and inline vertex data, which came a call
+ * per word -- some two hundred thousand a frame in a busy scene, each
+ * through every check below. Takes the whole run when it is plain data for
+ * an open primitive, exactly as the per-word cases do, and returns 1;
+ * otherwise takes nothing and returns 0, and the walker goes word by word. */
+void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+
+int nv2a_pb_exec_data_run(uint32_t subch, uint32_t method, const uint32_t *p, uint32_t count)
+{
+    uint32_t i;
+
+    if (subch != 0 || !s_gpu.prim || !count || s_ftrace == 2)
+        return 0;
+    switch (method) {
+    case NV097_ARRAY_ELEMENT16:
+        for (i = 0; i < count && s_gpu.idx_count + 2 <= NV_MAX_INDICES; i++) {
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(p[i] & 0xFFFF);
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(p[i] >> 16);
+        }
+        break;
+    case 0x1808:                            /* ARRAY_ELEMENT32 */
+        for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
+            s_gpu.idx[s_gpu.idx_count++] = p[i];
+        break;
+    case NV097_INLINE_ARRAY:
+        for (i = 0; i < count && s_gpu.inline_count < NV_MAX_INLINE; i++)
+            s_gpu.inline_buf[s_gpu.inline_count++] = p[i];
+        break;
+    default:
+        return 0;
+    }
+    s_reg[(method & 0x1FFCu) / 4] = p[count - 1];  /* as word by word leaves it */
+    {   /* RECOMP_PB_DATARUN_CHECK=1: the same words word by word, compared */
+        static int check = -1;
+        static uint32_t runs, bad;
+        if (check < 0)
+            check = getenv("RECOMP_PB_DATARUN_CHECK") != NULL;
+        if (check) {
+            static uint32_t fast_idx[NV_MAX_INDICES], fast_inl[NV_MAX_INLINE];
+            uint32_t i1 = s_gpu.idx_count, n1 = s_gpu.inline_count, i0, n0;
+            /* the run's own words: back to where it started */
+            i0 = method == NV097_INLINE_ARRAY ? i1
+               : i1 - (method == NV097_ARRAY_ELEMENT16 ? 2 * count : count);
+            n0 = method == NV097_INLINE_ARRAY ? n1 - count : n1;
+            if (i1 >= NV_MAX_INDICES - 2 || n1 >= NV_MAX_INLINE - 1)
+                return 1;                   /* clipped at the end: not comparable */
+            memcpy(fast_idx, s_gpu.idx + i0, (i1 - i0) * sizeof s_gpu.idx[0]);
+            memcpy(fast_inl, s_gpu.inline_buf + n0, (n1 - n0) * 4);
+            s_gpu.idx_count = i0;
+            s_gpu.inline_count = n0;
+            for (i = 0; i < count; i++)
+                nv2a_pb_exec_method(subch, method, p[i]);
+            runs++;
+            if (s_gpu.idx_count != i1 || s_gpu.inline_count != n1
+                || memcmp(fast_idx, s_gpu.idx + i0, (i1 - i0) * sizeof s_gpu.idx[0])
+                || memcmp(fast_inl, s_gpu.inline_buf + n0, (n1 - n0) * 4))
+                bad++;
+            if ((runs & 0xFFFF) == 0)
+                fprintf(stderr, "[PB] data runs checked %u, differing %u\n", runs, bad);
+        }
+    }
+    return 1;
 }
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)

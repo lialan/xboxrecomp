@@ -43,6 +43,8 @@ static uint32_t s_tot_calls;
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern int nv2a_pb_exec_data_run(uint32_t subch, uint32_t method, const uint32_t *p,
+                                 uint32_t count);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
@@ -508,6 +510,23 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
+            /* index lists and inline vertex data: the run in one call */
+            static int data_run = -1;     /* RECOMP_PB_DATARUN=0: word by word */
+            if (data_run < 0)
+                data_run = !(getenv("RECOMP_PB_DATARUN") && getenv("RECOMP_PB_DATARUN")[0] == '0');
+            if (noninc && count > 1 && s_exec_enabled && data_run) {
+                uint32_t n = count;
+                if ((end_va - va) / 4 < n)
+                    n = (end_va - va) / 4;
+                if (n && nv2a_pb_exec_data_run(subch, method,
+                                               (const uint32_t *)(mem + va), n)) {
+                    for (uint32_t i = 0; i < n; i++)
+                        note(subch, method);
+                    va += 4 * n;
+                    words += n;
+                    continue;
+                }
+            }
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
