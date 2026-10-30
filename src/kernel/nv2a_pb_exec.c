@@ -45,6 +45,8 @@
 #define NV_TLS __declspec(thread)
 #else
 #define NV_TLS __thread
+#include <pthread.h>
+#include <unistd.h>   /* sysconf: raster pool size */
 #endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -2490,16 +2492,6 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
 #define NV_RASTER_MAX_THREADS 16
 #define NV_RASTER_MT_MIN_PIXELS 8192
 
-#if defined(_WIN32)
-static struct {
-    int n;                                  /* threads incl. the caller */
-    HANDLE start[NV_RASTER_MAX_THREADS], done;
-    volatile LONG pending;
-    const XfTri *tris;
-    int ntris;
-    XfCount cnt[NV_RASTER_MAX_THREADS];
-} s_pool;
-
 /* Worker k owns the rows y with y % n == k, for every triangle of the run,
  * in submission order. Each pixel therefore sees its triangles in the order
  * the title drew them, whichever thread draws it. */
@@ -2512,6 +2504,16 @@ static void xf_rows_owned(const XfTri *tris, int ntris, int k, int n,
         xf_rows(&tris[i], y0, n, cnt);
     }
 }
+
+#if defined(_WIN32)
+static struct {
+    int n;                                  /* threads incl. the caller */
+    HANDLE start[NV_RASTER_MAX_THREADS], done;
+    volatile LONG pending;
+    const XfTri *tris;
+    int ntris;
+    XfCount cnt[NV_RASTER_MAX_THREADS];
+} s_pool;
 
 static DWORD WINAPI raster_worker(LPVOID arg)
 {
@@ -2581,13 +2583,98 @@ static void xf_rows_parallel(const XfTri *T, int ntris, long px,
     }
 }
 #else
+/* The same pool on pthreads. A run is published by bumping gen under the
+ * lock; each worker draws its rows once per generation and the last one to
+ * finish wakes the caller. */
+static struct {
+    int n;                                  /* threads incl. the caller */
+    pthread_mutex_t mu;
+    pthread_cond_t go, done;
+    unsigned gen;
+    int pending;
+    const XfTri *tris;
+    int ntris;
+    XfCount cnt[NV_RASTER_MAX_THREADS];
+} s_pool = { 0, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
+             PTHREAD_COND_INITIALIZER, 0, 0, NULL, 0, {{0, 0, 0}} };
+
+static void *raster_worker(void *arg)
+{
+    int k = (int)(intptr_t)arg;
+    unsigned seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&s_pool.mu);
+        while (s_pool.gen == seen)
+            pthread_cond_wait(&s_pool.go, &s_pool.mu);
+        seen = s_pool.gen;
+        pthread_mutex_unlock(&s_pool.mu);
+        memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
+        xf_rows_owned(s_pool.tris, s_pool.ntris, k, s_pool.n, &s_pool.cnt[k]);
+        pthread_mutex_lock(&s_pool.mu);
+        if (--s_pool.pending == 0)
+            pthread_cond_signal(&s_pool.done);
+        pthread_mutex_unlock(&s_pool.mu);
+    }
+    return NULL;
+}
+
+static int raster_pool_size(void)
+{
+    static int init;
+    if (!init) {
+        const char *e = getenv("RECOMP_RASTER_THREADS");
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        int n, k;
+        init = 1;
+        n = e ? atoi(e) : (int)cpus - 4;
+        if (n < 1) n = 1;
+        if (n > NV_RASTER_MAX_THREADS) n = NV_RASTER_MAX_THREADS;
+        s_pool.n = n;
+        for (k = 0; k < n - 1; k++) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, raster_worker, (void *)(intptr_t)k)) {
+                s_pool.n = k + 1;           /* run with the workers we got */
+                break;
+            }
+            pthread_detach(t);
+        }
+    }
+    return s_pool.n;
+}
+
 static void xf_rows_parallel(const XfTri *T, int ntris, long px,
                              XfCount *total)
 {
-    int k;
-    (void)px;
-    for (k = 0; k < ntris; k++)
-        xf_rows(&T[k], T[k].miny, 1, total);
+    int n = raster_pool_size(), k;
+
+    if (n <= 1 || px < NV_RASTER_MT_MIN_PIXELS) {
+        for (k = 0; k < ntris; k++)
+            xf_rows(&T[k], T[k].miny, 1, total);
+        return;
+    }
+    pthread_mutex_lock(&s_pool.mu);
+    s_pool.tris = T;
+    s_pool.ntris = ntris;
+    s_pool.pending = n - 1;
+    s_pool.gen++;
+    pthread_cond_broadcast(&s_pool.go);
+    pthread_mutex_unlock(&s_pool.mu);
+    {
+        XfCount mine = {0, 0, 0};
+        xf_rows_owned(T, ntris, n - 1, n, &mine);
+        pthread_mutex_lock(&s_pool.mu);
+        while (s_pool.pending)
+            pthread_cond_wait(&s_pool.done, &s_pool.mu);
+        pthread_mutex_unlock(&s_pool.mu);
+        total->depth_fail += mine.depth_fail;
+        total->pixels += mine.pixels;
+        total->zpass += mine.zpass;
+    }
+    for (k = 0; k < n - 1; k++) {
+        total->depth_fail += s_pool.cnt[k].depth_fail;
+        total->pixels += s_pool.cnt[k].pixels;
+        total->zpass += s_pool.cnt[k].zpass;
+    }
 }
 #endif
 
@@ -4096,6 +4183,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
             draws_at_flip = s_gpu.draws;
         }
+        /* A back end that renders off the CPU resolves its surfaces into
+         * guest memory here, so the present and the dump below read the
+         * frame just finished rather than whatever the buffer last held. */
+        if (s_backend && s_backend->flip)
+            s_backend->flip();
         if (s_gpu.pitch) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
@@ -4130,8 +4222,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
         }
         s_gpu.drawn_stale = 1;
-        if (s_backend && s_backend->flip)
-            s_backend->flip();
 
         if (verbose) {
             static unsigned n;
