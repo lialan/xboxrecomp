@@ -777,6 +777,45 @@ static void surface_apply_clip(void)
 
 static const Nv2aBackend *s_backend;
 
+/* RECOMP_PROF=1: once a second, where the executor thread's time went --
+ * transforming fixed-function and vertex-program batches on the CPU, clipping
+ * and expanding their triangles, the back end's draw() and flip(), and the
+ * raw (GPU-transformed) draws. Which of those dominates decides what to move
+ * off the CPU next; guessing had it at texture hashing. */
+static struct {
+    int on;
+    uint64_t start, ff, vp, clip, draw, raw, flip, batch;
+    uint32_t ff_n, vp_n, raw_n, draw_n;
+} s_prof = { -1 };
+
+static int prof_on(void)
+{
+    if (s_prof.on < 0)
+        s_prof.on = getenv("RECOMP_PROF") != NULL;
+    return s_prof.on;
+}
+
+static void prof_flip(void)
+{
+    uint64_t now = xbox_HostNowNs(), dt;
+
+    if (!s_prof.start) {
+        s_prof.start = now;
+        return;
+    }
+    dt = now - s_prof.start;
+    if (dt < 1000000000ull)
+        return;
+    fprintf(stderr, "[PROF] %.2f s: batches %.0f ms | FF xf %.0f ms (%u) | VP xf %.0f ms (%u)"
+            " | clip+expand %.0f ms | draw %.0f ms (%u) | raw %.0f ms (%u) | flip %.0f ms\n",
+            dt / 1e9, s_prof.batch / 1e6, s_prof.ff / 1e6, s_prof.ff_n,
+            s_prof.vp / 1e6, s_prof.vp_n, s_prof.clip / 1e6, s_prof.draw / 1e6,
+            s_prof.draw_n, s_prof.raw / 1e6, s_prof.raw_n, s_prof.flip / 1e6);
+    memset(&s_prof, 0, sizeof s_prof);
+    s_prof.on = 1;
+    s_prof.start = now;
+}
+
 void nv2a_backend_register(const Nv2aBackend *backend)
 {
     s_backend = backend;
@@ -2364,7 +2403,14 @@ static void backend_flush(int textured, int use_rc)
             batch.stage[st] = &stex[st];
         }
     }
-    s_backend->draw(&surf, &batch);
+    if (prof_on()) {
+        uint64_t t0 = xbox_HostNowNs();
+        s_backend->draw(&surf, &batch);
+        s_prof.draw += xbox_HostNowNs() - t0;
+        s_prof.draw_n++;
+    } else {
+        s_backend->draw(&surf, &batch);
+    }
     s_gpu.tris_drawn += s_bcount / 3;
     s_bcount = 0;
     note_drawn();
@@ -3329,12 +3375,23 @@ static void xf_set_viewport(void)
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
+    uint64_t t0 = prof_on() ? xbox_HostNowNs() : 0, t1 = 0;
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
     for (i = 0; i < n; i++)
         if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
             return;                                    /* no program loaded */
+    if (t0) {
+        t1 = xbox_HostNowNs();
+        if (batch_uses_program()) {
+            s_prof.vp += t1 - t0;
+            s_prof.vp_n++;
+        } else {
+            s_prof.ff += t1 - t0;
+            s_prof.ff_n++;
+        }
+    }
     xf_set_viewport();
     {
         const VertexAttr *tc = texcoord_attr();
@@ -3464,6 +3521,8 @@ static void raster_batch_program(void)
     }
     /* The batch's triangles, all at once (see xf_queue_push). */
     xf_queue_flush();
+    if (t0)
+        s_prof.clip += xbox_HostNowNs() - t1;
     if (backend_draws())
         backend_flush(!s_xf_no_tex, backend_use_rc());
 }
@@ -3634,7 +3693,10 @@ static void draw_primitive(void)
     {
         uint32_t t0 = s_gpu.tris_drawn;
         uint64_t p0 = s_gpu.pixels;
+        uint64_t b0 = prof_on() ? xbox_HostNowNs() : 0;
         raster_batch();
+        if (b0)
+            s_prof.batch += xbox_HostNowNs() - b0;
         if (s_ftrace == 2) {
             fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                     " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
@@ -4480,6 +4542,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
         frame_trace_flip();
+        if (prof_on())
+            prof_flip();
         return;
 
     case NV097_FLIP_STALL: {
@@ -4519,8 +4583,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* A back end that renders off the CPU resolves its surfaces into
          * guest memory here, so the present and the dump below read the
          * frame just finished rather than whatever the buffer last held. */
-        if (s_backend && s_backend->flip)
+        if (s_backend && s_backend->flip) {
+            uint64_t f0 = prof_on() ? xbox_HostNowNs() : 0;
             s_backend->flip();
+            if (f0)
+                s_prof.flip += xbox_HostNowNs() - f0;
+        }
         if (s_gpu.pitch) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
