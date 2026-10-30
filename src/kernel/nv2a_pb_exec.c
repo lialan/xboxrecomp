@@ -4256,6 +4256,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+        /* RECOMP_PB_SUBCH_LOG=1: each distinct (subchannel, method) seen
+         * outside the 3D class, once, to tell whether a title drives the 2D
+         * objects (surface-2D, image blit) that nothing here models. */
+        static int on = -1;
+        static uint32_t seen[128];
+        static int nseen;
+        if (on < 0)
+            on = getenv("RECOMP_PB_SUBCH_LOG") != NULL;
+        if (on && nseen < 128) {
+            uint32_t key = (subch << 16) | method;
+            int k;
+            for (k = 0; k < nseen && seen[k] != key; k++)
+                ;
+            if (k == nseen) {
+                seen[nseen++] = key;
+                fprintf(stderr, "[SUBCH] %u:%04X = %08X\n", subch, method, param);
+            }
+        }
         note_unhandled(method, param);
         return;
     }
