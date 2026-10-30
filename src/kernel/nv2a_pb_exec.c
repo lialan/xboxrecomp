@@ -1939,6 +1939,95 @@ static int ffp_skinned_clip(uint32_t index, const float in[4], float clip[4])
     return 1;
 }
 
+/* Eye-space position and unit normal of a fixed-function vertex, blended
+ * through the skinning matrices like the position is (model-view 0 when
+ * skinning is off). Normals go through the matrices themselves, as
+ * lit_color does. Returns 0 without a normal. */
+static int ffp_eye(uint32_t index, float e[3], float n[3])
+{
+    uint32_t mode = s_reg[0x0328 / 4];
+    float pos[4], nrm[4], wt[4] = {0.0f, 0.0f, 0.0f, 1.0f}, ww[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float len;
+    int nm = 1, k, i;
+
+    if (!s_gpu.attr[2].size || !fetch_attr(&s_gpu.attr[0], index, pos)
+        || !fetch_attr(&s_gpu.attr[2], index, nrm))
+        return 0;
+    if (mode && mode <= 6) {
+        fetch_attr(&s_gpu.attr[1], index, wt);
+        nm = mode <= 2 ? 2 : mode <= 4 ? 3 : 4;
+        for (k = 0; k < 4; k++)
+            ww[k] = k < nm ? wt[k] : 0.0f;
+        if (mode & 1) {                        /* last weight implied */
+            ww[nm - 1] = 1.0f;
+            for (k = 0; k < nm - 1; k++)
+                ww[nm - 1] -= wt[k];
+        }
+    }
+    for (i = 0; i < 3; i++)
+        e[i] = n[i] = 0.0f;
+    for (k = 0; k < nm; k++) {
+        const float *mv = (const float *)&s_reg[(0x0480 + 0x40 * k) / 4];
+        for (i = 0; i < 3; i++) {
+            e[i] += ww[k] * (mv[4 * i] * pos[0] + mv[4 * i + 1] * pos[1]
+                           + mv[4 * i + 2] * pos[2] + mv[4 * i + 3] * pos[3]);
+            n[i] += ww[k] * (mv[4 * i] * nrm[0] + mv[4 * i + 1] * nrm[1]
+                           + mv[4 * i + 2] * nrm[2]);
+        }
+    }
+    len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (len > 1e-8f)
+        for (i = 0; i < 3; i++)
+            n[i] /= len;
+    return 1;
+}
+
+/* Fixed-function texture coordinate generation (SET_TEXGEN_S/T/R/Q,
+ * 0x03C0 + 0x10 * stage + 4 * component): normal map, reflection map and
+ * sphere map, from the eye-space normal and view vector. Eye- and
+ * object-linear (which need their planes) keep the vertex's coordinate.
+ * Virtua Cop 3 lights its people this way; without it every vertex looked
+ * up one texel and faces came out a flat colour. */
+static void ffp_texgen(uint32_t index, int st, float tc[4])
+{
+    float e[3], n[3], u[3], r[3], d, len;
+    uint32_t mode[4];
+    int c, any = 0;
+
+    for (c = 0; c < 4; c++) {
+        mode[c] = s_reg[(0x03C0 + 0x10 * st + 4 * c) / 4];
+        if (mode[c] == 0x8511 || mode[c] == 0x8512 || mode[c] == 0x2402)
+            any = 1;
+    }
+    if (!any || !ffp_eye(index, e, n))
+        return;
+    len = sqrtf(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
+    for (c = 0; c < 3; c++)
+        u[c] = len > 1e-8f ? e[c] / len : 0.0f;
+    d = n[0] * u[0] + n[1] * u[1] + n[2] * u[2];
+    for (c = 0; c < 3; c++)
+        r[c] = u[c] - 2.0f * d * n[c];
+    for (c = 0; c < 4; c++) {
+        switch (mode[c]) {
+        case 0x8511:                                       /* NORMAL_MAP */
+            if (c < 3) tc[c] = n[c];
+            break;
+        case 0x8512:                                       /* REFLECTION_MAP */
+            if (c < 3) tc[c] = r[c];
+            break;
+        case 0x2402: {                                     /* SPHERE_MAP */
+            float m = 2.0f * sqrtf(r[0] * r[0] + r[1] * r[1] + (r[2] + 1.0f) * (r[2] + 1.0f));
+            if (c < 2 && m > 1e-8f) tc[c] = r[c] / m + 0.5f;
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    if (!mode[3])
+        tc[3] = 1.0f;
+}
+
 /* One fixed-function vertex, in the shape a vertex program produces. */
 static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
 {
@@ -2034,6 +2123,7 @@ static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
                     st, s_reg[(0x0420 + 4 * st) / 4], s_reg[(0x03C0 + 0x10 * st) / 4],
                     s_reg[(0x03C4 + 0x10 * st) / 4]);
         }
+        ffp_texgen(index, st, out->tex[st]);
         if (s_reg[(0x0420 + 4 * st) / 4]) {
             const float *tm = (const float *)&s_reg[(0x06C0 + 0x40 * st) / 4];
             float t[4];
