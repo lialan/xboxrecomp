@@ -5320,12 +5320,26 @@ static void bridge_ObReferenceObjectByHandle(void)
 
     (void)obj_type;
     if (thread) {
+        static unsigned shown;
+        if (getenv("RECOMP_THOBJ_TRACE") && (shown++ < 16 || shown % 200000 == 0))
+            fprintf(stderr, "  [KERNEL] ObReferenceObjectByHandle(0x%08X) -> thread 0x%08X "
+                            "signal %u exit 0x%08X\n", handle, thread,
+                    BRIDGE_MEM32(thread + THOBJ_SIGNAL),
+                    BRIDGE_MEM32(thread + THOBJ_EXIT_STATUS));
         thobj_ref(thread);
         if (object_ptr) BRIDGE_MEM32(object_ptr) = thread;
         g_eax = 0;
         return;
     }
     /* Other objects still have no guest body. */
+    {   /* A handle token with no object: callers that read the object (XAPI's
+         * GetExitCodeThread reads SignalState at +4) see a NULL one, so name
+         * the handle once. */
+        static int logged;
+        if ((handle & 0xFF000000u) == 0x48000000u && logged++ < 8)
+            fprintf(stderr, "  [KERNEL] ObReferenceObjectByHandle(0x%08X, type 0x%08X): "
+                            "no object for this handle\n", handle, obj_type);
+    }
     if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
     g_eax = 0;  /* STATUS_SUCCESS */
 }

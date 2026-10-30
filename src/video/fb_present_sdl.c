@@ -51,8 +51,24 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
 extern int  xbox_InputAnyOpen(void);
 
-#define FB_W 640u
-#define FB_H 480u
+/* The displayed surface. 640x480 unless RECOMP_FB_SIZE=WxH says otherwise
+ * (Sega Chihiro titles run at 1024x768); read once, before the window opens
+ * and before any flip is copied. */
+static uint32_t s_fb_w = 640u, s_fb_h = 480u;
+#define FB_W s_fb_w
+#define FB_H s_fb_h
+
+static void fb_size_from_env(void)
+{
+    const char *e = getenv("RECOMP_FB_SIZE");
+    unsigned w, h;
+
+    if (e && sscanf(e, "%ux%u", &w, &h) == 2 && w >= 64 && h >= 64
+            && w <= 4096 && h <= 4096) {
+        s_fb_w = w;
+        s_fb_h = h;
+    }
+}
 
 /* ── Handoff: three slots, one each for writer, reader and the ready frame ── */
 
@@ -286,6 +302,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     if (!env_on("RECOMP_FB_WINDOW") || env_on("RECOMP_HEADLESS"))
         return guest_main();
 
+    fb_size_from_env();
     e = getenv("RECOMP_PRESENT_VSYNC");
     vsync = !e || env_on("RECOMP_PRESENT_VSYNC");
     e = getenv("RECOMP_WINDOW_SCALE");
