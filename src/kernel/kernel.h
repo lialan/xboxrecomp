@@ -1317,6 +1317,14 @@ void xbox_VblankArmBits(volatile uint32_t *pcrtc_intr, volatile LONG *tick_busy,
  * has come (or a vblank is being raised) within the last second. */
 int xbox_VblankAckHeld(void);
 
+/* A host showing frames on a display of its own clock (a headset at 120 Hz)
+ * aligns the 60 Hz vblank schedule to it: edge_ns (xbox_HostNowNs's clock)
+ * is a display frame's start, and the schedule's edges slew towards it
+ * modulo the vblank period, by at most a quarter millisecond a call -- so a
+ * title paced by vblanks finishes its frames in step with the display, and
+ * each is shown the same number of times. */
+void xbox_VblankAlign(uint64_t edge_ns);
+
 #ifdef __cplusplus
 }
 #endif

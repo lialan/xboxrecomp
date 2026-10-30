@@ -3279,11 +3279,20 @@ static uint64_t vblank_due(uint64_t t0_ns, uint64_t n)
     return t0_ns + n * 1000000000ull / 60u;
 }
 
+/* xbox_VblankAlign's request: a display edge, 0 when none is pending. */
+static int64_t g_vbl_align_ns;
+
+void xbox_VblankAlign(uint64_t edge_ns)
+{
+    __atomic_store_n(&g_vbl_align_ns, (int64_t)edge_ns, __ATOMIC_RELEASE);
+}
+
 static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
 {
     static uint64_t t0_ns, count;
     static int started;
     uint64_t due;
+    int64_t edge;
 
     *next_due_ns = 0;
     if (kernel_vblank_mode() != XBOX_VBLANK_PACED)
@@ -3292,6 +3301,21 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
         started = 1;
         t0_ns = now_ns;
         count = 0;
+    }
+    edge = __atomic_exchange_n(&g_vbl_align_ns, (int64_t)0, __ATOMIC_ACQ_REL);
+    if (edge) {
+        /* the schedule's phase against the edge, in (-P/2, P/2]: slew */
+        const int64_t P = 1000000000ll / 60, step = 250000;
+        int64_t d = (edge - (int64_t)vblank_due(t0_ns, count)) % P;
+        if (d > P / 2)
+            d -= P;
+        else if (d <= -P / 2)
+            d += P;
+        if (d > step)
+            d = step;
+        else if (d < -step)
+            d = -step;
+        t0_ns = (uint64_t)((int64_t)t0_ns + d);
     }
     due = vblank_due(t0_ns, count);
     if (now_ns < due) {
