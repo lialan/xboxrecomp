@@ -1923,10 +1923,25 @@ static int ffp_skinned_clip(uint32_t index, const float in[4], float clip[4])
 /* One fixed-function vertex, in the shape a vertex program produces. */
 static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
 {
-    const float *m = s_gpu.composite, *off = nv2a_vsh_constant(59);
-    float in[4], clip[4], c[4], w;
+    const float *off = nv2a_vsh_constant(59);
+    float in[4], clip[4], c[4], w, cm[16];
+    const float *m = cm;
     uint32_t st;
     int i;
+    static int methods_only = -1;
+
+    /* The composite as the hardware holds it: constant slots 0-3, which the
+     * composite methods and CONSTANT_LOAD uploads both write. Reading only
+     * the methods' copy left objects whose matrix arrived as constants at a
+     * stale transform -- Virtua Cop 3's rooms, flung off screen in combat.
+     * RECOMP_FFP_CMAT_METHODS=1 reads the methods' copy as before. */
+    if (methods_only < 0)
+        methods_only = getenv("RECOMP_FFP_CMAT_METHODS") != NULL;
+    if (methods_only)
+        m = s_gpu.composite;
+    else
+        for (i = 0; i < 4; i++)
+            memcpy(&cm[4 * i], nv2a_vsh_constant((uint32_t)i), 16);
 
     if (!fetch_attr(&s_gpu.attr[0], index, in))
         return 0;
@@ -2199,6 +2214,8 @@ static void backend_flush(int textured, int use_rc)
         backend_texture(0, &tex);
         batch.texture = &tex;
     }
+    if (s_gpu.zpass_enable)
+        batch.zpass_out = &s_gpu.zpass_count;
     if (use_rc) {
         batch.rc = &s_gpu.rc;
         batch.ext = s_bext;
@@ -4430,6 +4447,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x06B0: case 0x06B4: case 0x06B8: case 0x06BC:
         memcpy(&s_gpu.composite[(method - 0x0680) / 4], &param, 4);
         s_gpu.composite_set = 1;
+        /* The composite is XFCTX CMAT0, slots 0-3 of the transform-constant
+         * file (xemu: vsh_constants[CMAT0 + slot / 4][slot % 4]); D3D may
+         * also write it there with CONSTANT_LOAD, see ffp_vertex. */
+        nv2a_vsh_constant_component((method - 0x0680) / 16,
+                                    ((method - 0x0680) / 4) & 3, param);
         break;
 
     /* Depth. */

@@ -108,6 +108,11 @@ typedef struct {
     const Nv2aVertexEx *ext;
     const Nv2aTexture  *stage[4];
     uint32_t            fog_color;
+    /* Set while the title counts visible pixels (SET_ZPASS_PIXEL_COUNT_ENABLE):
+     * the back end adds the pixels of this batch that pass the depth test.
+     * The count answers GET_REPORT, the visibility test titles cull with;
+     * left at 0, everything they test is "hidden" and never drawn. */
+    uint32_t           *zpass_out;
 } Nv2aBatch;
 
 typedef struct {
