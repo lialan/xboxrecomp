@@ -29,6 +29,13 @@
  * Closing the window ends the process: the window owns the main thread, and
  * lifted code cannot be stopped mid-flight. atexit handlers still run.
  *
+ * A back end may hand the window a group of frames per flip instead
+ * (xbox_FramebufferWindowPresentFrames): in-between frames it made, then the
+ * real one. The window spreads a group over the flip interval it measures --
+ * frame i of n at arrival + i * interval / n -- on this thread, so a higher
+ * display rate costs the executor one copy per frame and never a vsync. A
+ * flip that delivered a group skips the plain copy.
+ *
  * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display;
  * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2).
  */
@@ -72,10 +79,15 @@ static void fb_size_from_env(void)
 
 /* ── Handoff: three slots, one each for writer, reader and the ready frame ── */
 
+/* A slot holds a group of n frames, back to back, each FB_W * FB_H * bpp;
+ * a plain flip is a group of one. */
+#define FB_GROUP_MAX 8
+
 struct fb_slot {
     uint8_t *px;
     size_t   cap;
     uint32_t bpp;
+    int      n;
 };
 
 /* What the window takes from SDL, and gives back on every way out. */
@@ -95,6 +107,33 @@ static volatile uint32_t s_fb_va, s_fb_pitch; /* AvSetDisplayMode surface */
 /* Counted at the flip, read once a second for the title bar. */
 static uint64_t s_flips;
 static uint32_t s_frame_draws;
+
+/* The flip (s_flips) that delivered a group: its plain present stands down.
+ * Executor thread only. */
+static uint64_t s_group_flip = (uint64_t)-1;
+
+/* Frames put on screen, for a back end's rate log. */
+static uint64_t s_presents;
+
+uint64_t xbox_FramebufferWindowPresentCount(void)
+{
+    return __atomic_load_n(&s_presents, __ATOMIC_RELAXED);
+}
+
+int xbox_FramebufferWindowOpen(void)
+{
+    return __atomic_load_n(&s_running, __ATOMIC_RELAXED);
+}
+
+/* Called on the main thread once the window and renderer exist: a title
+ * adds its menus there (AppKit wants them on that thread, after SDL has
+ * built the menu bar). */
+static void (*s_open_hook)(void);
+
+void xbox_HostWindowOnOpen(void (*fn)(void))
+{
+    s_open_hook = fn;
+}
 
 static uint64_t now_ms(void)
 {
@@ -119,9 +158,10 @@ void xbox_FramebufferWindowStart(void) {}
 
 /* The back slot is filled: make it the ready one. An unshown ready frame is
  * overwritten (dropped), never waited for. */
-static void publish(uint32_t bpp)
+static void publish(uint32_t bpp, int n)
 {
     s_slot[s_back].bpp = bpp;          /* only this thread touches s_back */
+    s_slot[s_back].n = n;
     pthread_mutex_lock(&s_lock);
     {
         int t = s_ready;
@@ -143,28 +183,40 @@ static void publish(uint32_t bpp)
     }
 }
 
-static void present_copy(uint32_t fb_va, uint32_t pitch)
+/* Copy n frames, each FB_W x FB_H rows of `pitch` bytes, into the back slot
+ * and publish them as one group. */
+static void group_copy(const uint8_t *const *src, int n, uint32_t pitch,
+                       uint32_t bpp)
 {
     struct fb_slot *s = &s_slot[s_back];
-    const uint8_t *src;
-    uint32_t bpp = pitch / FB_W, y;
-    size_t need;
+    size_t frame, need;
+    uint32_t y;
+    int i;
 
-    if (bpp != 2 && bpp != 4)
+    if ((bpp != 2 && bpp != 4) || pitch < FB_W * bpp || n < 1
+            || n > FB_GROUP_MAX)
         return;
-    need = (size_t)FB_W * FB_H * bpp;
+    frame = (size_t)FB_W * FB_H * bpp;
+    need = frame * (size_t)n;
     if (s->cap < need) {
-        uint8_t *n = (uint8_t *)realloc(s->px, need);
-        if (!n)
+        uint8_t *p = (uint8_t *)realloc(s->px, need);
+        if (!p)
             return;
-        s->px = n;
+        s->px = p;
         s->cap = need;
     }
-    src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
-    for (y = 0; y < FB_H; y++)
-        memcpy(s->px + (size_t)y * FB_W * bpp, src + (size_t)y * pitch,
-               (size_t)FB_W * bpp);
-    publish(bpp);
+    for (i = 0; i < n; i++)
+        for (y = 0; y < FB_H; y++)
+            memcpy(s->px + frame * i + (size_t)y * FB_W * bpp,
+                   src[i] + (size_t)y * pitch, (size_t)FB_W * bpp);
+    publish(bpp, n);
+}
+
+static void present_copy(uint32_t fb_va, uint32_t pitch)
+{
+    const uint8_t *src =
+        (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
+    group_copy(&src, 1, pitch, pitch / FB_W);
 }
 
 /* Called by the pushbuffer executor when the title flips. */
@@ -175,9 +227,28 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
      * this present in flight or this present sees the window closing. */
     if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !fb_va || !pitch)
         return;
+    if (s_group_flip == __atomic_load_n(&s_flips, __ATOMIC_RELAXED))
+        return;                         /* the back end showed this flip */
     __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
     if (__atomic_load_n(&s_running, __ATOMIC_SEQ_CST))
         present_copy(fb_va, pitch);
+    __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+}
+
+/* Called by a back end from inside the flip, on the executor thread, before
+ * the plain present: n frames of FB_W x FB_H at `pitch`, the last one real,
+ * the others to be shown before it at even steps of the flip interval. The
+ * flip's plain present then does nothing. */
+void xbox_FramebufferWindowPresentFrames(const void *const *frames, int n,
+                                         uint32_t pitch, uint32_t bpp)
+{
+    if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !frames || n < 1)
+        return;
+    __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_running, __ATOMIC_SEQ_CST)) {
+        group_copy((const uint8_t *const *)frames, n, pitch, bpp);
+        s_group_flip = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
+    }
     __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
 }
 
@@ -294,6 +365,12 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
     const char *e;
     int vsync, scale, quit = 0, guest_done = 0, dirty = 1;
+    /* The group on screen: frame `next` of `n` is due at arrival + next *
+     * period / n. The period is the flip interval, measured between groups
+     * of more than one frame (a group of one is shown at once). */
+    int group_n = 0, group_next = 0;
+    double t_group = 0.0, t_group_prev = 0.0, period = 1000.0 / 60.0;
+    const double tick_ms = 1000.0 / (double)SDL_GetPerformanceFrequency();
 
     /* Ctrl-C and SIGTERM keep their default meaning; SDL would turn them
      * into an SDL_QUIT that a headless run never reads. Set before the
@@ -364,16 +441,26 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         return guest_main();
     }
 
+    if (s_open_hook)
+        s_open_hook();
+
     while (!quit && !guest_done) {
         SDL_Event ev;
         uint64_t seq, now;
         const uint8_t *px = NULL;
         uint32_t bpp = 0, pitch = 0;
+        int timeout = shown_seq ? 100 : 16;
+        double t_now;
 
         /* Before the first flip, poll at the display rate: the window then
          * reads the display surface itself. After, the flip's event wakes
-         * the loop. */
-        if (SDL_WaitEventTimeout(&ev, shown_seq ? 100 : 16)) {
+         * the loop -- or the next frame of a group falls due. */
+        if (group_next < group_n) {
+            double due = t_group + period * group_next / group_n;
+            double left = due - (double)SDL_GetPerformanceCounter() * tick_ms;
+            timeout = left <= 0.0 ? 0 : (int)left + 1;
+        }
+        if (timeout == 0 ? SDL_PollEvent(&ev) : SDL_WaitEventTimeout(&ev, timeout)) {
             do {
                 /* Keys for the pad stand-in, and the window events that
                  * release them; it only reads the event. */
@@ -400,11 +487,31 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         }
         pthread_mutex_unlock(&s_lock);
 
+        t_now = (double)SDL_GetPerformanceCounter() * tick_ms;
         if (seq != shown_seq) {
+            /* A new group replaces whatever is left of the last one: its
+             * first frame lies between that one's real frame and its own. */
             shown_seq = seq;
-            px = s_slot[s_front].px;
+            group_n = s_slot[s_front].n;
+            group_next = 0;
+            if (group_n > 1) {
+                double dt = t_now - t_group_prev;
+                if (t_group_prev > 0.0 && dt > 5.0 && dt < 50.0)
+                    period += (dt - period) * 0.1;
+                t_group_prev = t_now;
+            }
+            t_group = t_now;
+        }
+        if (group_next < group_n
+                && t_now >= t_group + period * group_next / group_n) {
+            /* The latest frame that is due; any earlier one is too late. */
+            while (group_next + 1 < group_n
+                   && t_now >= t_group + period * (group_next + 1) / group_n)
+                group_next++;
             bpp = s_slot[s_front].bpp;
             pitch = FB_W * bpp;
+            px = s_slot[s_front].px + (size_t)pitch * FB_H * group_next;
+            group_next++;
         } else if (!shown_seq && s_fb_va && s_fb_pitch) {
             /* No flip yet: the display surface, as the GDI window reads it. */
             bpp = s_fb_pitch / FB_W;
@@ -433,6 +540,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             if (tex)
                 SDL_RenderCopy(ren, tex, NULL, NULL);
             SDL_RenderPresent(ren);
+            __atomic_add_fetch(&s_presents, 1, __ATOMIC_RELAXED);
         }
 
         now = now_ms();
