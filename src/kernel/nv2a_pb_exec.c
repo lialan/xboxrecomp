@@ -1879,7 +1879,7 @@ static int ffp_skinned_clip(uint32_t index, const float in[4], float clip[4])
     static uint32_t logged;
     uint32_t mode = s_reg[0x0328 / 4];
     float wt[4] = {0.0f, 0.0f, 0.0f, 1.0f}, ww[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float eye[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float eye[4] = {0.0f, 0.0f, 0.0f, 0.0f}, proj[16];
     const float *p = (const float *)&s_reg[0x0440 / 4];
     int nm, k, i, j;
 
@@ -1917,6 +1917,19 @@ static int ffp_skinned_clip(uint32_t index, const float in[4], float clip[4])
         for (i = 0; i < 4; i++)
             eye[i] += ww[k] * (mv[4 * i] * in[0] + mv[4 * i + 1] * in[1]
                              + mv[4 * i + 2] * in[2] + mv[4 * i + 3] * in[3]);
+    }
+    /* Project. Virtua Cop 3 never sets the projection methods: D3D leaves the
+     * projection (with the viewport) in the composite, transform constants
+     * 0-3, and the bone matrices carry the whole model-view. Projecting with
+     * the empty 0x0440 matrix gave every skinned vertex w = 0, and the
+     * triangles were thrown away -- the hips, thighs and arms of nearly every
+     * person in the game. */
+    for (i = 0; i < 16 && p[i] == 0.0f; i++)
+        ;
+    if (i == 16) {
+        for (i = 0; i < 4; i++)
+            memcpy(&proj[4 * i], nv2a_vsh_constant((uint32_t)i), 16);
+        p = proj;
     }
     for (i = 0; i < 4; i++) {
         clip[i] = 0.0f;
