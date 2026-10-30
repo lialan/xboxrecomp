@@ -2323,6 +2323,7 @@ static void backend_texture(int st, Nv2aTexture *tex)
     tex->addr_v = s_gpu.texs[st].addr_v;
     tex->levels = s_gpu.texs[st].pitch ? 1 : s_gpu.texs[st].levels;
     tex->filter = s_gpu.texs[st].filter;
+    tex->cube   = s_gpu.texs[st].cube;
 }
 
 /* `textured`: the batch carried texture coordinates, so the bound texture is

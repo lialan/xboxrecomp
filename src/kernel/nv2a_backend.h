@@ -52,6 +52,9 @@ typedef struct {
      * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
      * 16-23). A back end that ignores them samples level 0. */
     uint32_t levels, filter;
+    /* A cube map (the format word's CUBEMAP_ENABLE): six faces, +X -X +Y -Y
+     * +Z -Z, each a full mip chain, each starting on a 128-byte boundary. */
+    uint32_t cube;
 } Nv2aTexture;
 
 typedef struct {
