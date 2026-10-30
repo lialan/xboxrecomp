@@ -49,8 +49,14 @@ if(WIN32)
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
-    find_package(OpenSSL REQUIRED)
-    target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+    # Android has no OpenSSL, and nothing in the kernel calls it yet: the
+    # link is only kept where the library exists.
+    find_package(OpenSSL QUIET)
+    if(OPENSSL_FOUND)
+        target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+    else()
+        target_link_libraries(xbox_kernel PUBLIC platform)
+    endif()
 endif()
 
 if(MSVC)

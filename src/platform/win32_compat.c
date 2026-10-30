@@ -718,6 +718,31 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+#if defined(__linux__)
+/* Thread affinity of any thread: glibc's pthread_*affinity_np, or on
+ * Android, which has neither, the kernel call on the thread's tid. */
+#if defined(__ANDROID__)
+#include <sys/syscall.h>
+static int w32_setaffinity(pthread_t th, cpu_set_t *set)
+{
+    return sched_setaffinity(pthread_gettid_np(th), sizeof *set, set);
+}
+static int w32_getaffinity(pthread_t th, cpu_set_t *set)
+{
+    return sched_getaffinity(pthread_gettid_np(th), sizeof *set, set);
+}
+#else
+static int w32_setaffinity(pthread_t th, cpu_set_t *set)
+{
+    return pthread_setaffinity_np(th, sizeof *set, set);
+}
+static int w32_getaffinity(pthread_t th, cpu_set_t *set)
+{
+    return pthread_getaffinity_np(th, sizeof *set, set);
+}
+#endif
+#endif
+
 /* Win32 gives a new thread the process's CPU mask; pthread_create copies
  * the creator's. A guest thread pinned to one core (xbox_GuestThreadPin)
  * would otherwise hand that core to every host thread it creates, the
@@ -765,7 +790,7 @@ static void *thread_trampoline(void *arg)
         for (i = 0; i < (int)(8 * sizeof s_process_mask) && i < CPU_SETSIZE; i++)
             if (s_process_mask & ((DWORD_PTR)1 << i))
                 CPU_SET(i, &set);
-        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+        w32_setaffinity(pthread_self(), &set);
     }
 #endif
 
@@ -882,7 +907,12 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_THREAD) return FALSE;
+#if defined(__ANDROID__)
+    /* Bionic has no pthread_cancel: the thread runs on, but reads as
+     * exited to its waiters, which is what a title waits for. */
+#else
     pthread_cancel(o->thread);
+#endif
     pthread_mutex_lock(&o->lock);
     o->exit_code = exitCode;
     o->exited    = 1;
@@ -918,7 +948,7 @@ DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
         DWORD_PTR prev = 0;
         cpu_set_t set;
         int i;
-        if (pthread_getaffinity_np(th, sizeof set, &set) == 0)
+        if (w32_getaffinity(th, &set) == 0)
             for (i = 0; i < (int)(8 * sizeof prev) && i < CPU_SETSIZE; i++)
                 if (CPU_ISSET(i, &set))
                     prev |= (DWORD_PTR)1 << i;
@@ -926,7 +956,7 @@ DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
         for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
             if (mask & ((DWORD_PTR)1 << i))
                 CPU_SET(i, &set);
-        if (pthread_setaffinity_np(th, sizeof set, &set) != 0)
+        if (w32_setaffinity(th, &set) != 0)
             return 0;
         return prev ? prev : mask;
     }
@@ -1437,6 +1467,10 @@ VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
     memset_s(ptr, cnt, 0, cnt);
+#elif defined(__ANDROID__)
+    volatile unsigned char *p = (volatile unsigned char *)ptr;   /* no explicit_bzero */
+    while (cnt--)
+        *p++ = 0;
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -1748,6 +1782,9 @@ static int anon_map_fd(const char *name)
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
+#elif defined(__ANDROID__)
+    /* Bionic's memfd_create wrapper is API 30; the call is older. */
+    return (int)syscall(__NR_memfd_create, name ? name : "xbox_map", 0);
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif

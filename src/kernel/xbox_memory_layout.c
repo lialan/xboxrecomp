@@ -2620,9 +2620,23 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * instead. Each fixed window is carved out of the span as it is
          * mapped, and guest_vmem's range is handed over just before
          * guest_vmem_init. Off by default; the stock span is unchanged. */
-        if (ext_vma_span(g_span_size)) {
-            g_span_size = (size_t)1 << 32;
-            g_span_whole_window = 1;
+        /* RECOMP_HOLD_WINDOW=1 holds the whole window too, without the rest
+         * of RECOMP_EXT_VMA -- the case of a 128 MB title, whose mirrors
+         * already reach GUEST_VMEM_TOP so ext_vma_span() is 0. On by default
+         * on Android: there the libraries the loader maps top-down sit just
+         * above a fresh span, and the contiguous window, the device
+         * apertures and the kernel page all failed (ENOMEM) without it. */
+        {
+            const char *hold = getenv("RECOMP_HOLD_WINDOW");
+#if defined(__ANDROID__)
+            int hold_on = !hold || *hold != '0';
+#else
+            int hold_on = hold && *hold && *hold != '0';
+#endif
+            if (ext_vma_span(g_span_size) || hold_on) {
+                g_span_size = (size_t)1 << 32;
+                g_span_whole_window = 1;
+            }
         }
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
