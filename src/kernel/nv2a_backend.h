@@ -28,6 +28,7 @@
 #define NV2A_BACKEND_H
 
 #include <stdint.h>
+#include "nv2a_combiner.h"   /* Nv2aCombiner, for Nv2aBatch.rc */
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
@@ -82,11 +83,31 @@ typedef struct {
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
 } Nv2aRenderState;
 
+/* What the register combiners read per vertex, beyond Nv2aVertex: for a back
+ * end that evaluates them (see Nv2aBatch.rc). Texture coordinates are the
+ * vertex program's outputs, per stage, as (s, t, r, q): normalised for
+ * swizzled and DXT textures, texels for linear ones -- the same units the
+ * software rasteriser samples with. */
+typedef struct {
+    uint32_t specular;          /* 0xAARRGGBB, the combiners' v1 */
+    float    fog;               /* fog factor 0..1 (1: no fog) */
+    float    tex[4][4];
+} Nv2aVertexEx;
+
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
     const Nv2aTexture *texture;     /* NULL: untextured */
     const Nv2aRenderState *state;
+    /* Register combiners, for batches the software rasteriser would shade
+     * through them; NULL means texture * diffuse. When set, ext holds count
+     * entries parallel to vertices, stage[i] the texture stage i samples
+     * (NULL: stage off or unusable) and fog_color the fog colour (ARGB).
+     * Stage modes are in rc->stage_program, as SHADER_STAGE_PROGRAM. */
+    const Nv2aCombiner *rc;
+    const Nv2aVertexEx *ext;
+    const Nv2aTexture  *stage[4];
+    uint32_t            fog_color;
 } Nv2aBatch;
 
 typedef struct {

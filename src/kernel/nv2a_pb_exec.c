@@ -1997,6 +1997,7 @@ static int s_xf_no_tex;
  * dropped. */
 #define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
 static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
+static Nv2aVertexEx *s_bext;     /* parallel: what the combiners read */
 static uint32_t   s_bcount;
 
 static Nv2aVertex *backend_slot(void)
@@ -2004,9 +2005,22 @@ static Nv2aVertex *backend_slot(void)
     if (!s_bverts
         && !(s_bverts = (Nv2aVertex *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bverts)))
         return NULL;
+    if (!s_bext
+        && !(s_bext = (Nv2aVertexEx *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bext)))
+        return NULL;
     if (s_bcount + 3 > NV_BACKEND_MAX_VERTS)
         return NULL;
     return &s_bverts[s_bcount];
+}
+
+static float fog_factor(float d);
+
+/* The combiner inputs of a program-path vertex, beside its Nv2aVertex. */
+static void backend_ext_from_xf(const Nv2aVshOutput *v, Nv2aVertexEx *e)
+{
+    e->specular = pack_color(v->d1);
+    e->fog = fog_factor(v->fog[0]);
+    memcpy(e->tex, v->tex, sizeof e->tex);
 }
 
 static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
@@ -2026,34 +2040,64 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
     o->v = v->tex[0][1] * sv;
 }
 
+/* Whether program-path pixels go through the combiners: the same test the
+ * software rasteriser makes for T.use_rc. */
+static int backend_use_rc(void)
+{
+    static int no_rc = -1;
+    if (no_rc < 0)
+        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+    return s_gpu.rc_seen && !no_rc;
+}
+
+static void backend_texture(int st, Nv2aTexture *tex)
+{
+    tex->offset = s_gpu.texs[st].offset;
+    tex->width  = s_gpu.texs[st].width;
+    tex->height = s_gpu.texs[st].height;
+    tex->pitch  = s_gpu.texs[st].pitch;
+    tex->color  = s_gpu.texs[st].color;
+    tex->addr_u = s_gpu.texs[st].addr_u;
+    tex->addr_v = s_gpu.texs[st].addr_v;
+    tex->levels = s_gpu.texs[st].pitch ? 1 : s_gpu.texs[st].levels;
+    tex->filter = s_gpu.texs[st].filter;
+}
+
 /* `textured`: the batch carried texture coordinates, so the bound texture is
- * part of it. */
-static void backend_flush(int textured)
+ * part of it. `use_rc`: the batch came through the program path, whose pixels
+ * the software rasteriser shades with the register combiners (xf_rows), so
+ * the back end gets their state and inputs too. */
+static void backend_flush(int textured, int use_rc)
 {
     Nv2aSurface surf;
     Nv2aRenderState rs;
-    Nv2aTexture tex;
+    Nv2aTexture tex, stex[4];
     Nv2aBatch batch;
+    int st;
 
     if (!s_bcount)
         return;
     current_surface(&surf);
     current_render_state(&rs);
+    memset(&batch, 0, sizeof batch);
     batch.vertices = s_bverts;
     batch.count = s_bcount;
     batch.texture = NULL;
     batch.state = &rs;
     if (textured && s_gpu.texs[0].valid) {
-        tex.offset = s_gpu.texs[0].offset;
-        tex.width  = s_gpu.texs[0].width;
-        tex.height = s_gpu.texs[0].height;
-        tex.pitch  = s_gpu.texs[0].pitch;
-        tex.color  = s_gpu.texs[0].color;
-        tex.addr_u = s_gpu.texs[0].addr_u;
-        tex.addr_v = s_gpu.texs[0].addr_v;
-        tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
-        tex.filter = s_gpu.texs[0].filter;
+        backend_texture(0, &tex);
         batch.texture = &tex;
+    }
+    if (use_rc) {
+        batch.rc = &s_gpu.rc;
+        batch.ext = s_bext;
+        batch.fog_color = s_gpu.fog_color;
+        for (st = 0; st < 4; st++) {
+            if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F) || !s_gpu.texs[st].valid)
+                continue;
+            backend_texture(st, &stex[st]);
+            batch.stage[st] = &stex[st];
+        }
     }
     s_backend->draw(&surf, &batch);
     s_gpu.tris_drawn += s_bcount / 3;
@@ -2772,6 +2816,9 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
             backend_from_xf(va, &o[0]);
             backend_from_xf(vb, &o[1]);
             backend_from_xf(vc, &o[2]);
+            backend_ext_from_xf(va, &s_bext[s_bcount + 0]);
+            backend_ext_from_xf(vb, &s_bext[s_bcount + 1]);
+            backend_ext_from_xf(vc, &s_bext[s_bcount + 2]);
             s_bcount += 3;
         }
         return;
@@ -3153,7 +3200,7 @@ static void raster_batch_program(void)
     /* The batch's triangles, all at once (see xf_queue_push). */
     xf_queue_flush();
     if (backend_draws())
-        backend_flush(!s_xf_no_tex);
+        backend_flush(!s_xf_no_tex, backend_use_rc());
 }
 
 static void raster_batch(void)
@@ -3231,7 +3278,7 @@ static void raster_batch(void)
         break;                             /* points and lines: not yet */
     }
     if (backend_draws())
-        backend_flush(textured);
+        backend_flush(textured, 0);
 
     if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
