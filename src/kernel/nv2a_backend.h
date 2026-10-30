@@ -128,6 +128,10 @@ typedef struct {
  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */
 void nv2a_backend_register(const Nv2aBackend *backend);
 
+/* From flip(): the surface the title just finished, which the present shows
+ * (0 if unknown). A back end need only resolve this one into guest memory. */
+uint32_t nv2a_backend_presented_va(void);
+
 /* Decode a whole texture to 0xAARRGGBB, row-major, width*height entries.
  * Handles every format the executor can sample (swizzled, linear, DXT).
  * Returns 0 if the format is not supported. */

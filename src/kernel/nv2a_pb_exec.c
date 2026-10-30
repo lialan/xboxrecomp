@@ -787,6 +787,12 @@ static int backend_draws(void)
     return s_backend && s_backend->draw;
 }
 
+uint32_t nv2a_backend_presented_va(void)
+{
+    uint32_t off = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
+    return off ? dma_resolve(off) : 0;      /* as Nv2aSurface.color_va */
+}
+
 static void current_surface(Nv2aSurface *out)
 {
     out->color_va        = dma_resolve(s_gpu.color_offset);
@@ -4222,7 +4228,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                     s_gpu.clear_color, 10);
         clear_surface(param);
-        if (param & 0x01)                         /* Z */
+        /* Z. A back end that rasterises keeps its own depth buffer, and the
+         * software one is never read then: clearing its 4 MB each frame was
+         * a fifth of the GPU thread. */
+        if ((param & 0x01) && !backend_draws())
             zbuf_clear();
         break;
 
