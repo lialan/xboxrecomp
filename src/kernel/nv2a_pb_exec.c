@@ -2021,6 +2021,28 @@ static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
     fetch_attr(texcoord_attr(), index, out->tex[0]);
     for (st = 1; st < 4; st++)
         fetch_attr(&s_gpu.attr[9 + st], index, out->tex[st]);
+    /* Texture matrices (SET_TEXTURE_MATRIX_ENABLE 0x0420 + 4i, matrix
+     * 0x06C0 + 0x40i), laid out like the other fixed-function matrices.
+     * Without them a coordinate the title steers through a matrix sampled
+     * the wrong place -- or one place: VC3's faces came out a flat colour. */
+    for (st = 0; st < 4; st++) {
+        static uint32_t seen;
+        uint32_t gen = s_reg[(0x03C0 + 0x10 * st) / 4] | s_reg[(0x03C4 + 0x10 * st) / 4];
+        if ((s_reg[(0x0420 + 4 * st) / 4] || gen) && !(seen & (1u << st))) {
+            seen |= 1u << st;
+            fprintf(stderr, "  [GPU] fixed-function stage %d: texture matrix %u, texgen S %X T %X\n",
+                    st, s_reg[(0x0420 + 4 * st) / 4], s_reg[(0x03C0 + 0x10 * st) / 4],
+                    s_reg[(0x03C4 + 0x10 * st) / 4]);
+        }
+        if (s_reg[(0x0420 + 4 * st) / 4]) {
+            const float *tm = (const float *)&s_reg[(0x06C0 + 0x40 * st) / 4];
+            float t[4];
+            for (i = 0; i < 4; i++)
+                t[i] = tm[4 * i] * out->tex[st][0] + tm[4 * i + 1] * out->tex[st][1]
+                     + tm[4 * i + 2] * out->tex[st][2] + tm[4 * i + 3] * out->tex[st][3];
+            memcpy(out->tex[st], t, sizeof t);
+        }
+    }
     return 1;
 }
 
