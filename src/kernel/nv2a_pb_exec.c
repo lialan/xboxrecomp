@@ -1858,6 +1858,68 @@ static int lit_color(uint32_t index, float out[4])
     return 1;
 }
 
+/* Vertex blending (SET_SKIN_MODE, 0x0328), as xemu's fixed-function shader
+ * does it: the position is a weighted sum of the object position through up
+ * to four model-view matrices (0x0480 + 0x40 k), then the projection matrix
+ * (0x0440), which like the composite carries the viewport scale. Modes 1, 3
+ * and 5 derive the last weight as one minus the others. The composite matrix
+ * is meaningless for these batches -- D3D leaves whatever it last held -- so
+ * skinned meshes (characters, and much of Virtua Cop 3's set) landed at
+ * stale positions, mostly off screen. RECOMP_FFP_SKIN=0 turns this off.
+ * Returns 0 when skinning is off (the caller uses the composite). */
+static int ffp_skinned_clip(uint32_t index, const float in[4], float clip[4])
+{
+    static int off = -1;
+    static uint32_t logged;
+    uint32_t mode = s_reg[0x0328 / 4];
+    float wt[4] = {0.0f, 0.0f, 0.0f, 1.0f}, ww[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float eye[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const float *p = (const float *)&s_reg[0x0440 / 4];
+    int nm, k, i, j;
+
+    static int composite = -1;
+
+    if (off < 0) {
+        const char *e = getenv("RECOMP_FFP_SKIN");
+        off = e && e[0] == '0';
+    }
+    /* Unskinned batches keep the composite matrix unless RECOMP_FFP_MVP=1
+     * asks for model-view 0 * projection (xemu's form) -- which drew nothing
+     * of Virtua Cop 3. */
+    if (composite < 0)
+        composite = getenv("RECOMP_FFP_MVP") == NULL;
+    if (mode > 6 || off || (!mode && composite))
+        return 0;
+    if (!(logged & (1u << mode))) {
+        logged |= 1u << mode;
+        fprintf(stderr, "  [GPU] fixed-function skinning, mode %u\n", mode);
+    }
+    if (mode)
+        fetch_attr(&s_gpu.attr[1], index, wt);          /* WEIGHT */
+    switch (mode) {
+    case 0:  nm = 1; ww[0] = 1.0f; break;          /* no blending: model-view 0 */
+    case 1:  nm = 2; ww[0] = wt[0]; ww[1] = 1.0f - wt[0]; break;
+    case 2:  nm = 2; ww[0] = wt[0]; ww[1] = wt[1]; break;
+    case 3:  nm = 3; ww[0] = wt[0]; ww[1] = wt[1]; ww[2] = 1.0f - wt[0] - wt[1]; break;
+    case 4:  nm = 3; ww[0] = wt[0]; ww[1] = wt[1]; ww[2] = wt[2]; break;
+    case 5:  nm = 4; ww[0] = wt[0]; ww[1] = wt[1]; ww[2] = wt[2];
+             ww[3] = 1.0f - wt[0] - wt[1] - wt[2]; break;
+    default: nm = 4; ww[0] = wt[0]; ww[1] = wt[1]; ww[2] = wt[2]; ww[3] = wt[3]; break;
+    }
+    for (k = 0; k < nm; k++) {
+        const float *mv = (const float *)&s_reg[(0x0480 + 0x40 * k) / 4];
+        for (i = 0; i < 4; i++)
+            eye[i] += ww[k] * (mv[4 * i] * in[0] + mv[4 * i + 1] * in[1]
+                             + mv[4 * i + 2] * in[2] + mv[4 * i + 3] * in[3]);
+    }
+    for (i = 0; i < 4; i++) {
+        clip[i] = 0.0f;
+        for (j = 0; j < 4; j++)
+            clip[i] += p[4 * i + j] * eye[j];
+    }
+    return 1;
+}
+
 /* One fixed-function vertex, in the shape a vertex program produces. */
 static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
 {
@@ -1868,9 +1930,41 @@ static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
 
     if (!fetch_attr(&s_gpu.attr[0], index, in))
         return 0;
-    for (i = 0; i < 4; i++)
-        clip[i] = m[4 * i] * in[0] + m[4 * i + 1] * in[1]
-                + m[4 * i + 2] * in[2] + m[4 * i + 3] * in[3];
+    if (!ffp_skinned_clip(index, in, clip))
+        for (i = 0; i < 4; i++)
+            clip[i] = m[4 * i] * in[0] + m[4 * i + 1] * in[1]
+                    + m[4 * i + 2] * in[2] + m[4 * i + 3] * in[3];
+    {
+        /* RECOMP_FFP_TRACE=<flag file>: while it exists, the matrices behind
+         * the first vertex of up to 8 fixed-function batches. */
+        static const char *flag = (const char *)-1;
+        static int n;
+        static uint32_t last_draw;
+        if (flag == (const char *)-1)
+            flag = getenv("RECOMP_FFP_TRACE");
+        if (flag && n < 8 && s_gpu.draws != last_draw) {
+            FILE *fl = fopen(flag, "rb");
+            if (fl) {
+                const float *mv = (const float *)&s_reg[0x0480 / 4];
+                const float *pj = (const float *)&s_reg[0x0440 / 4];
+                const float *c58 = nv2a_vsh_constant(58);
+                int r;
+                fclose(fl);
+                last_draw = s_gpu.draws;
+                n++;
+                fprintf(stderr, "[FFP] skin %u in %g %g %g %g clip %g %g %g %g "
+                        "c58 %g %g %g %g c59 %g %g %g %g\n", s_reg[0x0328 / 4],
+                        in[0], in[1], in[2], in[3], clip[0], clip[1], clip[2], clip[3],
+                        c58[0], c58[1], c58[2], c58[3], off[0], off[1], off[2], off[3]);
+                for (r = 0; r < 4; r++)
+                    fprintf(stderr, "[FFP]   comp %9.4g %9.4g %9.4g %9.4g | mv %9.4g %9.4g %9.4g %9.4g"
+                            " | proj %9.4g %9.4g %9.4g %9.4g\n",
+                            m[4 * r], m[4 * r + 1], m[4 * r + 2], m[4 * r + 3],
+                            mv[4 * r], mv[4 * r + 1], mv[4 * r + 2], mv[4 * r + 3],
+                            pj[4 * r], pj[4 * r + 1], pj[4 * r + 2], pj[4 * r + 3]);
+            }
+        }
+    }
     /* A vertex behind the camera (w < 0) is kept: the clipper cuts it at the
      * near plane, and rejecting it dropped every batch that reached behind
      * the eye -- X-Men Legends' street and sidewalk meshes, which extend past
@@ -2021,6 +2115,23 @@ static void backend_ext_from_xf(const Nv2aVshOutput *v, Nv2aVertexEx *e)
     e->specular = pack_color(v->d1);
     e->fog = fog_factor(v->fog[0]);
     memcpy(e->tex, v->tex, sizeof e->tex);
+    if (getenv("RECOMP_FOG_TRACE")) {
+        static unsigned lo, hi, on;
+        if (e->fog < 0.5f) lo++; else hi++;
+        if (s_gpu.fog_enable) on++;
+        if ((lo + hi) % 200000 == 0)
+            fprintf(stderr, "[FOG] vertices: %u factor<0.5, %u >=0.5, %u with fog on\n",
+                    lo, hi, on);
+    }
+    if (s_gpu.fog_enable && e->fog < 0.5f && getenv("RECOMP_FOG_TRACE")) {
+        static int n;
+        if (n++ < 12)
+            fprintf(stderr, "[FOG] mode %X params %g %g colour %08X | vertex fog %g %g %g %g"
+                    " pos %g %g %g %g -> factor %g\n", s_gpu.fog_mode,
+                    s_gpu.fog_param[0], s_gpu.fog_param[1], s_gpu.fog_color,
+                    v->fog[0], v->fog[1], v->fog[2], v->fog[3],
+                    v->pos[0], v->pos[1], v->pos[2], v->pos[3], e->fog);
+    }
 }
 
 static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
