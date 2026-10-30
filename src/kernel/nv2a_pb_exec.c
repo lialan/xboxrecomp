@@ -5537,10 +5537,16 @@ void nv2a_pb_exec_report(void)
     int i, j;
 
     {
-        /* Frames per second of guest time, from flips between reports. */
+        /* Frames per second of wall time, from flips between reports.
+         * (clock() was the process's CPU time over all its threads -- with
+         * three busy ones a second of it passed in a third of a second, and
+         * a game at 50 fps read 16.) */
         static uint32_t last_flips;
         static unsigned long last_ms;
-        unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
+        struct timespec ts_;
+        unsigned long now;
+        clock_gettime(CLOCK_MONOTONIC, &ts_);
+        now = (unsigned long)ts_.tv_sec * 1000ul + (unsigned long)(ts_.tv_nsec / 1000000);
         if (last_ms && now > last_ms)
             fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
                     (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),
