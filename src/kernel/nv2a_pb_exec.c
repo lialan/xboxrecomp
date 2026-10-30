@@ -2133,10 +2133,15 @@ static float fog_factor(float d);
 /* The combiner inputs of a program-path vertex, beside its Nv2aVertex. */
 static void backend_ext_from_xf(const Nv2aVshOutput *v, Nv2aVertexEx *e)
 {
+    /* Once: this runs per vertex, and getenv walks the environment --
+     * a third of the GPU thread in combat when it was looked up here. */
+    static int fog_trace = -1;
+    if (fog_trace < 0)
+        fog_trace = getenv("RECOMP_FOG_TRACE") != NULL;
     e->specular = pack_color(v->d1);
     e->fog = fog_factor(v->fog[0]);
     memcpy(e->tex, v->tex, sizeof e->tex);
-    if (getenv("RECOMP_FOG_TRACE")) {
+    if (fog_trace) {
         static unsigned lo, hi, on;
         if (e->fog < 0.5f) lo++; else hi++;
         if (s_gpu.fog_enable) on++;
@@ -2144,7 +2149,7 @@ static void backend_ext_from_xf(const Nv2aVshOutput *v, Nv2aVertexEx *e)
             fprintf(stderr, "[FOG] vertices: %u factor<0.5, %u >=0.5, %u with fog on\n",
                     lo, hi, on);
     }
-    if (s_gpu.fog_enable && e->fog < 0.5f && getenv("RECOMP_FOG_TRACE")) {
+    if (s_gpu.fog_enable && e->fog < 0.5f && fog_trace) {
         static int n;
         if (n++ < 12)
             fprintf(stderr, "[FOG] mode %X params %g %g colour %08X | vertex fog %g %g %g %g"
