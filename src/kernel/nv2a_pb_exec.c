@@ -4653,6 +4653,95 @@ static void flip_hold_report(void)
  * otherwise takes nothing and returns 0, and the walker goes word by word. */
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 
+/* ── The state methods' dispatch ──────────────────────────────────────────
+ * A method that no case of nv2a_pb_exec_method's switch takes went through a
+ * chain of range checks -- combiner registers, the transform context in the
+ * constant file, program and constant uploads, texture registers, vertex
+ * array offsets and formats -- a dozen or more compares for most words of
+ * every frame. chain_kind is that chain, its conditions in their order,
+ * returning which branch it took and the register index within the range;
+ * dispatch_kind answers the same from a table built from it once.
+ * RECOMP_PB_DISPATCH_OLD=1 asks the chain every time; RECOMP_PB_DISPATCH_CHECK=1
+ * asks both and counts any word where they differ. */
+enum {
+    PK_OTHER, PK_ALPHA_ICW, PK_COLOR_ICW, PK_COLOR_OCW, PK_ALPHA_OCW, PK_FACTOR0,
+    PK_FACTOR1, PK_C59, PK_C58, PK_C57, PK_C56, PK_VSH_PROGRAM, PK_VSH_CONSTANT,
+    PK_TEX, PK_ATTR_OFFSET, PK_ATTR_FORMAT
+};
+
+static int chain_kind(uint32_t method, uint32_t *idx)
+{
+    *idx = 0;
+    if (method >= 0x0260 && method < 0x0280) { *idx = (method - 0x0260) / 4; return PK_ALPHA_ICW; }
+    if (method >= 0x0AC0 && method < 0x0AE0) { *idx = (method - 0x0AC0) / 4; return PK_COLOR_ICW; }
+    if (method >= 0x1E40 && method < 0x1E60) { *idx = (method - 0x1E40) / 4; return PK_COLOR_OCW; }
+    if (method >= 0x0AA0 && method < 0x0AC0) { *idx = (method - 0x0AA0) / 4; return PK_ALPHA_OCW; }
+    if (method >= 0x0A60 && method < 0x0A80) { *idx = (method - 0x0A60) / 4; return PK_FACTOR0; }
+    if (method >= 0x0A80 && method < 0x0AA0) { *idx = (method - 0x0A80) / 4; return PK_FACTOR1; }
+    if (method >= 0x0A20 && method < 0x0A30) { *idx = (method - 0x0A20) / 4; return PK_C59; }
+    if (method >= 0x0AF0 && method < 0x0B00) { *idx = (method - 0x0AF0) / 4; return PK_C58; }
+    if (method >= 0x09D0 && method < 0x09E0) { *idx = (method - 0x09D0) / 4; return PK_C57; }
+    if (method >= 0x0A50 && method < 0x0A60) { *idx = (method - 0x0A50) / 4; return PK_C56; }
+    if (method >= 0x0B00 && method < 0x0B80) return PK_VSH_PROGRAM;
+    if (method >= 0x0B80 && method < 0x0C00) return PK_VSH_CONSTANT;
+    if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST) return PK_TEX;
+    if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
+            && method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + NV_VERTEX_ATTRS * 4) {
+        *idx = (method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4;
+        return PK_ATTR_OFFSET;
+    }
+    if (method >= NV097_SET_VERTEX_DATA_ARRAY_FORMAT
+            && method < NV097_SET_VERTEX_DATA_ARRAY_FORMAT + NV_VERTEX_ATTRS * 4) {
+        *idx = (method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4;
+        return PK_ATTR_FORMAT;
+    }
+    return PK_OTHER;
+}
+
+static int dispatch_kind(uint32_t method, uint32_t *idx)
+{
+    static uint8_t kind_tab[0x2000 / 4], idx_tab[0x2000 / 4];
+    static int built, mode = -1;            /* mode: 0 table, 1 chain, 2 both */
+    static uint64_t checked, differ;
+    uint32_t k = (method & 0x1FFCu) / 4, ci;
+    int kind;
+
+    if (mode < 0) {
+        mode = getenv("RECOMP_PB_DISPATCH_OLD") ? 1
+             : getenv("RECOMP_PB_DISPATCH_CHECK") ? 2 : 0;
+        if (mode)
+            fprintf(stderr, "[PB] state-method dispatch: %s\n",
+                    mode == 1 ? "the range-check chain (RECOMP_PB_DISPATCH_OLD)"
+                              : "table, checked against the chain");
+    }
+    if (!built) {
+        uint32_t m;
+        for (m = 0; m < 0x2000; m += 4) {
+            uint32_t i;
+            kind_tab[m / 4] = (uint8_t)chain_kind(m, &i);
+            idx_tab[m / 4] = (uint8_t)i;
+        }
+        built = 1;
+    }
+    if (mode == 1 || method >= 0x2000)
+        return chain_kind(method, idx);
+    kind = kind_tab[k];
+    *idx = idx_tab[k];
+    if (mode == 2) {
+        int ck = chain_kind(method, &ci);
+        checked++;
+        if (ck != kind || ci != *idx) {
+            if (differ++ < 8)
+                fprintf(stderr, "[PB] dispatch differs at 0x%04X: chain %d/%u, table %d/%u\n",
+                        method, ck, ci, kind, *idx);
+        }
+        if ((checked & 0xFFFFF) == 0)
+            fprintf(stderr, "[PB] dispatch checked %llu words, differing %llu\n",
+                    (unsigned long long)checked, (unsigned long long)differ);
+    }
+    return kind;
+}
+
 /* A run of vertex-program or constant words (TRANSFORM_PROGRAM 0x0B00,
  * TRANSFORM_CONSTANT 0x0B80; inc: the method steps by 4 a word), from the
  * walker: VC3 sends a program and its constants with nearly every vertex-
@@ -5218,88 +5307,64 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
 
-    default:
-        if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
-            s_gpu.rc.alpha_icw[(method - 0x0260) / 4] = param;
-            break;
-        }
-        if (method >= 0x0AC0 && method < 0x0AE0) {         /* COLOR_ICW(i) */
-            s_gpu.rc.color_icw[(method - 0x0AC0) / 4] = param;
-            break;
-        }
-        if (method >= 0x1E40 && method < 0x1E60) {         /* COLOR_OCW(i) */
-            s_gpu.rc.color_ocw[(method - 0x1E40) / 4] = param;
-            break;
-        }
-        if (method >= 0x0AA0 && method < 0x0AC0) {         /* ALPHA_OCW(i) */
-            s_gpu.rc.alpha_ocw[(method - 0x0AA0) / 4] = param;
-            break;
-        }
-        if (method >= 0x0A60 && method < 0x0A80) {         /* FACTOR0(i) */
-            s_gpu.rc.factor0[(method - 0x0A60) / 4] = param;
-            break;
-        }
-        if (method >= 0x0A80 && method < 0x0AA0) {         /* FACTOR1(i) */
-            s_gpu.rc.factor1[(method - 0x0A80) / 4] = param;
-            break;
-        }
+    default: {
+        /* The methods no case above takes: what kind, from a table built
+         * once from chain_kind -- the range checks that were here, in their
+         * order -- and the register index within its range. */
+        uint32_t idx;
+        int kind = dispatch_kind(method, &idx);
+        switch (kind) {
+        case PK_ALPHA_ICW: s_gpu.rc.alpha_icw[idx] = param; break;
+        case PK_COLOR_ICW: s_gpu.rc.color_icw[idx] = param; break;
+        case PK_COLOR_OCW: s_gpu.rc.color_ocw[idx] = param; break;
+        case PK_ALPHA_OCW: s_gpu.rc.alpha_ocw[idx] = param; break;
+        case PK_FACTOR0: s_gpu.rc.factor0[idx] = param; break;
+        case PK_FACTOR1: s_gpu.rc.factor1[idx] = param; break;
         /* SET_VIEWPORT_OFFSET / _SCALE. The GPU keeps these in the constant
          * file, at c[59] and c[58] -- exactly where the D3D epilogue reads
          * them -- so they are constants that happen to arrive by method.
          * Dropped, every vertex program put its whole batch at the origin:
          * no 3D anywhere, and a black car on the garage screen. */
-        if (method >= 0x0A20 && method < 0x0A30) {
-            nv2a_vsh_constant_component(59, (method - 0x0A20) / 4, param);
-            break;
-        }
-        if (method >= 0x0AF0 && method < 0x0B00) {
-            nv2a_vsh_constant_component(58, (method - 0x0AF0) / 4, param);
-            break;
-        }
+        case PK_C59: nv2a_vsh_constant_component(59, idx, param); break;
+        case PK_C58: nv2a_vsh_constant_component(58, idx, param); break;
         /* The rest of the transform context that shares the constant file:
          * SET_FOG_PLANE is c[57] and SET_EYE_POSITION c[56]. Vertex programs
          * read them like any constant -- SSX 3's shadow-caster program takes
          * its colour from c[57] -- and dropped, they read whatever an earlier
          * constant upload left there: half its shadow maps came out opaque. */
-        if (method >= 0x09D0 && method < 0x09E0) {         /* SET_FOG_PLANE */
-            nv2a_vsh_constant_component(57, (method - 0x09D0) / 4, param);
-            break;
-        }
-        if (method >= 0x0A50 && method < 0x0A60) {         /* SET_EYE_POSITION */
-            nv2a_vsh_constant_component(56, (method - 0x0A50) / 4, param);
-            break;
-        }
-        if (method >= 0x0B00 && method < 0x0B80) {    /* TRANSFORM_PROGRAM(i) */
-            nv2a_vsh_program_word(param);
-            break;
-        }
-        if (method >= 0x0B80 && method < 0x0C00) {    /* TRANSFORM_CONSTANT(i) */
-            nv2a_vsh_constant_word(param);
-            break;
-        }
-        if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST)
-            record_tex_reg(method, param);
-        if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
-                && method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + NV_VERTEX_ATTRS * 4) {
+        case PK_C57: nv2a_vsh_constant_component(57, idx, param); break;
+        case PK_C56: nv2a_vsh_constant_component(56, idx, param); break;
+        case PK_VSH_PROGRAM: nv2a_vsh_program_word(param); break;   /* TRANSFORM_PROGRAM(i) */
+        case PK_VSH_CONSTANT: nv2a_vsh_constant_word(param); break; /* TRANSFORM_CONSTANT(i) */
+        case PK_ATTR_OFFSET:
             /* Resolved here, once, so every consumer -- the rasteriser's
              * attribute reads and the diagnostics alike -- sees the same
              * address. A vertex array offset is a DMA-object offset exactly
              * like a surface offset: physical, and addressable only through
              * the window when it names contiguous memory. */
-            s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4].offset =
-                dma_resolve(param);
-        } else if (method >= NV097_SET_VERTEX_DATA_ARRAY_FORMAT
-                && method < NV097_SET_VERTEX_DATA_ARRAY_FORMAT + NV_VERTEX_ATTRS * 4) {
-            VertexAttr *a = &s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4];
+            s_gpu.attr[idx].offset = dma_resolve(param);
+            break;
+        case PK_ATTR_FORMAT: {
+            VertexAttr *a = &s_gpu.attr[idx];
             a->type   =  param        & 0x0F;
             a->size   = (param >> 4)  & 0x0F;
             if (a->size == 7)                   /* SIZE_3W */
                 a->size = 3;
             a->stride = (param >> 8)  & 0xFF;
-        } else if (!imm_vertex_method(method, param)) {
-            note_unhandled(method, param);
+            break;
+        }
+        case PK_TEX:
+            record_tex_reg(method, param);
+            if (!imm_vertex_method(method, param))
+                note_unhandled(method, param);
+            break;
+        default:                                /* PK_OTHER */
+            if (!imm_vertex_method(method, param))
+                note_unhandled(method, param);
+            break;
         }
         break;
+    }
     }
 }
 
