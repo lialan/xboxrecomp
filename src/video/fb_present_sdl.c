@@ -34,7 +34,15 @@
  * real one. The window spreads a group over the flip interval it measures --
  * frame i of n at arrival + i * interval / n -- on this thread, so a higher
  * display rate costs the executor one copy per frame and never a vsync. A
- * flip that delivered a group skips the plain copy.
+ * flip that delivered a group skips the plain copy. A group's frames may be
+ * larger than the guest surface (a back end drawing at a higher internal
+ * resolution) and of another shape, and fill the picture.
+ *
+ * The picture's logical size is FB_W x FB_H unless a back end sets another
+ * (xbox_FramebufferWindowSetPicture, e.g. 16:9); it is the renderer's
+ * logical size, so mouse coordinates stay in picture space, and a window
+ * that is not fullscreen or maximised takes its shape at its height. A
+ * plain frame is shown at its own 4:3 shape in the middle of it.
  *
  * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display;
  * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2).
@@ -79,16 +87,29 @@ static void fb_size_from_env(void)
 
 /* ── Handoff: three slots, one each for writer, reader and the ready frame ── */
 
-/* A slot holds a group of n frames, back to back, each FB_W * FB_H * bpp;
- * a plain flip is a group of one. */
+/* A slot holds a group of n frames, back to back, each w * h * bpp; fill
+ * is set for a back end's group, which fills the picture. A plain flip is a
+ * group of one FB_W x FB_H frame. */
 #define FB_GROUP_MAX 8
 
 struct fb_slot {
     uint8_t *px;
     size_t   cap;
     uint32_t bpp;
-    int      n;
+    int      n, fill;
+    uint32_t w, h;
 };
+
+/* The picture's logical size, 0 for FB_W x FB_H. */
+static volatile uint32_t s_pic_w, s_pic_h;
+
+void xbox_FramebufferWindowSetPicture(uint32_t lw, uint32_t lh)
+{
+    if (lw && lh && lw <= 8192 && lh <= 8192) {
+        __atomic_store_n(&s_pic_w, lw, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_pic_h, lh, __ATOMIC_RELAXED);
+    }
+}
 
 /* What the window takes from SDL, and gives back on every way out. */
 #define FBWIN_SDL_SUBSYSTEMS \
@@ -158,10 +179,13 @@ void xbox_FramebufferWindowStart(void) {}
 
 /* The back slot is filled: make it the ready one. An unshown ready frame is
  * overwritten (dropped), never waited for. */
-static void publish(uint32_t bpp, int n)
+static void publish(uint32_t bpp, int n, uint32_t w, uint32_t h, int fill)
 {
     s_slot[s_back].bpp = bpp;          /* only this thread touches s_back */
     s_slot[s_back].n = n;
+    s_slot[s_back].w = w;
+    s_slot[s_back].h = h;
+    s_slot[s_back].fill = fill;
     pthread_mutex_lock(&s_lock);
     {
         int t = s_ready;
@@ -183,20 +207,20 @@ static void publish(uint32_t bpp, int n)
     }
 }
 
-/* Copy n frames, each FB_W x FB_H rows of `pitch` bytes, into the back slot
- * and publish them as one group. */
-static void group_copy(const uint8_t *const *src, int n, uint32_t pitch,
-                       uint32_t bpp)
+/* Copy n frames, each w x h rows of `pitch` bytes, into the back slot and
+ * publish them as one group. */
+static void group_copy(const uint8_t *const *src, int n, uint32_t w,
+                       uint32_t h, uint32_t pitch, uint32_t bpp, int fill)
 {
     struct fb_slot *s = &s_slot[s_back];
     size_t frame, need;
     uint32_t y;
     int i;
 
-    if ((bpp != 2 && bpp != 4) || pitch < FB_W * bpp || n < 1
-            || n > FB_GROUP_MAX)
+    if ((bpp != 2 && bpp != 4) || pitch < w * bpp || n < 1
+            || n > FB_GROUP_MAX || !w || !h || w > 8192 || h > 8192)
         return;
-    frame = (size_t)FB_W * FB_H * bpp;
+    frame = (size_t)w * h * bpp;
     need = frame * (size_t)n;
     if (s->cap < need) {
         uint8_t *p = (uint8_t *)realloc(s->px, need);
@@ -205,18 +229,23 @@ static void group_copy(const uint8_t *const *src, int n, uint32_t pitch,
         s->px = p;
         s->cap = need;
     }
-    for (i = 0; i < n; i++)
-        for (y = 0; y < FB_H; y++)
-            memcpy(s->px + frame * i + (size_t)y * FB_W * bpp,
-                   src[i] + (size_t)y * pitch, (size_t)FB_W * bpp);
-    publish(bpp, n);
+    for (i = 0; i < n; i++) {
+        if (pitch == w * bpp) {
+            memcpy(s->px + frame * i, src[i], frame);
+            continue;
+        }
+        for (y = 0; y < h; y++)
+            memcpy(s->px + frame * i + (size_t)y * w * bpp,
+                   src[i] + (size_t)y * pitch, (size_t)w * bpp);
+    }
+    publish(bpp, n, w, h, fill);
 }
 
 static void present_copy(uint32_t fb_va, uint32_t pitch)
 {
     const uint8_t *src =
         (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
-    group_copy(&src, 1, pitch, pitch / FB_W);
+    group_copy(&src, 1, FB_W, FB_H, pitch, pitch / FB_W, 0);
 }
 
 /* Called by the pushbuffer executor when the title flips. */
@@ -236,17 +265,18 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 }
 
 /* Called by a back end from inside the flip, on the executor thread, before
- * the plain present: n frames of FB_W x FB_H at `pitch`, the last one real,
- * the others to be shown before it at even steps of the flip interval. The
- * flip's plain present then does nothing. */
+ * the plain present: n frames of w x h at `pitch`, the last one real, the
+ * others to be shown before it at even steps of the flip interval, each
+ * filling the picture. The flip's plain present then does nothing. */
 void xbox_FramebufferWindowPresentFrames(const void *const *frames, int n,
-                                         uint32_t pitch, uint32_t bpp)
+                                         uint32_t w, uint32_t h, uint32_t pitch,
+                                         uint32_t bpp)
 {
     if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !frames || n < 1)
         return;
     __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
     if (__atomic_load_n(&s_running, __ATOMIC_SEQ_CST)) {
-        group_copy((const uint8_t *const *)frames, n, pitch, bpp);
+        group_copy((const uint8_t *const *)frames, n, w, h, pitch, bpp, 1);
         s_group_flip = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
     }
     __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
@@ -361,7 +391,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     SDL_Window *win;
     SDL_Renderer *ren;
     SDL_Texture *tex = NULL;
-    uint32_t tex_bpp = 0;
+    uint32_t tex_bpp = 0, tex_w = 0, tex_h = 0, log_w, log_h;
+    int tex_fill = 0;
     uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
     const char *e;
     int vsync, scale, quit = 0, guest_done = 0, dirty = 1;
@@ -408,6 +439,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         return guest_main();
     }
     SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H);
+    log_w = FB_W;
+    log_h = FB_H;
     {
         SDL_RendererInfo ri;
         if (SDL_GetRendererInfo(ren, &ri) == 0)
@@ -448,7 +481,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         SDL_Event ev;
         uint64_t seq, now;
         const uint8_t *px = NULL;
-        uint32_t bpp = 0, pitch = 0;
+        uint32_t bpp = 0, pitch = 0, fw = FB_W, fh = FB_H, lw, lh;
+        int fill = 0;
         int timeout = shown_seq ? 100 : 16;
         double t_now;
 
@@ -509,8 +543,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                    && t_now >= t_group + period * (group_next + 1) / group_n)
                 group_next++;
             bpp = s_slot[s_front].bpp;
-            pitch = FB_W * bpp;
-            px = s_slot[s_front].px + (size_t)pitch * FB_H * group_next;
+            fw = s_slot[s_front].w;
+            fh = s_slot[s_front].h;
+            fill = s_slot[s_front].fill;
+            pitch = fw * bpp;
+            px = s_slot[s_front].px + (size_t)pitch * fh * group_next;
             group_next++;
         } else if (!shown_seq && s_fb_va && s_fb_pitch) {
             /* No flip yet: the display surface, as the GDI window reads it. */
@@ -519,15 +556,44 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             if (bpp == 2 || bpp == 4)
                 px = (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
         }
+        lw = __atomic_load_n(&s_pic_w, __ATOMIC_RELAXED);
+        lh = __atomic_load_n(&s_pic_h, __ATOMIC_RELAXED);
+        if (!lw || !lh) {
+            lw = FB_W;
+            lh = FB_H;
+        }
+        if (lw != log_w || lh != log_h) {
+            /* Another picture shape (an aspect switch): the renderer's
+             * logical size follows, and a window that is neither
+             * fullscreen nor maximised takes the shape at its height. */
+            int ww, wh;
+            Uint32 fl = SDL_GetWindowFlags(win);
+            SDL_RenderSetLogicalSize(ren, (int)lw, (int)lh);
+            if (!(fl & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED))) {
+                SDL_GetWindowSize(win, &ww, &wh);
+                SDL_SetWindowSize(win, (int)((double)wh * lw / lh + 0.5), wh);
+            }
+            log_w = lw;
+            log_h = lh;
+            dirty = 1;
+            fprintf(stderr, "  [FBWIN] picture %ux%u\n", lw, lh);
+        }
         if (px) {
-            if (!tex || bpp != tex_bpp) {
+            tex_fill = fill;
+            if (!tex || bpp != tex_bpp || fw != tex_w || fh != tex_h) {
                 if (tex)
                     SDL_DestroyTexture(tex);
                 tex = SDL_CreateTexture(ren, bpp == 4 ? SDL_PIXELFORMAT_RGB888
                                                       : SDL_PIXELFORMAT_RGB565,
                                         SDL_TEXTUREACCESS_STREAMING,
-                                        (int)FB_W, (int)FB_H);
+                                        (int)fw, (int)fh);
+                /* A frame drawn larger than the guest's is scaled, not
+                 * pixel-doubled: filter it. */
+                if (tex && (fw != FB_W || fh != FB_H))
+                    SDL_SetTextureScaleMode(tex, SDL_ScaleModeLinear);
                 tex_bpp = bpp;
+                tex_w = fw;
+                tex_h = fh;
             }
             if (tex)
                 SDL_UpdateTexture(tex, NULL, px, (int)pitch);
@@ -537,8 +603,18 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             dirty = 0;
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderClear(ren);
-            if (tex)
+            if (tex && (tex_fill || (log_w == FB_W && log_h == FB_H))) {
                 SDL_RenderCopy(ren, tex, NULL, NULL);
+            } else if (tex) {
+                /* A guest frame in a picture of another shape: at its own
+                 * shape, in the middle. */
+                SDL_Rect d;
+                d.h = (int)log_h;
+                d.w = (int)((double)log_h * FB_W / FB_H + 0.5);
+                d.x = ((int)log_w - d.w) / 2;
+                d.y = 0;
+                SDL_RenderCopy(ren, tex, NULL, &d);
+            }
             SDL_RenderPresent(ren);
             __atomic_add_fetch(&s_presents, 1, __ATOMIC_RELAXED);
         }
