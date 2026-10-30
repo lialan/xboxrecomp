@@ -267,6 +267,13 @@ typedef struct w32_object {
     /* event */
     int             signaled;
     int             manual_reset;
+    /* Bumped by every set. A set on a manual-reset event releases every
+     * thread waiting at that moment, as NT's does, even if the event is
+     * reset before a woken waiter gets the lock back: VC3's D3D clears its
+     * vblank event and waits on it from three threads, and without this
+     * the first to wake reset it under the others, which slept through
+     * that vblank -- frames ran 37-54 per second against 60 vblanks. */
+    unsigned        set_gen;
 
     /* semaphore */
     long            sem_count;
@@ -478,11 +485,14 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
+    unsigned gen0 = o->set_gen;
 
     for (;;) {
         int ready = 0;
         switch (o->kind) {
-        case K_EVENT:  ready = o->signaled; break;
+        case K_EVENT:
+            ready = o->signaled || (o->manual_reset && o->set_gen != gen0);
+            break;
         case K_THREAD: ready = o->exited;   break;
         case K_SEM:    ready = (o->sem_count > 0); break;
         case K_MUTEX:
@@ -605,6 +615,7 @@ BOOL SetEvent(HANDLE h)
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
+    o->set_gen++;
     pthread_cond_broadcast(&o->cond);
     pthread_mutex_unlock(&o->lock);
     return TRUE;
@@ -626,6 +637,7 @@ BOOL PulseEvent(HANDLE h)
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
+    o->set_gen++;           /* what actually releases the current waiters */
     pthread_cond_broadcast(&o->cond);
     o->signaled = 0;
     pthread_mutex_unlock(&o->lock);

@@ -2035,7 +2035,57 @@ static void bridge_KeSetEvent(void)
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
+static void bridge_KeWaitForSingleObject_body(void);
+
+/* RECOMP_WAIT_PROF=1: per waited object, how many waits, the time spent in
+ * them and the longest, and who waited -- every 5 s, the busiest first. A
+ * title that runs below the vblank rate with every thread mostly idle is
+ * losing its frames in a wait, and this says which. */
 static void bridge_KeWaitForSingleObject(void)
+{
+    static int on = -1;
+    static struct { uint32_t obj, caller, n; uint64_t total, max; } tab[64];
+    static uint64_t last_report;
+    uint32_t object, caller;
+    uint64_t t0, dt;
+    int i;
+
+    if (on < 0)
+        on = getenv("RECOMP_WAIT_PROF") != NULL;
+    if (!on) {
+        bridge_KeWaitForSingleObject_body();
+        return;
+    }
+    object = STACK_ARG(0);
+    caller = g_xbox_kernel_caller;
+    t0 = xbox_HostNowNs();
+    bridge_KeWaitForSingleObject_body();
+    dt = xbox_HostNowNs() - t0;
+    for (i = 0; i < 64; i++) {
+        if (tab[i].n && (tab[i].obj != object || tab[i].caller != caller))
+            continue;
+        tab[i].obj = object;
+        tab[i].caller = caller;
+        tab[i].n++;
+        tab[i].total += dt;
+        if (dt > tab[i].max)
+            tab[i].max = dt;
+        break;
+    }
+    if (t0 - last_report > 5000000000ull) {
+        if (last_report) {
+            for (i = 0; i < 64 && tab[i].n; i++)
+                if (tab[i].total > 50000000ull)          /* over 50 ms in 5 s */
+                    fprintf(stderr, "[WAIT] obj %08X from %08X: %u waits, %.1f ms total,"
+                            " max %.2f ms\n", tab[i].obj, tab[i].caller, tab[i].n,
+                            tab[i].total / 1e6, tab[i].max / 1e6);
+            memset(tab, 0, sizeof tab);
+        }
+        last_report = t0;
+    }
+}
+
+static void bridge_KeWaitForSingleObject_body(void)
 {
     uint32_t object = STACK_ARG(0);
     uint32_t wait_reason = STACK_ARG(1);
