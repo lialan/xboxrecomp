@@ -1788,12 +1788,23 @@ static uint32_t vertex_color(uint32_t index)
  * coordinates are taken from the attribute streams as they are), no fog
  * coordinate, no specular, no point sprites. */
 
-/* Is this batch transformed by the fixed-function unit? Inline-array batches
- * are left to the screen-space path, as they were before. */
+/* Is this batch transformed by the fixed-function unit? The transform state
+ * says, however the vertices arrived. Inline-array batches used to be sent to
+ * the screen-space path regardless -- and Virtua Cop 3 draws every speaker's
+ * face, hair, teeth and lashes in the comm window inline (the facial
+ * animation morphs them on the CPU and hands them over with DrawPrimitiveUP),
+ * in object space under the fixed-function unit: taken as screen pixels, each
+ * face collapsed into a speck in the corner and the speakers were drawn as a
+ * headset around nothing. RECOMP_INLINE_FFP=0: the old rule. */
 static int batch_is_ffp(void)
 {
+    static int inline_ffp = -1;
+    if (inline_ffp < 0) {
+        const char *e = getenv("RECOMP_INLINE_FFP");
+        inline_ffp = !(e && e[0] == '0');
+    }
     return s_gpu.composite_set && (s_gpu.xf_mode & 3) != 2
-        && !s_gpu.inline_active;
+        && (inline_ffp || !s_gpu.inline_active);
 }
 
 /* Fixed-function vertex lighting (SET_LIGHTING_ENABLE).
