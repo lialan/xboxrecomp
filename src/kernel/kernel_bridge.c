@@ -3109,10 +3109,18 @@ static int kernel_vblank_mode(void)
 /* The one vblank count. The tick increments it directly, the 60 Hz
  * schedule through kernel_vblank_count; only one of the two ever runs. */
 static volatile LONG g_vblank_total;
+static volatile uint64_t g_vblank_last_ns;   /* host time of the latest */
 
 uint32_t xbox_VblankCount(void)
 {
     return (uint32_t)g_vblank_total;
+}
+
+/* When the latest vblank was counted, on the host clock (RECOMP_FRAME_TRACE
+ * sets frames against it). 0 before the first. */
+uint64_t xbox_VblankLastNs(void)
+{
+    return g_vblank_last_ns;
 }
 
 /* Count one vblank, and once per 600 print a line that
@@ -3126,6 +3134,7 @@ static void kernel_vblank_count(long long now)
     static double gap_min = 1e9, gap_max;
     LARGE_INTEGER q;
 
+    g_vblank_last_ns = xbox_HostNowNs();
     InterlockedIncrement(&g_vblank_total);
     if (!qf.QuadPart)
         QueryPerformanceFrequency(&qf);
@@ -3321,7 +3330,16 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
     edge = __atomic_exchange_n(&g_vbl_align_ns, (int64_t)0, __ATOMIC_ACQ_REL);
     if (edge) {
         /* the schedule's phase against the edge, in (-P/2, P/2]: slew */
-        const int64_t P = 1000000000ll / 60, step = 250000;
+        /* RECOMP_VBLANK_SLEW_NS: the most one alignment moves the schedule
+         * (default 250 us) */
+        static int64_t step = -1;
+        const int64_t P = 1000000000ll / 60;
+        if (step < 0) {
+            const char *e = getenv("RECOMP_VBLANK_SLEW_NS");
+            step = e ? atol(e) : 250000;
+            if (step < 0)
+                step = 250000;
+        }
         int64_t d = (edge - (int64_t)vblank_due(t0_ns, count)) % P;
         if (d > P / 2)
             d -= P;
@@ -3367,6 +3385,7 @@ static void kernel_vblank_tick(void)
      * in the same words as the 60 Hz schedule's line. Only a log line. */
     if (!last_ms)
         last_ms = now;              /* so the first line spans 599 vblanks */
+    g_vblank_last_ns = xbox_HostNowNs();
     if (InterlockedIncrement(&g_vblank_total) % 600 == 0) {
         fprintf(stderr, "  [NV2A] vblank %ld (tick): last 600 in %lld ms\n",
                 (long)g_vblank_total, now - last_ms);

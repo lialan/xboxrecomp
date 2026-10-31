@@ -222,6 +222,11 @@ void xbox_ThreadAcctAdd(int kind, uint64_t ns)
         s->wait_ns[kind] += ns;
 }
 
+const char *xbox_ThreadAcctSelfName(void)
+{
+    return t_slot ? t_slot->name : "unnamed";
+}
+
 void xbox_ThreadAcctKick(uint64_t ns)
 {
     ACCT_ADD64(&s_kick_ns, ns);

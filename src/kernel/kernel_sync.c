@@ -15,6 +15,11 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"     /* RECOMP_TLS */
+#include "platform/host_time.h"
+#include "platform/thread_acct.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -194,13 +199,61 @@ static NTSTATUS xbox_wait_result_to_ntstatus(DWORD result, ULONG count)
     }
 }
 
+/* RECOMP_WAIT_TRACE=1: every guest kernel wait of 5 ms or more -- which
+ * thread (host id), the object, the guest code that waited (the kernel
+ * call's caller), how long, and where it began and ended against the guest
+ * vblanks: a frame that skips a vblank shows which wait spanned it. At most
+ * 3000 lines. */
+extern RECOMP_TLS uint32_t g_xbox_kernel_caller;
+static uint64_t wait_trace_begin(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_WAIT_TRACE") != NULL;
+    return on ? xbox_HostNowNs() : 0;
+}
+static void wait_trace_end(const char *what, const void *obj, uint64_t t0, uint32_t vbl0,
+                           uint64_t vns0)
+{
+    static volatile LONG lines;
+    uint64_t t1, vns1;
+    uint32_t vbl1;
+    if (!t0)
+        return;
+    t1 = xbox_HostNowNs();
+    static long min_us = -1;
+    if (min_us < 0) {           /* RECOMP_WAIT_TRACE=<ms>: the shortest logged */
+        const char *e = getenv("RECOMP_WAIT_TRACE");
+        min_us = e && atol(e) > 1 ? atol(e) * 1000 : 5000;
+    }
+    static uint64_t from_ns = 1;
+    if (from_ns == 1) {         /* RECOMP_WAIT_TRACE_AFTER=<s>: from then on */
+        const char *e = getenv("RECOMP_WAIT_TRACE_AFTER");
+        from_ns = e ? t0 + (uint64_t)atol(e) * 1000000000ull : 0;
+    }
+    if (t1 - t0 < (uint64_t)min_us * 1000ull || t0 < from_ns
+        || InterlockedIncrement(&lines) > 3000)
+        return;
+    vbl1 = xbox_VblankCount();
+    vns1 = xbox_VblankLastNs();
+    fprintf(stderr, "[WAIT] %s %s %p from %08X: %.2f ms, began %.2f ms after vblank %u,"
+            " ended %.2f ms after vblank %u\n", xbox_ThreadAcctSelfName(), what, obj,
+            g_xbox_kernel_caller, (t1 - t0) / 1e6, t0 >= vns0 ? (t0 - vns0) / 1e6 : -1.0, vbl0,
+            t1 >= vns1 ? (t1 - vns1) / 1e6 : -1.0, vbl1);
+}
+#define WAIT_TRACE_BEGIN() uint64_t _wt0 = wait_trace_begin(); \
+    uint32_t _wv0 = _wt0 ? xbox_VblankCount() : 0; uint64_t _wn0 = _wt0 ? xbox_VblankLastNs() : 0
+#define WAIT_TRACE_END(what, obj) wait_trace_end((what), (obj), _wt0, _wv0, _wn0)
+
 NTSTATUS __stdcall xbox_NtWaitForSingleObject(
     HANDLE Handle,
     BOOLEAN Alertable,
     PLARGE_INTEGER Timeout)
 {
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    WAIT_TRACE_BEGIN();
     DWORD result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    WAIT_TRACE_END("NtWaitForSingleObject", Handle);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -220,7 +273,11 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
      */
     (void)WaitMode;
 
-    result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    {
+        WAIT_TRACE_BEGIN();
+        result = WaitForSingleObjectEx(Handle, ms, Alertable);
+        WAIT_TRACE_END("NtWaitForSingleObjectEx", Handle);
+    }
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -238,7 +295,11 @@ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
     /* WaitType: 0 = WaitAll, 1 = WaitAny (matches NT definitions) */
     bWaitAll = (WaitType == 0) ? TRUE : FALSE;
 
-    result = WaitForMultipleObjectsEx(Count, Handles, bWaitAll, ms, Alertable);
+    {
+        WAIT_TRACE_BEGIN();
+        result = WaitForMultipleObjectsEx(Count, Handles, bWaitAll, ms, Alertable);
+        WAIT_TRACE_END("NtWaitForMultipleObjectsEx", Count ? Handles[0] : NULL);
+    }
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 
@@ -259,7 +320,9 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
 
     HANDLE hObject = (HANDLE)Object;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    WAIT_TRACE_BEGIN();
     DWORD result = WaitForSingleObjectEx(hObject, ms, Alertable);
+    WAIT_TRACE_END("KeWaitForSingleObject", hObject);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 

@@ -24,6 +24,8 @@ void xbox_ThreadAcctName(const char *name);
 void xbox_ThreadAcctAdd(int kind, uint64_t ns);
 /* A GPU write-back flush acknowledged, at most ns after it was asked for. */
 void xbox_ThreadAcctKick(uint64_t ns);
+/* The calling thread's name in the report ("unnamed" if it has none). */
+const char *xbox_ThreadAcctSelfName(void);
 
 /* Around a wait: a load and a branch while the log is off. */
 #define XBOX_ACCT_BEGIN() \

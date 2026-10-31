@@ -4134,8 +4134,28 @@ static int try_draw_raw_vp(void)
     return 1;
 }
 
+/* RECOMP_EXEC_DRAW_DELAY_US=<us>: every batch costs the executor that much
+ * more (a busy wait), to stand in on a fast machine for a slow one's
+ * executor -- the Quest's runs two to three times slower -- and see its
+ * frame pacing locally (RECOMP_FRAME_TRACE). */
+static void exec_draw_delay(void)
+{
+    static long us = -1;
+    uint64_t end;
+    if (us < 0) {
+        const char *e = getenv("RECOMP_EXEC_DRAW_DELAY_US");
+        us = e ? atol(e) : 0;
+    }
+    if (us <= 0)
+        return;
+    end = xbox_HostNowNs() + (uint64_t)us * 1000ull;
+    while (xbox_HostNowNs() < end)
+        ;
+}
+
 static void raster_batch_program(void)
 {
+    exec_draw_delay();
     uint32_t i, n = s_gpu.idx_count;
     uint64_t t0, t1 = 0;
 
@@ -4906,9 +4926,63 @@ static uint64_t s_vbl_moved_ns;
  * most of a frame. */
 static uint32_t s_walk_vbl;
 
+static uint64_t s_walk_ns;          /* when that walk began */
+
 void nv2a_pb_exec_walk_begin(void)
 {
     s_walk_vbl = xbox_VblankCount();
+    s_walk_ns = xbox_HostNowNs();
+}
+
+/* RECOMP_FRAME_TRACE=1: where a frame that missed its vblank lost the time.
+ * For every flip: the guest vblanks since the previous flip (1 on time, 2+
+ * a missed one), how long after the latest vblank the walk carrying it
+ * began (the title's side: when its last segment arrived) and how long the
+ * walk took to reach the flip (the executor's side). Once a second, the
+ * averages for on-time and for late flips:
+ *   [FRAMES] 49 flips, 10 late | on time: arrived 6.1 ms after the vblank,
+ *            executed in 2.3 | late: arrived 14.9, executed in 3.0
+ * A late flip that arrived late is the title's (or its waits'); one that
+ * arrived early and executed long is the executor's. */
+static void frame_trace(uint64_t flip_ns)
+{
+    static int on = -1;
+    static uint32_t last_vbl, n, late;
+    static double arr[2], exe[2];
+    static uint32_t cnt[2];
+    static uint64_t t0;
+    uint32_t vbl, dv;
+    uint64_t vns;
+    int k;
+
+    if (on < 0)
+        on = getenv("RECOMP_FRAME_TRACE") != NULL;
+    if (!on)
+        return;
+    vbl = xbox_VblankCount();
+    vns = xbox_VblankLastNs();
+    dv = last_vbl ? vbl - last_vbl : 1;
+    last_vbl = vbl;
+    k = dv >= 2;
+    n++;
+    late += k;
+    cnt[k]++;
+    /* the walk's start against the vblank before it (the walk may have
+     * begun before the latest one: then against the one before that) */
+    arr[k] += s_walk_ns >= vns ? (s_walk_ns - vns) / 1e6 : -((vns - s_walk_ns) / 1e6);
+    exe[k] += (flip_ns - s_walk_ns) / 1e6;
+    if (!t0)
+        t0 = flip_ns;
+    if (flip_ns - t0 >= 1000000000ull) {
+        fprintf(stderr, "[FRAMES] %u flips, %u late | on time: arrived %.1f ms after the"
+                " vblank, executed in %.1f | late: arrived %.1f, executed in %.1f\n",
+                n, late, cnt[0] ? arr[0] / cnt[0] : 0.0, cnt[0] ? exe[0] / cnt[0] : 0.0,
+                cnt[1] ? arr[1] / cnt[1] : 0.0, cnt[1] ? exe[1] / cnt[1] : 0.0);
+        n = late = 0;
+        arr[0] = arr[1] = exe[0] = exe[1] = 0;
+        cnt[0] = cnt[1] = 0;
+        t0 = flip_ns;
+    }
 }
 
 /* RECOMP_FLIP_PACING: unset or 0 off (flips complete at once and frame
@@ -5558,6 +5632,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint64_t stall_ns = xbox_HostNowNs();
         int clock_ok;
         uint32_t stall_vbl;
+        frame_trace(stall_ns);
         (void)flip_clock(stall_ns, &clock_ok);
         stall_vbl = s_walk_vbl;
         if (s_ftrace == 2)

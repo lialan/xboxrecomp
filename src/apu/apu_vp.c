@@ -128,6 +128,28 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * Voice off / lock
  * ============================================================ */
 
+/* RECOMP_APU_VOICE_LOG=1: the voice lists' life -- a voice put on a list it
+ * is already on, a list walk cut off at MCPX_HW_MAX_VOICES (a cycle), each
+ * idle-voice trap raised or deferred, each voice_off and its cause, and
+ * once a second the lists' lengths. At most VLOG_MAX lines. */
+#define VLOG_MAX 4000
+static int s_vlog_on = -1, s_vlog_n;
+static int vlog_on(void)
+{
+    if (s_vlog_on < 0)
+        s_vlog_on = getenv("RECOMP_APU_VOICE_LOG") != NULL;
+    return s_vlog_on && s_vlog_n < VLOG_MAX;
+}
+#define VLOG(...) do { if (vlog_on()) { s_vlog_n++; fprintf(stderr, "[VOICE] " __VA_ARGS__); \
+    fputc('\n', stderr); } } while (0)
+static unsigned s_vlog_frame;
+/* Per voice and list: refilled (SET_VOICE_SSL_A/B) since last consumed. */
+static uint8_t s_ssl_fresh[MCPX_HW_MAX_VOICES][2];
+
+/* Which list v is on (1 2D, 2 3D, 3 MP), 0 when on none; walks with the
+ * same cap as the frame. */
+static int voice_list_of(MCPXAPUState *d, uint16_t v);
+
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
@@ -208,6 +230,13 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        if (vlog_on()) {
+            int on = voice_list_of(d, (uint16_t)selected_handle);
+            VLOG("frame %u: VOICE_ON %u%s (list field %u)", s_vlog_frame,
+                 (unsigned)selected_handle,
+                 on ? " -- ALREADY ON A LIST: a second link" : "",
+                 (unsigned)GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST));
+        }
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -319,6 +348,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        VLOG("frame %u: VOICE_OFF %u (the title)", s_vlog_frame,
+             (unsigned)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         break;
 
@@ -466,6 +497,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        s_ssl_fresh[current_voice][ssl] = 1;
+        VLOG("frame %u: voice %d SSL A set: base %u count %u (playing %c seg %u)", s_vlog_frame,
+             current_voice, d->vp.ssl[current_voice].base[ssl],
+             d->vp.ssl[current_voice].count[ssl], 'A' + d->vp.ssl[current_voice].ssl_index,
+             d->vp.ssl[current_voice].ssl_seg);
         break;
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
@@ -476,6 +512,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        s_ssl_fresh[current_voice][ssl] = 1;
+        VLOG("frame %u: voice %d SSL B set: base %u count %u (playing %c seg %u)", s_vlog_frame,
+             current_voice, d->vp.ssl[current_voice].base[ssl],
+             d->vp.ssl[current_voice].count[ssl], 'A' + d->vp.ssl[current_voice].ssl_index,
+             d->vp.ssl[current_voice].ssl_seg);
         break;
     }
 
@@ -498,6 +539,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case SE2FE_IDLE_VOICE:
+        VLOG("frame %u: idle-voice trap %u%s", s_vlog_frame, (unsigned)argument,
+             (d->regs[NV_PAPU_FETFORCE1] & NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE) ? ""
+             : " NOT RAISED: FETFORCE1 has no idle-voice bit");
         if (d->regs[NV_PAPU_FETFORCE1] & NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE) {
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FEMETHMODE;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
@@ -1129,6 +1173,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             int eacur = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                                        NV_PAVS_VOICE_PAR_STATE_EACUR);
             if (eacur < NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE) {
+                VLOG("frame %u: voice %u off: stream envelope past release", s_vlog_frame,
+                     (unsigned)v);
                 voice_off(d, (uint16_t)v);
                 return -1;
             }
@@ -1146,6 +1192,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             d->vp.ssl[v].ssl_seg = 0;
             if (!persist) {
                 d->vp.ssl[v].ssl_index = 0;
+                VLOG("frame %u: voice %u off: stream out of segments", s_vlog_frame,
+                     (unsigned)v);
                 voice_off(d, (uint16_t)v);
             } else {
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE +
@@ -1294,6 +1342,11 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 /* Move to next segment */
             } else {
                 int next_index = (ssl_index + 1) % 2;
+                VLOG("frame %u: voice %u SSL %c done -> %c (count %u)%s", s_vlog_frame,
+                     (unsigned)v, 'A' + ssl_index, 'A' + next_index,
+                     d->vp.ssl[v].count[next_index],
+                     s_ssl_fresh[v][next_index] ? "" : " -- STALE: not refilled since it last played");
+                s_ssl_fresh[v][ssl_index] = 0;
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
@@ -1665,10 +1718,26 @@ static void vp_trace_positions(MCPXAPUState *d)
     }
 }
 
+static int voice_list_of(MCPXAPUState *d, uint16_t v)
+{
+    for (int list = 0; list < 3; list++) {
+        uint32_t h = d->regs[voice_list_regs[list].top];
+        for (int i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
+            if (h == v)
+                return list + 1;
+            h = voice_get_mask(d, (uint16_t)h, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        }
+    }
+    return 0;
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    int vlog_len[3] = { 0, 0, 0 }, vlog_idle[3] = { 0, 0, 0 }, vlog_deferred = 0;
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+    s_vlog_frame++;
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
@@ -1681,10 +1750,21 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         for (int i = 0; d->regs[current] != 0xFFFF; i++) {
             if (i >= MCPX_HW_MAX_VOICES) {
                 DPRINTF("Voice list contains invalid entry!\n");
+                if (vlog_on()) {
+                    static unsigned shown;
+                    if (shown++ < 20)
+                        VLOG("frame %u: list %d walk cut off at %d entries: a cycle"
+                             " (voice %u links to %u)", s_vlog_frame, list,
+                             MCPX_HW_MAX_VOICES, (unsigned)d->regs[current],
+                             (unsigned)voice_get_mask(d, (uint16_t)d->regs[current],
+                                 NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                 NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE));
+                }
                 break;
             }
 
             uint16_t v = (uint16_t)d->regs[current];
+            vlog_len[list]++;
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
 
@@ -1694,9 +1774,12 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                  * idle voice in the same frame would overwrite FEDECPARAM
                  * before the ISR has read the first. The rest trap on later
                  * frames, after the ISR has resumed the front end. */
+                vlog_idle[list]++;
                 if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
                         != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
                     fe_method(d, SE2FE_IDLE_VOICE, v);
+                else
+                    vlog_deferred++;
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_spin_lock(d, v);
@@ -1707,6 +1790,12 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         }
     }
 
+    if (s_vlog_on > 0 && s_vlog_frame % 1500 == 0)
+        VLOG("frame %u: lists 2D %d 3D %d MP %d voices, idle on them %d/%d/%d,"
+             " %d idle deferred (FE trapped) this frame; FECTL %08X FETFORCE1 %08X",
+             s_vlog_frame, vlog_len[0], vlog_len[1], vlog_len[2], vlog_idle[0],
+             vlog_idle[1], vlog_idle[2], vlog_deferred, d->regs[NV_PAPU_FECTL],
+             d->regs[NV_PAPU_FETFORCE1]);
     vp_trace_positions(d);
     vp_stat_report();
     if (s_ring_on > 0 && ++s_ring_frames % 1500 == 0)
