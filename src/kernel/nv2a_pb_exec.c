@@ -3711,6 +3711,12 @@ static void raw_check(const Nv2aRawGeometry *g, const float *gpu)
     uint32_t i, k, bad = 0;
     int logged = 0;
 
+    if (g->check_valid && !*g->check_valid) {
+        static uint32_t missing;
+        if (++missing <= 8 || (missing & (missing - 1)) == 0)
+            fprintf(stderr, "[XFCHK] capture not produced; skipped (%u so far)\n", missing);
+        return;
+    }
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
     s_raw.checked++;
@@ -3885,6 +3891,7 @@ static int try_draw_raw(void)
     Nv2aBatch batch;
     const VertexAttr *tc;
     int check = 0;
+    uint32_t capture_valid = 0;
     uint64_t t0 = prof_on() ? xbox_HostNowNs() : 0;
 
     if (!ridx && !(ridx = (uint16_t *)malloc((NV_MAX_INDICES / 4 * 6 + 8) * sizeof *ridx)))
@@ -3960,6 +3967,7 @@ static int try_draw_raw(void)
                                         * sizeof *check_buf);
         if (check_buf) {
             g.check_out = check_buf;
+            g.check_valid = &capture_valid;
             check = 1;
         }
     }
@@ -4118,6 +4126,7 @@ static int try_draw_raw_vp(void)
     Nv2aVshOutput v0;
     const VertexAttr *tc;
     int check = 0;
+    uint32_t capture_valid = 0;
     uint64_t t0 = prof_on() ? xbox_HostNowNs() : 0;
 
     if (!ridx && !(ridx = (uint16_t *)malloc((NV_MAX_INDICES / 4 * 6 + 8) * sizeof *ridx)))
@@ -4189,6 +4198,7 @@ static int try_draw_raw_vp(void)
                                         * sizeof *check_buf);
         if (check_buf) {
             g.check_out = check_buf;
+            g.check_valid = &capture_valid;
             check = 1;
         }
     }
