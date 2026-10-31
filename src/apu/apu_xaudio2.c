@@ -256,6 +256,13 @@ void xa2_expect_drain(void)
     g_xa2_dry = 1;
 }
 
+/* XAudio2 reports a lost device through its own callbacks; nothing to try
+ * from here. */
+int xa2_recover(void)
+{
+    return 0;
+}
+
 unsigned xa2_underruns(void)
 {
     return g_xa2_underruns;

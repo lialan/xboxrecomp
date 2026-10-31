@@ -501,6 +501,8 @@ struct MCPXAPUState {
     int64_t next_frame_time_us;
     int pace_q_seen;            /* device queue at the last pacing decision */
     int64_t pace_drain_us;      /* when that queue last fell or sat below high */
+    int64_t pace_recover_us;    /* the last xa2_recover while stalled */
+    int pace_recover_tries;     /* xa2_recover calls so far (PACE_RECOVER_MAX) */
     bool pace_stalled;          /* device stopped consuming: host-clock pacing,
                                  * periods dropped (mcpx_apu_pace_step) */
 

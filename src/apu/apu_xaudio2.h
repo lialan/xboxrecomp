@@ -60,6 +60,14 @@ static inline void xa2_pacing_marks(int buf_samples, int count, int period,
 /* Times the voice ran dry after audio started ([XA2] underrun x%u). */
 unsigned xa2_underruns(void);
 
+/* The device stopped taking samples (mcpx_apu_pace_step: the queue has not
+ * fallen for its stall window). Says why, as far as the backend can tell,
+ * and tries to bring it back: the SDL backend closes and reopens the device
+ * (on Android an OpenSL ES player cut off by an audio route or focus change
+ * never calls back again, and a new one plays). Returns 1 when it reopened
+ * the device, 0 when it could not or does not try. */
+int xa2_recover(void);
+
 /* Samples the device has consumed since init: XAudio2's SamplesPlayed, or
  * on SDL2 everything queued minus what is still queued. Read against the
  * wall clock this is the host-side starvation measure: while the device

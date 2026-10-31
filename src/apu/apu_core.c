@@ -935,6 +935,10 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * the default 512 samples) well inside this; the largest buffers the hosts
  * accept (4096 samples, 85 ms) still fit. */
 #define PACE_STALL_US 200000
+/* A stalled device is reopened at once and then every PACE_RECOVER_US, at
+ * most PACE_RECOVER_MAX times a session (xa2_recover). */
+#define PACE_RECOVER_US  2000000
+#define PACE_RECOVER_MAX 10
 
 /* One pacing decision, taken at an EP-period boundary. Returns 0 to render
  * the next period now, or how many microseconds to wait before asking again.
@@ -992,6 +996,20 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
                                 " queue paces the APU\n");
             }
         }
+        /* Stalled: try to bring the device back (xa2_recover) at once and
+         * then every PACE_RECOVER_US, a few times. Without it a device
+         * Android cut off -- an audio route or focus change, an OpenSL ES
+         * player that stops calling back -- stayed silent for the rest of
+         * the session. */
+        if (d->pace_stalled && d->pace_recover_tries < PACE_RECOVER_MAX
+            && now_us - d->pace_recover_us >= PACE_RECOVER_US) {
+            d->pace_recover_us = now_us;
+            d->pace_recover_tries++;
+            if (xa2_recover()) {
+                d->pace_drain_us = now_us;
+                q = xa2_queued_samples();
+            }
+        }
         d->pace_q_seen = q;
         if (!d->pace_stalled && q >= high &&
             now_us - d->pace_drain_us >= PACE_STALL_US) {
@@ -1002,6 +1020,7 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
                                 " samples queued for %d ms): the host clock"
                                 " paces the APU and periods are dropped\n",
                         q, PACE_STALL_US / 1000);
+            d->pace_recover_us = now_us - PACE_RECOVER_US;   /* try at once */
         }
 
         if (d->pace_stalled)

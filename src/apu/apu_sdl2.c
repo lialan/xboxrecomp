@@ -48,6 +48,8 @@ static unsigned  g_underruns;
 static uint64_t  g_samples_queued;  /* samples handed to the queue, ever */
 static int       g_dry;
 static int64_t   g_underrun_logged_ms;
+static SDL_AudioSpec g_want;        /* what xa2_init asked for, to reopen with */
+static unsigned  g_recoveries;
 
 static int env_int(const char *name, int def, int lo, int hi)
 {
@@ -107,6 +109,7 @@ int xa2_init(void)
 
     /* No format changes allowed: the mixer's 48 kHz s16 stereo is what the
      * queue takes, and SDL converts for the device if it has to. */
+    g_want = want;
     g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (g_dev == 0) {
         fprintf(stderr, "[SDL2] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
@@ -167,6 +170,21 @@ int xa2_is_active(void)
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     if (!g_initialized || !g_dev || num_samples <= 0) return 0;
+    {   /* RECOMP_AUDIO_STALL_TEST=<s>: that many seconds in, the device stops
+         * pulling (paused behind the backend's back) -- the stall the pacer
+         * detects and xa2_recover answers, without a headset */
+        static int64_t at = -1, t0;
+        if (at < 0) {
+            const char *e = getenv("RECOMP_AUDIO_STALL_TEST");
+            at = e ? (int64_t)atoi(e) * 1000 : 0;
+            t0 = now_ms();
+        }
+        if (at > 0 && now_ms() - t0 >= at) {
+            at = 0;
+            fprintf(stderr, "[SDL2] RECOMP_AUDIO_STALL_TEST: the device stops pulling\n");
+            SDL_PauseAudioDevice(g_dev, 1);
+        }
+    }
     if (SDL_QueueAudio(g_dev, samples,
                        (Uint32)num_samples * SDLA_CHANNELS * sizeof(int16_t)) != 0) {
         fprintf(stderr, "[SDL2] SDL_QueueAudio failed: %s\n", SDL_GetError());
@@ -224,6 +242,43 @@ void xa2_expect_drain(void)
 unsigned xa2_underruns(void)
 {
     return g_underruns;
+}
+
+/* The device stopped consuming: log what SDL says about it, then close and
+ * reopen it. The queue's contents go with the old device (they are stale by
+ * now); the pacer refills the new one. Called by the APU's pacer when it
+ * declares the stall and again every few seconds while it lasts. */
+int xa2_recover(void)
+{
+    SDL_AudioSpec have;
+    SDL_AudioStatus st;
+    const char *driver;
+
+    if (!g_initialized)
+        return 0;
+    st = g_dev ? SDL_GetAudioDeviceStatus(g_dev) : SDL_AUDIO_STOPPED;
+    driver = SDL_GetCurrentAudioDriver();
+    g_recoveries++;
+    fprintf(stderr, "[SDL2] audio device not consuming: SDL says %s, driver %s, %u bytes"
+            " queued; reopening it (attempt %u)\n",
+            st == SDL_AUDIO_PLAYING ? "playing" : st == SDL_AUDIO_PAUSED ? "paused" : "stopped",
+            driver ? driver : "?", g_dev ? SDL_GetQueuedAudioSize(g_dev) : 0, g_recoveries);
+    if (g_dev) {
+        SDL_ClearQueuedAudio(g_dev);
+        SDL_CloseAudioDevice(g_dev);
+        g_dev = 0;
+    }
+    memset(&have, 0, sizeof have);
+    g_dev = SDL_OpenAudioDevice(NULL, 0, &g_want, &have, 0);
+    if (!g_dev) {
+        fprintf(stderr, "[SDL2] reopening the audio device failed: %s\n", SDL_GetError());
+        return 0;
+    }
+    g_dry = 0;
+    SDL_PauseAudioDevice(g_dev, 0);
+    fprintf(stderr, "[SDL2] audio device reopened (%d-sample buffers)\n",
+            have.samples ? have.samples : g_buf_samples);
+    return 1;
 }
 
 /* What the device thread has pulled off the queue; it pulls one device
