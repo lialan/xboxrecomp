@@ -48,6 +48,8 @@ extern int nv2a_pb_exec_data_run(uint32_t subch, uint32_t method, const uint32_t
                                  uint32_t count);
 extern int nv2a_pb_exec_vsh_run(uint32_t subch, uint32_t method, int inc, const uint32_t *p,
                                 uint32_t count);
+extern uint32_t nv2a_pb_exec_reg_run(uint32_t subch, uint32_t method, const uint32_t *p,
+                                     uint32_t count);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
@@ -75,14 +77,20 @@ static int pb_walk_enabled(void)
  * (about 40% of its thread in X-Men Legends' levels). */
 static uint16_t s_seen_slot[8][0x2000 / 4];
 
+/* The inventory is only reported with RECOMP_PB_SCAN; kept otherwise, it
+ * was a table update for every word of every frame's push buffer. */
+static int s_note_on = -1;
+
+static int note_on(void)
+{
+    if (s_note_on < 0)
+        s_note_on = getenv("RECOMP_PB_SCAN") != NULL;
+    return s_note_on;
+}
+
 static void note(uint32_t subch, uint32_t method)
 {
-    /* The inventory is only reported with RECOMP_PB_SCAN; kept otherwise, it
-     * was a table update for every word of every frame's push buffer. */
-    static int on = -1;
-    if (on < 0)
-        on = getenv("RECOMP_PB_SCAN") != NULL;
-    if (!on)
+    if (!note_on())
         return;
     uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
 
@@ -530,8 +538,11 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                     n = (end_va - va) / 4;
                 if (n && nv2a_pb_exec_data_run(subch, method,
                                                (const uint32_t *)(mem + va), n)) {
-                    for (uint32_t i = 0; i < n; i++)
-                        note(subch, method);
+                    /* (a call per index word, even to return at once, was
+                     * 4% of the executor in VC3's mission intro) */
+                    if (note_on())
+                        for (uint32_t i = 0; i < n; i++)
+                            note(subch, method);
                     va += 4 * n;
                     words += n;
                     continue;
@@ -545,14 +556,30 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                 if (n && n == count
                     && nv2a_pb_exec_vsh_run(subch, method, !noninc,
                                             (const uint32_t *)(mem + va), n)) {
-                    for (uint32_t i = 0; i < n; i++)
-                        note(subch, noninc ? method : method + i * 4);
+                    if (note_on())
+                        for (uint32_t i = 0; i < n; i++)
+                            note(subch, noninc ? method : method + i * 4);
                     va += 4 * n;
                     words += n;
                     continue;
                 }
             }
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
+            /* registers nothing acts on (matrices, lights): the run in one
+             * call -- or as many of its words as are such */
+            uint32_t first = 0;
+            if (!noninc && count > 1 && s_exec_enabled && data_run) {
+                uint32_t n = count;
+                if ((end_va - va) / 4 < n)
+                    n = (end_va - va) / 4;
+                first = n ? nv2a_pb_exec_reg_run(subch, method, (const uint32_t *)(mem + va), n)
+                          : 0;
+                if (first && note_on())
+                    for (uint32_t i = 0; i < first; i++)
+                        note(subch, method + i * 4);
+                va += 4 * first;
+                words += first;
+            }
+            for (uint32_t i = first; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
                 if (s_exec_enabled)
@@ -585,26 +612,37 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
         /* RECOMP_PROF: the walk's own time a second -- all of the executor's
          * push-buffer work, draws included -- and its words */
         static int prof = -1;
-        static uint64_t acc_ns, t0, acc_words;
-        struct timespec ta, tb;
+        static uint64_t acc_ns, t0, acc_words, acc_cpu;
+        struct timespec ta, tb, ca = { 0, 0 }, cb = { 0, 0 };
         if (prof < 0)
             prof = getenv("RECOMP_PROF") != NULL;
-        if (prof)
+        if (prof) {
             clock_gettime(CLOCK_MONOTONIC, &ta);
+#ifdef CLOCK_THREAD_CPUTIME_ID
+            /* and the thread's CPU time: the wall time also counts the
+             * thread waiting for a core while other processes run */
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ca);
+#endif
+        }
         words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
         if (prof) {
             uint64_t a_ns, b_ns;
             clock_gettime(CLOCK_MONOTONIC, &tb);
+#ifdef CLOCK_THREAD_CPUTIME_ID
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cb);
+#endif
             a_ns = (uint64_t)ta.tv_sec * 1000000000ull + (uint64_t)ta.tv_nsec;
             b_ns = (uint64_t)tb.tv_sec * 1000000000ull + (uint64_t)tb.tv_nsec;
             acc_ns += b_ns - a_ns;
+            acc_cpu += (uint64_t)(cb.tv_sec - ca.tv_sec) * 1000000000ull
+                     + (uint64_t)(cb.tv_nsec - ca.tv_nsec);
             acc_words += words;
             if (!t0)
                 t0 = a_ns;
             if (b_ns - t0 >= 1000000000ull) {
-                fprintf(stderr, "[PROF] walk %.0f ms, %llu words\n", acc_ns / 1e6,
-                        (unsigned long long)acc_words);
-                acc_ns = acc_words = 0;
+                fprintf(stderr, "[PROF] walk %.0f ms, %llu words, thread CPU %.0f ms\n",
+                        acc_ns / 1e6, (unsigned long long)acc_words, acc_cpu / 1e6);
+                acc_ns = acc_words = acc_cpu = 0;
                 t0 = b_ns;
             }
         }
