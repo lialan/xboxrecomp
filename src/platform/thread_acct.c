@@ -207,9 +207,13 @@ int xbox_ThreadAcctInit(void)
     return g_thread_acct_on;
 }
 
+void (*g_xbox_thread_named)(const char *name);
+
 void xbox_ThreadAcctName(const char *name)
 {
     AcctSlot *s;
+    if (g_xbox_thread_named)
+        g_xbox_thread_named(name);
     if (xbox_ThreadAcctInit() <= 0 || !(s = acct_self()))
         return;
     snprintf(s->name, sizeof s->name, "%s", name);
