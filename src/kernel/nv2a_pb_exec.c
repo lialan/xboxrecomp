@@ -34,6 +34,7 @@
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 #include "nv2a_flip_hold.h"
 #include "platform/host_time.h"   /* xbox_HostNowNs */
+#include "nv2a_pb_defer.h"
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
@@ -821,7 +822,7 @@ static void prof_flip(void)
 
 void nv2a_backend_register(const Nv2aBackend *backend)
 {
-    s_backend = backend;
+    s_backend = nv2a_defer_wrap(backend);   /* RECOMP_PB_DECODE_THREAD */
 }
 
 static int backend_draws(void)
@@ -829,9 +830,20 @@ static int backend_draws(void)
     return s_backend && s_backend->draw;
 }
 
+static int s_presented_ov;
+static uint32_t s_presented_ov_va;
+
+void nv2a_backend_presented_override(int on, uint32_t va)
+{
+    s_presented_ov_va = va;
+    s_presented_ov = on;
+}
+
 uint32_t nv2a_backend_presented_va(void)
 {
     uint32_t off = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
+    if (s_presented_ov)
+        return s_presented_ov_va;
     return off ? dma_resolve(off) : 0;      /* as Nv2aSurface.color_va */
 }
 
@@ -879,34 +891,32 @@ static void current_render_state(Nv2aRenderState *r)
     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
 }
 
-static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+static int sample_tex(const Texture *t, uint32_t face_offset,
+                      uint32_t u, uint32_t v, uint32_t *argb);
 
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
 {
-    Texture saved = s_gpu.texs[0];
+    /* Its own Texture, not stage 0's: under RECOMP_PB_DECODE_THREAD the back
+     * end calls this from the submission thread while the executor decodes. */
+    Texture t;
     uint32_t x, y;
-    int ok = 1;
 
-    s_gpu.texs[0].offset = tex->offset;
-    s_gpu.texs[0].width  = tex->width;
-    s_gpu.texs[0].height = tex->height;
-    s_gpu.texs[0].pitch  = tex->pitch;
-    s_gpu.texs[0].color  = tex->color;
-    s_gpu.texs[0].addr_u = 3;
-    s_gpu.texs[0].addr_v = 3;
-    s_gpu.texs[0].palette = tex->palette;   /* P8's CLUT; 0 fails a P8 decode */
-    s_gpu.texs[0].levels = 1;
-    s_gpu.texs[0].filter = 0;
-    s_gpu.texs[0].cube   = 0;
-    s_gpu.texs[0].valid  = 1;
-    for (y = 0; y < tex->height && ok; y++)
+    memset(&t, 0, sizeof t);
+    t.offset = tex->offset;
+    t.width  = tex->width;
+    t.height = tex->height;
+    t.pitch  = tex->pitch;
+    t.color  = tex->color;
+    t.addr_u = 3;
+    t.addr_v = 3;
+    t.palette = tex->palette;   /* P8's CLUT; 0 fails a P8 decode */
+    t.levels = 1;
+    t.valid  = 1;
+    for (y = 0; y < tex->height; y++)
         for (x = 0; x < tex->width; x++)
-            if (!sample_texture(x, y, &argb_out[(size_t)y * tex->width + x])) {
-                ok = 0;
-                break;
-            }
-    s_gpu.texs[0] = saved;
-    return ok;
+            if (!sample_tex(&t, 0, x, y, &argb_out[(size_t)y * tex->width + x]))
+                return 0;
+    return 1;
 }
 
 /* Swizzled colour surfaces (SURFACE_FORMAT type 2, log2 width/height in bits
@@ -3484,10 +3494,12 @@ static int raw_mode_bits(void)
 static int raw_xf_enabled(void) { return raw_mode_bits() & 1; }
 static int raw_vp_enabled(void) { return raw_mode_bits() & 2; }
 
-/* Can fetch_attr read this attribute at all (array batches)? */
+/* Can fetch_attr read this attribute at all? For an array batch the offset
+ * is a guest address, 0 meaning none; for an inline batch it is a byte
+ * offset into the payload, and attribute 0 legitimately starts at 0. */
 static int attr_usable(const VertexAttr *a)
 {
-    if (!a->size || !a->stride || !a->offset)
+    if (!a->size || !a->stride || (!a->offset && !s_gpu.inline_active))
         return 0;
     switch (a->type) {
     case 0: case 1: case 2: case 4: case 5: case 6:
@@ -3513,10 +3525,21 @@ static int raw_attrib(uint32_t a, uint32_t min, uint32_t max, Nv2aAttrib *out)
         return 1;
     at = (uint64_t)va->offset + (uint64_t)min * va->stride;
     bytes = (max - min) * va->stride + attr_elem_bytes(va);
-    if (!guest_span_ok(at, bytes))
-        return 0;
-    out->data = (const uint8_t *)xbox_GetMemoryOffset() + at;
-    out->guest_va = (uint32_t)at;
+    if (s_gpu.inline_active) {
+        /* An inline batch (DrawPrimitiveUP): the vertices are the payload
+         * buffered between BEGIN and END, as raw_vp_attrib reads them. These
+         * used to be declined here ("attribute span") and transformed on the
+         * CPU one vertex at a time -- VC3's comm-window faces, a fifth of the
+         * executor's time in the mission intro. */
+        if (at + bytes > (uint64_t)s_gpu.inline_count * 4)
+            return 0;
+        out->data = (const uint8_t *)s_gpu.inline_buf + at;
+    } else {
+        if (!guest_span_ok(at, bytes))
+            return 0;
+        out->data = (const uint8_t *)xbox_GetMemoryOffset() + at;
+        out->guest_va = (uint32_t)at;
+    }
     out->type = va->type;
     out->size = va->size < 4 ? va->size : 4;
     out->stride = va->stride;
@@ -3816,6 +3839,17 @@ static int try_draw_raw(void)
 
     if (!ridx && !(ridx = (uint16_t *)malloc((NV_MAX_INDICES / 4 * 6 + 8) * sizeof *ridx)))
         return 0;
+    {   /* RECOMP_INLINE_RAW=0: inline batches stay on the CPU, as before */
+        static int inline_raw = -1;
+        if (inline_raw < 0) {
+            const char *e = getenv("RECOMP_INLINE_RAW");
+            inline_raw = !(e && e[0] == '0');
+        }
+        if (s_gpu.inline_active && !inline_raw) {
+            s_raw.declined[RAW_D_SPAN]++;
+            return 0;
+        }
+    }
     /* The position must be readable, or the CPU path drops the batch. */
     if (!attr_usable(&s_gpu.attr[0])) {
         s_raw.declined[RAW_D_SPAN]++;
@@ -5298,7 +5332,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * held 0xFF000000 at times, which put the write outside guest memory). */
     if (subch == 0 && method == 0x1D70 && s_sem_va) {
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-        *(volatile uint32_t *)(mem + s_sem_va) = param;
+        /* Deferring, the release is queued behind the draws before it and
+         * the submission thread writes it once it has submitted them: the
+         * title sees the progress a GPU would report, and the decode goes
+         * on (a drain here cost the intro ~5 waits a frame). */
+        if (!nv2a_defer_write((volatile uint32_t *)(mem + s_sem_va), param))
+            *(volatile uint32_t *)(mem + s_sem_va) = param;
         return;
     }
     if (!inited) {
@@ -5389,6 +5428,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
         if (!r)
             return;
+        nv2a_defer_sync(NV2A_SYNC_KICKOFF);
         if (!s_sem_va) {
             uint32_t va = xbox_Nv2aFenceWordVa();
 
@@ -5487,6 +5527,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
     case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
     case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
+        nv2a_defer_sync(NV2A_SYNC_REPORT_CLEAR);   /* the back end adds to zpass_count */
         s_gpu.zpass_count = 0;
         break;
     case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
@@ -5503,6 +5544,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         uint32_t at = dma_resolve(param & 0x00FFFFFFu);
         uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
+        nv2a_defer_sync(NV2A_SYNC_REPORT);   /* the count includes the draws before it */
         memcpy(mem + at, &stamp, 8);
         memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
         memset(mem + at + 12, 0, 4);

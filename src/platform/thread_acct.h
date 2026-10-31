@@ -20,6 +20,11 @@ extern int g_thread_acct_on;
 int xbox_ThreadAcctInit(void);
 /* Names the calling thread in the report (and registers it). */
 void xbox_ThreadAcctName(const char *name);
+/* Called with each name given (on the named thread, log on or off) when
+ * set: how a host learns which of its threads is which -- a VR runtime's
+ * thread hints, for the push-buffer decode ("nv2a exec") and the GPU
+ * submission ("nv2a submit") threads. */
+extern void (*g_xbox_thread_named)(const char *name);
 /* Time the calling thread just spent blocked (XBOX_ACCT_OBJECT) or asleep. */
 void xbox_ThreadAcctAdd(int kind, uint64_t ns);
 /* A GPU write-back flush acknowledged, at most ns after it was asked for. */

@@ -3,6 +3,7 @@ project(nv2a_ffp_backend_regression C)
 enable_testing()
 add_executable(nv2a-ffp-backend-test nv2a_ffp_backend_test.c
     ../../src/kernel/nv2a_pb_exec.c
+    ../../src/kernel/nv2a_pb_defer.c
     ../../src/kernel/nv2a_vsh_interp.c
     ../../src/kernel/nv2a_combiner.c
     ../../src/kernel/nv2a_flip_hold.c)
