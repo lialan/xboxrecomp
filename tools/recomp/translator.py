@@ -470,6 +470,9 @@ def _mark_back_edges(bb, stmts):
     return stmts if out is None else out
 
 
+
+from .reg_cache import reg_cache_function as _reg_cache_function
+
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
@@ -528,6 +531,7 @@ class FunctionTranslator:
         # The guest CPU's quantum check at every loop back edge
         # (RECOMP_BACK_EDGE), with --back-edge-yield; off, edges stay bare.
         self.back_edge_yield = False
+        self.reg_cache = False
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover callbacks and the gap entries their bodies reference."""
@@ -3178,7 +3182,10 @@ class FunctionTranslator:
         lines.append(f"}}")
         lines.append(f"")
 
-        return "\n".join(lines)
+        code = "\n".join(lines)
+        if self.reg_cache:
+            code = _reg_cache_function(code)
+        return code
 
     def _find_used_registers(self, instructions):
         """Find which 32-bit registers are referenced by any instruction."""
@@ -3226,13 +3233,14 @@ class BatchTranslator:
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
                  icall_sites_json_path=None, back_edge_yield=False,
-                 entry_stubs=False):
+                 entry_stubs=False, reg_cache=False):
         """back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
         (--back-edge-yield; off by default). entry_stubs: an unresolved
         target inside a function enters a copy of it (--entry-stubs)."""
         self.xbe_path = xbe_path
         self.back_edge_yield = back_edge_yield
         self.entry_stubs = entry_stubs
+        self.reg_cache = reg_cache
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
         self.icall_sites = {}
@@ -3293,6 +3301,7 @@ class BatchTranslator:
             trace_functions=trace_functions,
             force_returns=force_returns, icall_sites=self.icall_sites)
         self.translator.back_edge_yield = self.back_edge_yield
+        self.translator.reg_cache = self.reg_cache
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         for explicit_helper in (seh_prolog, seh_epilog):
@@ -3650,6 +3659,15 @@ class BatchTranslator:
         # So it tracks the template, like the .c files do. A project that
         # genuinely needs its own can put one earlier on the include path --
         # gen/ is only found because recomp_funcs.h sits beside it.
+        if self.reg_cache:
+            # The --reg-cache functions include these, beside the types.
+            for rc in ("recomp_rc_on.h", "recomp_rc_off.h"):
+                rc_src = os.path.join(os.path.dirname(__file__), "..", "..",
+                                      "templates", "runtime", rc)
+                with open(rc_src, "r", encoding="utf-8") as src:
+                    rc_text = src.read()
+                with open(os.path.join(output_dir, rc), "w", encoding="utf-8") as dst:
+                    dst.write(rc_text)
         types_dst = os.path.join(output_dir, "recomp_types.h")
         types_src = os.path.join(os.path.dirname(__file__), "..", "..",
                                  "templates", "runtime", "recomp_types.h")

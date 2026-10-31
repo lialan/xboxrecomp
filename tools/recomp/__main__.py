@@ -284,6 +284,15 @@ def main():
                              "a loop that makes no kernel call; it costs a "
                              "load and a branch per edge when the lock is "
                              "off. Off by default: edges stay bare")
+    parser.add_argument("--reg-cache", action="store_true",
+                        help="Hold the general-purpose guest registers a "
+                             "function uses (eax..edi, esp) in C locals, "
+                             "written back to the thread-local block before "
+                             "every call and return and reloaded after every "
+                             "call (recomp_rc_on.h). Guest stores no longer "
+                             "force a reload of every register. Off by "
+                             "default: registers are read and written in the "
+                             "block")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -363,6 +372,7 @@ def main():
             "icall_sites.json"),
         back_edge_yield=args.back_edge_yield,
         entry_stubs=args.entry_stubs,
+        reg_cache=args.reg_cache,
     )
 
     t_load = time.time() - t0

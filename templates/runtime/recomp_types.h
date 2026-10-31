@@ -1252,7 +1252,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0);
-#define RECOMP_ABI_CALL(va, fn) do { \
+#define RECOMP_ABI_CALL_BASE(va, fn) do { \
     uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
     (fn)(); \
     if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
@@ -1263,10 +1263,14 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  * keeps the counts (a project defines recomp_call_profile_hit). Diffing the counts
  * of two situations shows which functions one of them runs and the other does not. */
 void recomp_call_profile_hit(uint32_t va);
-#define RECOMP_ABI_CALL(va, fn) do { recomp_call_profile_hit(va); (fn)(); } while(0)
+#define RECOMP_ABI_CALL_BASE(va, fn) do { recomp_call_profile_hit(va); (fn)(); } while(0)
 #else
-#define RECOMP_ABI_CALL(va, fn) (fn)()
+#define RECOMP_ABI_CALL_BASE(va, fn) (fn)()
 #endif
+/* The call itself; code lifted with --reg-cache wraps it (recomp_rc_on.h).
+ * RECOMP_ABI_CHECK reads the callee-saved registers around the call, which
+ * under --reg-cache are the function's locals: use it with the default lift. */
+#define RECOMP_ABI_CALL(va, fn) RECOMP_ABI_CALL_BASE(va, fn)
 
 /* A guarded arm of an indirect call. When a recorded run saw a call site
  * reach only a few translated functions, the lifter compares the target
