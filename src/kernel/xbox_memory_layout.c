@@ -15,6 +15,7 @@
 #if !defined(_WIN32) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE   /* glibc declares dladdr/Dl_info (RECOMP_WATCH) only under it */
 #endif
+#include "thread_acct.h"
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "guest_vmem.h"
@@ -1397,6 +1398,17 @@ static void nv2a_ack_busy_bits(int flip_held)
 
     if (!regs)
         return;
+    /* RECOMP_THREAD_LOG: a flush request found pending could have waited
+     * at most since the walker last looked -- D3D's kick-off spins on it,
+     * so this bounds the title's time waiting for the executor there. */
+    if (g_thread_acct_on > 0) {
+        static uint64_t last;
+        uint64_t now = xbox_HostNowNs();
+        volatile uint32_t *flush = (volatile uint32_t *)((char *)regs + NV2A_ACK_PFB_FLUSH);
+        if (last && (*flush & 0x00010000u) && !flip_held)
+            xbox_ThreadAcctKick(now - last);
+        last = now;
+    }
     for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
         volatile uint32_t *r =
             (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
@@ -1427,6 +1439,50 @@ void xbox_Nv2aAckBusyBits(void)
     nv2a_ack_busy_bits(0);
 }
 
+/* The write-back flush, answered promptly.
+ *
+ * D3D's KickOff sets PFB 0x100410 bit 16 and spins until it clears: on the
+ * console the GPU flushes its write-combine buffer and clears it within
+ * microseconds, whatever it is drawing. Here the walker clears it between
+ * commands (every 256) and between segments -- but not while it is inside
+ * one long command: a flip's present, a texture upload, a heavy draw. The
+ * title spun that long in the kick-off, its game thread's time lost to the
+ * executor's (a third of VC3's game thread on the Mac).
+ *
+ * This thread clears it within RECOMP_FLUSH_ACK_US (default 50; 0 turns the
+ * thread off, the walker alone answering as before), except while a flip is
+ * held for pacing, when the withheld acknowledgement is the pacing. It only
+ * ever clears that one bit, interlocked like the walker's clear. */
+static DWORD WINAPI nv2a_flush_ack_thread(LPVOID param)
+{
+    volatile uint32_t *r = (volatile uint32_t *)((char *)param + NV2A_ACK_PFB_FLUSH);
+    uint64_t us;
+    const char *e = getenv("RECOMP_FLUSH_ACK_US");
+    extern int nv2a_pb_exec_flip_is_held(void);
+
+    xbox_ThreadAcctName("nv2a flush ack");
+    us = e ? strtoull(e, NULL, 10) : 50;
+    if (us > 1000)
+        us = 1000;
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        if ((*r & 0x00010000u) && !nv2a_pb_exec_flip_is_held()) {
+            if (g_thread_acct_on > 0)
+                xbox_ThreadAcctKick(us * 1000ull);
+            InterlockedAnd((volatile LONG *)r, (LONG)~0x00010000u);
+        }
+        xbox_HostSleepNs(us * 1000ull);
+    }
+    return 0;
+}
+
+static void nv2a_flush_ack_start(volatile uint32_t *regs)
+{
+    const char *e = getenv("RECOMP_FLUSH_ACK_US");
+    if (e && *e == '0' && !e[1])
+        return;
+    CloseHandle(CreateThread(NULL, 0, nv2a_flush_ack_thread, (LPVOID)regs, 0, NULL));
+}
+
 /* One word of the NV2A register file (offset from the register base), or NULL
  * before it is mapped. The pushbuffer executor writes what the GPU would when
  * it executes a command: PGRAPH state a title reads back, and DMA_GET. */
@@ -1440,6 +1496,7 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    xbox_ThreadAcctName("nv2a exec");
     /* Idle back-off: after IDLE_SPINS passes with nothing new to walk and
      * no flip held, each pass sleeps RECOMP_ACK_IDLE_US (default 100 us; 0:
      * spin as before) instead of only yielding. Spinning kept a core at full
@@ -1675,6 +1732,7 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    nv2a_flush_ack_start((volatile uint32_t *)g_nv2a_memory);
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));

@@ -7,6 +7,7 @@
  * Sleep in whole milliseconds, rounded up.
  * POSIX: CLOCK_MONOTONIC and nanosleep.
  */
+#include "thread_acct.h"
 #include "host_time.h"
 
 #ifdef _WIN32
@@ -51,7 +52,17 @@ uint64_t xbox_HostNowNs(void)
 #endif
 }
 
+static void host_sleep_ns(uint64_t ns);
+
+/* Accounted (thread_acct.h, RECOMP_THREAD_LOG) as the calling thread's sleep. */
 void xbox_HostSleepNs(uint64_t ns)
+{
+    XBOX_ACCT_BEGIN();
+    host_sleep_ns(ns);
+    XBOX_ACCT_END(XBOX_ACCT_SLEEP);
+}
+
+static void host_sleep_ns(uint64_t ns)
 {
     if (!ns)
         return;

@@ -345,7 +345,7 @@ static struct {
     uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
     uint32_t batches_program, verts_program, tris_behind;
     /* Where program-path triangles go, so "nothing drew" has a reason. */
-    uint32_t xf_degenerate, xf_offscreen, xf_drawn;
+    uint32_t xf_degenerate, xf_offscreen, xf_drawn, xf_backend;
     uint64_t xf_depth_fail, xf_pixels;
     float xf_min[3], xf_max[3];
     uint32_t xf_fmt[16];  /* attribute formats seen: type | size<<4 | slot<<8 */
@@ -3144,6 +3144,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     }
     if (backend_draws()) {                     /* a back end rasterises */
         Nv2aVertex *o = backend_slot();
+        s_gpu.xf_backend++;
         if (o) {
             backend_from_xf(va, &o[0]);
             backend_from_xf(vb, &o[1]);
@@ -4939,6 +4940,13 @@ static uint32_t flip_clock(uint64_t now_ns, int *ok)
     return c;
 }
 
+/* Whether a flip is held right now, for a thread other than the ack loop's
+ * (the flush acknowledger): a read of one int, stale by at most a pass. */
+int nv2a_pb_exec_flip_is_held(void)
+{
+    return s_flip_hold.held;
+}
+
 /* Once per pass of the ack loop: 1 while a flip is held. */
 int nv2a_pb_exec_flip_poll(void)
 {
@@ -5995,10 +6003,15 @@ void nv2a_pb_exec_report(void)
                     s_raw.mismatch_batches, s_raw.mismatch_verts, s_raw.cpu_aborts,
                     s_raw.eye_plane);
     }
-    fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
+    /* Triangles the CPU transformed: zero-area (or NaN) ones are dropped --
+     * they cover no pixel on any rasteriser -- the rest go to the back end
+     * when there is one, else to the software rasteriser (drawn, off-surface,
+     * pixels: the software rasteriser's own counts). */
+    fprintf(stderr, "[GPU]   CPU-transformed triangles: %u zero-area/NaN (no pixels; dropped),"
+                    " %u to the back end; software rasteriser: %u off-surface,"
                     " %u drawn; pixels %llu written, %llu depth-failed;"
                     " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",
-            s_gpu.xf_degenerate, s_gpu.xf_offscreen, s_gpu.xf_drawn,
+            s_gpu.xf_degenerate, s_gpu.xf_backend, s_gpu.xf_offscreen, s_gpu.xf_drawn,
             (unsigned long long)s_gpu.xf_pixels,
             (unsigned long long)s_gpu.xf_depth_fail,
             s_gpu.xf_min[0], s_gpu.xf_max[0], s_gpu.xf_min[1], s_gpu.xf_max[1],

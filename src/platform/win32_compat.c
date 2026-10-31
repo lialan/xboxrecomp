@@ -16,6 +16,8 @@
 #define __STDC_WANT_LIB_EXT1__ 1
 
 #include "win32_compat.h"
+#include "thread_acct.h"
+#include "host_time.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -226,13 +228,16 @@ BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWOR
     if (!cs->LockSemaphore) InitializeCriticalSection(cs);
     pthread_cond_t  *c = (pthread_cond_t  *)cv->Ptr;
     pthread_mutex_t *m = (pthread_mutex_t *)cs->LockSemaphore;
+    XBOX_ACCT_BEGIN();
     if (ms == INFINITE) {
         pthread_cond_wait(c, m);
+        XBOX_ACCT_END(XBOX_ACCT_OBJECT);
         return TRUE;
     }
     struct timespec ts;
     deadline_from_ms(ms, &ts);
     int rc = pthread_cond_timedwait(c, m, &ts);
+    XBOX_ACCT_END(XBOX_ACCT_OBJECT);
     if (rc == ETIMEDOUT) { SetLastError(WAIT_TIMEOUT); return FALSE; }
     return TRUE;
 }
@@ -513,8 +518,10 @@ static DWORD wait_single(w32_object *o, DWORD ms)
             until = o->waitable_due_time;
             bounded = 1;
         }
+        XBOX_ACCT_BEGIN();
         int rc = bounded ? pthread_cond_timedwait(&o->cond, &o->lock, &until)
                          : pthread_cond_wait(&o->cond, &o->lock);
+        XBOX_ACCT_END(XBOX_ACCT_OBJECT);
         if (rc == ETIMEDOUT && timed && !timespec_before(&until, &ts)) {
             result = WAIT_TIMEOUT; break;
         }
@@ -587,7 +594,11 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                 (now.tv_sec == ts.tv_sec && now.tv_nsec >= ts.tv_nsec))
                 return WAIT_TIMEOUT;
         }
-        usleep(1000);
+        {
+            XBOX_ACCT_BEGIN();
+            usleep(1000);
+            XBOX_ACCT_END(XBOX_ACCT_OBJECT);
+        }
     }
 }
 
@@ -980,7 +991,12 @@ BOOL GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
     return TRUE;
 }
 
-VOID SwitchToThread(void) { sched_yield(); }
+VOID SwitchToThread(void)
+{
+    XBOX_ACCT_BEGIN();
+    sched_yield();
+    XBOX_ACCT_END(XBOX_ACCT_SLEEP);
+}
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
@@ -1004,9 +1020,11 @@ DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 
 VOID Sleep(DWORD ms)
 {
-    if (ms == 0) { sched_yield(); return; }
+    XBOX_ACCT_BEGIN();
+    if (ms == 0) { sched_yield(); XBOX_ACCT_END(XBOX_ACCT_SLEEP); return; }
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
+    XBOX_ACCT_END(XBOX_ACCT_SLEEP);
 }
 
 DWORD SleepEx(DWORD ms, BOOL alertable)

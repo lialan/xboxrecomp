@@ -30,7 +30,7 @@ target_include_directories(recomp_exit_hook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # host_time: the host's monotonic clock and the timer thread's sleep
 # (host_time.h). A real library on every host, carried by platform to every
 # library of the runtime.
-add_library(host_time STATIC host_time.c)
+add_library(host_time STATIC host_time.c thread_acct.c)   # thread_acct: RECOMP_THREAD_LOG
 target_include_directories(host_time PUBLIC
     ${XBOXRECOMP_SRC_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}

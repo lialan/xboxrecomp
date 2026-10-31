@@ -25,6 +25,10 @@
  *   different parameter layouts (pointer vs value), so each needs its own bridge.
  */
 
+#include "thread_acct.h"
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "kernel_missing.h"
@@ -720,6 +724,21 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * for every thread, which is how two of them ended up inside _lock() each
      * holding the lock the other wanted. */
     g_is_spawned_thread = 1;
+    if (xbox_ThreadAcctInit() > 0) {        /* RECOMP_THREAD_LOG: its name */
+        char nm[32];
+        static volatile LONG seq;
+        const char *sym = NULL;
+#if !defined(_WIN32)
+        Dl_info di;
+        if (dladdr((void *)(uintptr_t)fn, &di) && di.dli_sname)
+            sym = di.dli_sname;
+#endif
+        if (sym)
+            snprintf(nm, sizeof nm, "guest %s", sym);
+        else
+            snprintf(nm, sizeof nm, "guest #%ld", (long)InterlockedIncrement(&seq));
+        xbox_ThreadAcctName(nm);
+    }
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     g_thread_obj_va = s->obj_va;
