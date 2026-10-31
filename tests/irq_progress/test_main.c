@@ -75,11 +75,12 @@ extern ptrdiff_t g_xbox_mem_offset;
 /* "At once": generous for a loaded CI host or Wine; the ages are printed. */
 #define PROMPT_NS  (50 * MS)
 
-enum { K_QPC, K_RAISE, K_LOWER, K_COUNT };
+enum { K_QPC, K_RAISE, K_LOWER, K_CURRENT, K_COUNT };
 static const uint32_t k_ordinals[K_COUNT] = {
     126,    /* KeQueryPerformanceCounter: a call with no effect here */
     160,    /* KfRaiseIrql, fastcall */
     161,    /* KfLowerIrql, fastcall */
+    103,    /* KeGetCurrentIrql */
 };
 
 static int failures;
@@ -502,6 +503,21 @@ int main(void)
     check(xbox_GuestCpuOn() && xbox_GuestCpuHeld(),
           "RECOMP_GUEST_LOCK=1: the one guest thread holds the guest CPU");
     xbox_GuestCpuStatsGet(&gs, 1);
+    check(kcall(K_CURRENT, 0) == 0, "KeGetCurrentIrql reports PASSIVE through the guest thunk");
+    {
+        uint32_t old = kcall(K_RAISE, DISPATCH_LEVEL);
+        check(kcall(K_CURRENT, 0) == DISPATCH_LEVEL,
+              "KeGetCurrentIrql reports DISPATCH through the guest thunk");
+        kcall(K_RAISE, 26);
+        check(kcall(K_CURRENT, 0) == 26,
+              "KeGetCurrentIrql reports nested device level through the guest thunk");
+        kcall(K_LOWER, DISPATCH_LEVEL);
+        check(kcall(K_CURRENT, 0) == DISPATCH_LEVEL,
+              "KeGetCurrentIrql follows the nested lower");
+        kcall(K_LOWER, old);
+        check(kcall(K_CURRENT, 0) == old,
+              "KeGetCurrentIrql follows the lower to PASSIVE");
+    }
     passive_spin();
     dispatch_spin_calls();
     dispatch_spin_back_edges();
