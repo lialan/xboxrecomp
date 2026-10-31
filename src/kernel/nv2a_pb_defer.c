@@ -27,8 +27,14 @@
  *     and for the latch and the reports the executor drains the ring first
  *     (nv2a_defer_sync). What the title sees of the GPU's progress is the
  *     submission thread's, as it would be a GPU's.
- * A flip, and a draw_raw with a check buffer, are replayed synchronously:
- * the executor presents the flip's resolve right after, and reads the check.
+ * A draw_raw with a check buffer is replayed synchronously (the executor
+ * reads the check), and so is a flip -- the executor presents the flip's
+ * resolve right after -- unless the back end says its flip writes nothing
+ * the present reads (Nv2aBackend.flip_async; the Quest's GL back end, which
+ * shows the frame itself) and no frame dump is on: then the decode of the
+ * next frame overlaps the flip's submission. A flip record carries the
+ * presented surface, which the back end asks for during the flip
+ * (nv2a_backend_presented_override).
  *
  * A draw_raw is answered "taken" at once; one the real back end then
  * declines is counted ([DEFER] declined) rather than redone on the CPU,
@@ -105,6 +111,11 @@ typedef struct {
     uint32_t value;
 } WriteRec;
 
+typedef struct {
+    RecHdr h;
+    uint32_t presented;           /* nv2a_backend_presented_va() at the flip */
+} FlipRec;
+
 static const Nv2aBackend *s_real;
 static Nv2aBackend s_proxy;
 static int s_mode = -1;           /* 0 off, 1 threaded, 2 synchronous */
@@ -116,7 +127,7 @@ static long s_gl_us;             /* RECOMP_EXEC_GL_DELAY_US */
 
 static struct {
     uint64_t recs, bytes, drains, drain_ns, busy_ns, declined, max_depth;
-    uint64_t sync_n[NV2A_SYNC_KINDS], sync_ns[NV2A_SYNC_KINDS], prog, writes;
+    uint64_t sync_n[NV2A_SYNC_KINDS], sync_ns[NV2A_SYNC_KINDS], prog, writes, async_flips;
 } s_st;
 
 #ifdef _WIN32
@@ -223,8 +234,11 @@ static void replay(RecHdr *h)
         break;
     }
     case REC_FLIP:
-        if (s_real->flip)
+        if (s_real->flip) {
+            nv2a_backend_presented_override(1, ((FlipRec *)h)->presented);
             s_real->flip();
+            nv2a_backend_presented_override(0, 0);
+        }
         break;
     default:
         break;
@@ -553,12 +567,19 @@ int nv2a_defer_write(volatile uint32_t *at, uint32_t value)
 
 static void p_flip(void)
 {
-    uint32_t size = align(sizeof(RecHdr));
-    RecHdr *h = (RecHdr *)reserve(size);
-    h->type = REC_FLIP;
-    h->size = size;
-    publish(h);
-    nv2a_defer_sync(NV2A_SYNC_FLIP);     /* the present reads its resolve next */
+    static int dump = -1;
+    uint32_t size = align(sizeof(FlipRec));
+    FlipRec *r = (FlipRec *)reserve(size);
+    r->h.type = REC_FLIP;
+    r->h.size = size;
+    r->presented = nv2a_backend_presented_va();
+    publish(&r->h);
+    if (dump < 0)
+        dump = getenv("RECOMP_FB_DUMP_FLIPS") != NULL || getenv("RECOMP_PB_FLIP_SYNC") != NULL;
+    if (dump || !s_real->flip_async || !s_real->flip_async())
+        nv2a_defer_sync(NV2A_SYNC_FLIP); /* the present reads its resolve next */
+    else
+        s_st.async_flips++;
 
     if (getenv("RECOMP_PROF")) {         /* once a second, with the executor's */
         static uint64_t last;
@@ -581,8 +602,9 @@ static void p_flip(void)
                                       s_st.sync_ns[k] / 1e6);
                 line[n] = 0;
                 fprintf(stderr, "[DEFER]   drains:%s; %llu program draws, %llu semaphore"
-                        " writes queued\n", line, (unsigned long long)s_st.prog,
-                        (unsigned long long)s_st.writes);
+                        " writes queued, %llu flips not waited for\n", line,
+                        (unsigned long long)s_st.prog, (unsigned long long)s_st.writes,
+                        (unsigned long long)s_st.async_flips);
             }
             memset(&s_st, 0, sizeof s_st);
             last = now;

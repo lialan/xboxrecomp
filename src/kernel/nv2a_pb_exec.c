@@ -830,9 +830,20 @@ static int backend_draws(void)
     return s_backend && s_backend->draw;
 }
 
+static int s_presented_ov;
+static uint32_t s_presented_ov_va;
+
+void nv2a_backend_presented_override(int on, uint32_t va)
+{
+    s_presented_ov_va = va;
+    s_presented_ov = on;
+}
+
 uint32_t nv2a_backend_presented_va(void)
 {
     uint32_t off = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
+    if (s_presented_ov)
+        return s_presented_ov_va;
     return off ? dma_resolve(off) : 0;      /* as Nv2aSurface.color_va */
 }
 

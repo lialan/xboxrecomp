@@ -255,6 +255,12 @@ typedef struct {
      * decline, and the executor then transforms the batch itself. A back end
      * initialised as { clear, draw, flip } leaves it NULL. */
     int  (*draw_raw)(const Nv2aSurface *s, const Nv2aBatch *b);
+    /* Optional: 1 when this flip writes nothing into guest memory that the
+     * executor's present or frame dump reads after it (the back end shows
+     * the frame itself). The decode thread (RECOMP_PB_DECODE_THREAD) then
+     * goes on with the next frame while the submission thread does the flip,
+     * instead of waiting for it. NULL: it waits. */
+    int  (*flip_async)(void);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
@@ -262,8 +268,13 @@ typedef struct {
 void nv2a_backend_register(const Nv2aBackend *backend);
 
 /* From flip(): the surface the title just finished, which the present shows
- * (0 if unknown). A back end need only resolve this one into guest memory. */
+ * (0 if unknown). A back end need only resolve this one into guest memory.
+ * (A flip replayed on the submission thread gets the one recorded with it.) */
 uint32_t nv2a_backend_presented_va(void);
+
+/* The submission thread, around a flip it replays: what
+ * nv2a_backend_presented_va answers meanwhile (on 0, off again). */
+void nv2a_backend_presented_override(int on, uint32_t va);
 
 /* Decode a whole texture to 0xAARRGGBB, row-major, width*height entries.
  * Handles every format the executor can sample (swizzled, linear, DXT).
