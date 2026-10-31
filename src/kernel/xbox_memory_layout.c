@@ -21,6 +21,8 @@
 #include "guest_vmem.h"
 #include "kernel_missing.h"
 #include "nv2a_flip_hold.h"
+#include "nv2a_pb_defer.h"   /* nv2a_defer_sync, nv2a_defer_write */
+int nv2a_pb_dma_walk(void);   /* nv2a_pb_scan.c */
 #include "host_time.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -1658,12 +1660,20 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         nv2a_pb_scan_report();
                     }
                 }
-                /* Consumed, now that it has actually been executed. */
+                /* Consumed, now that it has actually been executed (and,
+                 * under RECOMP_PB_DECODE_THREAD, submitted). */
                 {
                     volatile uint32_t *get =
                         (volatile uint32_t *)((char *)regs
                                               + NV2A_USER_DMA_GET);
-                    *get = put;
+                    /* Under RECOMP_PB_DECODE_THREAD, GET moves once the
+                     * submission thread has submitted what came before it
+                     * (queued behind it), as a GPU's would. The DMA walk
+                     * reads GET back to spot a ring reset, so it waits. */
+                    if (nv2a_pb_dma_walk() || !nv2a_defer_write(get, put)) {
+                        nv2a_defer_sync(NV2A_SYNC_GET);
+                        *get = put;
+                    }
                     get_written = put;
                 }
                 last_put = put; last_put_ms = now_ms;
