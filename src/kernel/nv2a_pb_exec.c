@@ -2360,7 +2360,12 @@ static void backend_texture(int st, Nv2aTexture *tex)
     tex->color  = s_gpu.texs[st].color;
     tex->addr_u = s_gpu.texs[st].addr_u;
     tex->addr_v = s_gpu.texs[st].addr_v;
-    tex->levels = s_gpu.texs[st].pitch ? 1 : s_gpu.texs[st].levels;
+    /* A linear image has one level. The pitch says nothing about that:
+     * CONTROL1's pitch is only meaningful for linear formats, and titles
+     * leave a stale one set for the swizzled and compressed textures after
+     * it -- which hid every mip chain VC3 has (its DXT textures all carry a
+     * pitch) and gave a cube map a stale pitch the wrong face stride. */
+    tex->levels = tex_size_from_format(s_gpu.texs[st].color) ? s_gpu.texs[st].levels : 1;
     tex->filter = s_gpu.texs[st].filter;
     tex->cube   = s_gpu.texs[st].cube;
 }
