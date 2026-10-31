@@ -101,7 +101,14 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va);
  *
  * Set once during memory initialization, then read-only.
  */
+/* Hidden: the runtime is linked into the same image as the generated code,
+ * so it is reached directly rather than through the GOT -- one load fewer
+ * for every guest memory access that reloads it after a call. */
+#if defined(__GNUC__) || defined(__clang__)
+extern __attribute__((visibility("hidden"))) ptrdiff_t g_xbox_mem_offset;
+#else
 extern ptrdiff_t g_xbox_mem_offset;
+#endif
 
 /* Bounds of the title's executable sections, filled in by
  * xbox_MemoryLayoutInit from the XBE's own section table. Zero means "not

@@ -1686,6 +1686,9 @@ static void xbox_Nv2aAckStart(void)
 static void *g_kernel_memory = NULL;
 
 /* Global offset accessible by recompiled code (via recomp_types.h) */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
 ptrdiff_t g_xbox_mem_offset = 0;
 
 /* Bounds of the title's executable sections, from its own XBE section table.
