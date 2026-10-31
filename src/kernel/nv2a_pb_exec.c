@@ -315,6 +315,7 @@ static struct {
     float    aa_sx, aa_sy;              /* anti-aliasing scale of the surface */
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
+    uint64_t regrun_words;           /* taken by nv2a_pb_exec_reg_run */
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
@@ -4422,8 +4423,15 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
-        fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
+    /* (every 200 draws was 300 lines a second in a 3D scene, 2% of the
+     * executor; RECOMP_PB_EXEC_VERBOSE keeps that) */
+    {
+        static int every = -1;
+        if (every < 0)
+            every = getenv("RECOMP_PB_EXEC_VERBOSE") ? 200 : 100000;
+        if ((s_gpu.draws % (uint32_t)every) == 0)
+            fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
+    }
     s_gpu.verts += s_gpu.idx_count;
 
     /* How many batches carry coordinates at all, and what range they span.
@@ -5090,16 +5098,25 @@ int nv2a_pb_exec_data_run(uint32_t subch, uint32_t method, const uint32_t *p, ui
     if (subch != 0 || !s_gpu.prim || !count || s_ftrace == 2)
         return 0;
     switch (method) {
-    case NV097_ARRAY_ELEMENT16:
-        for (i = 0; i < count && s_gpu.idx_count + 2 <= NV_MAX_INDICES; i++) {
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(p[i] & 0xFFFF);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(p[i] >> 16);
+    case NV097_ARRAY_ELEMENT16: {
+        /* the room left, once: a tight loop the compiler can widen */
+        uint32_t room = s_gpu.idx_count + 2 <= NV_MAX_INDICES
+                      ? (NV_MAX_INDICES - s_gpu.idx_count) / 2 : 0;
+        uint32_t n = count < room ? count : room, *d = &s_gpu.idx[s_gpu.idx_count];
+        for (i = 0; i < n; i++) {
+            d[2 * i] = p[i] & 0xFFFF;
+            d[2 * i + 1] = p[i] >> 16;
         }
+        s_gpu.idx_count += 2 * n;
         break;
-    case 0x1808:                            /* ARRAY_ELEMENT32 */
-        for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
-            s_gpu.idx[s_gpu.idx_count++] = p[i];
+    }
+    case 0x1808: {                          /* ARRAY_ELEMENT32 */
+        uint32_t room = NV_MAX_INDICES - s_gpu.idx_count;
+        uint32_t n = count < room ? count : room;
+        memcpy(&s_gpu.idx[s_gpu.idx_count], p, n * sizeof *p);
+        s_gpu.idx_count += n;
         break;
+    }
     case NV097_INLINE_ARRAY:
         for (i = 0; i < count && s_gpu.inline_count < NV_MAX_INLINE; i++)
             s_gpu.inline_buf[s_gpu.inline_count++] = p[i];
@@ -5138,6 +5155,38 @@ int nv2a_pb_exec_data_run(uint32_t subch, uint32_t method, const uint32_t *p, ui
         }
     }
     return 1;
+}
+
+/* An incrementing run of subchannel-0 words from `method`: as many leading
+ * words as name registers nv2a_pb_exec_method only mirrors and tallies
+ * (learned: each has been through that way once) are taken here, without
+ * its per-word checks and dispatch -- VC3 sends every matrix (16 words)
+ * and light that way, a draw's worth at a time. Returns how many it took;
+ * the walker sends the rest one by one. RECOMP_PB_REGRUN=0: none. */
+static uint8_t s_mirror_only[0x2000 / 4];
+
+uint32_t nv2a_pb_exec_reg_run(uint32_t subch, uint32_t method, const uint32_t *p,
+                              uint32_t count)
+{
+    static int on = -1;
+    uint32_t i;
+
+    if (on < 0) {
+        on = !(getenv("RECOMP_PB_REGRUN") && getenv("RECOMP_PB_REGRUN")[0] == '0');
+        if (!on)
+            fprintf(stderr, "[PB] register runs: word by word (RECOMP_PB_REGRUN=0)\n");
+    }
+    if (!on || subch != 0 || s_ftrace == 2)
+        return 0;
+    for (i = 0; i < count && method + 4 * i < 0x2000; i++) {
+        uint32_t m = method + 4 * i;
+        if (!s_mirror_only[m / 4])
+            break;
+        s_reg[m / 4] = p[i];
+        note_unhandled(m, p[i]);
+    }
+    s_gpu.regrun_words += i;
+    return i;
 }
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
@@ -5674,8 +5723,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 note_unhandled(method, param);
             break;
         default:                                /* PK_OTHER */
-            if (!imm_vertex_method(method, param))
+            if (!imm_vertex_method(method, param)) {
                 note_unhandled(method, param);
+                /* Nothing but the register mirror and the tally: a run of
+                 * such words can take the short way (nv2a_pb_exec_reg_run).
+                 * The way a subchannel-0 method goes depends on the method
+                 * alone, bar the semaphore release (a back end may name the
+                 * semaphore later). */
+                if (method != 0x1D70)
+                    s_mirror_only[(method & 0x1FFCu) / 4] = 1;
+            }
             break;
         }
         break;
@@ -5871,10 +5928,12 @@ void nv2a_pb_exec_report(void)
     }
     flip_hold_report();
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
-                    " clears %u | %u unhandled methods (%d distinct)\n",
+                    " clears %u | %u unhandled methods (%d distinct), %llu words as"
+                    " register runs\n",
             s_gpu.color_offset, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
             s_gpu.clip_x, s_gpu.clip_y, s_gpu.clears,
-            s_gpu.unhandled_total, s_unhandled_count);
+            s_gpu.unhandled_total, s_unhandled_count,
+            (unsigned long long)s_gpu.regrun_words);
     fprintf(stderr, "[GPU] draws %u (%u with coordinates), %u indices;"
                     " x %.1f..%.1f  y %.1f..%.1f\n",
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
