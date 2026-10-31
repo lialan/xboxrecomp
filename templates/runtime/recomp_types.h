@@ -60,6 +60,9 @@
  * CMakeLists) -- MSVC's C4013 was emitted and discarded. Same failure as the
  * missing stdlib.h in kernel_bridge.c, in a hotter path. */
 #include <math.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
 #include <xmmintrin.h>
 #include <emmintrin.h>
@@ -1842,10 +1845,18 @@ static inline RecompMmx MMX_PACKSSWB(RecompMmx a, RecompMmx b) {
     return r;
 }
 static inline RecompMmx MMX_PACKUSWB(RecompMmx a, RecompMmx b) {
+#if defined(__aarch64__)
+    /* Signed words saturate to unsigned bytes, preserving lane order.
+     * The portable clamp loop otherwise widens to 32-bit lanes on A64. */
+    RecompMmx r;
+    vst1_u8(r.ub, vqmovun_s16(vcombine_s16(vld1_s16(a.w), vld1_s16(b.w))));
+    return r;
+#else
     RecompMmx r; int i;
     for (i = 0; i < 4; i++) r.ub[i]     = recomp_sat_u8(a.w[i]);
     for (i = 0; i < 4; i++) r.ub[i + 4] = recomp_sat_u8(b.w[i]);
     return r;
+#endif
 }
 static inline RecompMmx MMX_PACKSSDW(RecompMmx a, RecompMmx b) {
     RecompMmx r; int i;
