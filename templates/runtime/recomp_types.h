@@ -713,6 +713,41 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
 
 /** Read/write N bytes at a flat Xbox memory address. */
+/* x86's memory is ordered (TSO): a store is never seen before an earlier
+ * store, nor a load satisfied before an earlier load, by another processor.
+ * Titles lean on it without a barrier or lock in sight -- a producer fills
+ * a slot and bumps an index, the consumer reads the index and then the slot
+ * -- and on the console nothing else was possible. ARM keeps no such order
+ * between cores: plain loads and stores, which the volatile accesses below
+ * compile to, can be seen out of order by another core, and a reader takes
+ * the new index with the old slot. VC3's attract mode sat on its title logo
+ * in most runs under load that way, its sound engine and game threads
+ * handing work through memory.
+ *
+ * On arm64 the accesses are atomic instead: a load is a load-acquire (LDAR)
+ * and a store a store-release (STLR), which keeps every order x86 keeps and
+ * a little more. Lifted code makes only plain loads and stores of these
+ * (never a compound assignment), so nothing becomes a read-modify-write.
+ * LDAR/STLR fault where LDR/STR did not -- on a misaligned address (one
+ * that crosses 16 bytes, with FEAT_LSE2) -- and on a trapped device page;
+ * the POSIX fault path does both (mmio_decode_a64.h). x86-64 hosts are TSO
+ * already and keep the plain accesses. -DRECOMP_GUEST_MEM_ORDERED=0 turns
+ * it off. */
+#ifndef RECOMP_GUEST_MEM_ORDERED
+#  if defined(__aarch64__) && !defined(_MSC_VER)
+#    define RECOMP_GUEST_MEM_ORDERED 1
+#  else
+#    define RECOMP_GUEST_MEM_ORDERED 0
+#  endif
+#endif
+#if RECOMP_GUEST_MEM_ORDERED
+#define MEM8(addr)   (*(_Atomic volatile uint8_t  *)XBOX_PTR(addr))
+#define MEM16(addr)  (*(_Atomic volatile uint16_t *)XBOX_PTR(addr))
+#define MEM32(addr)  (*(_Atomic volatile uint32_t *)XBOX_PTR(addr))
+#define SMEM8(addr)  (*(_Atomic volatile int8_t   *)XBOX_PTR(addr))
+#define SMEM16(addr) (*(_Atomic volatile int16_t  *)XBOX_PTR(addr))
+#define SMEM32(addr) (*(_Atomic volatile int32_t  *)XBOX_PTR(addr))
+#else
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
@@ -721,6 +756,7 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
 #define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))
 #define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
+#endif
 #define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
 
 /** Float/double memory access. */

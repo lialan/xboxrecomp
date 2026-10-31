@@ -849,7 +849,7 @@ int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
     uint32_t va;
 
     if (!mmio_fault_va(fault, &va))
-        return 0;
+        return mmio_a64_align_fixup((ucontext_t *)ucv, fault);
     /* The APU decodes the direction from the opcode; is_write is advisory. */
     if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
         return g_apu_state
@@ -858,6 +858,7 @@ int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
         return 1;
     if (xbox_OhciOwnsAddress(va))
         return xbox_OhciHandleMmio(ucv, va);
+    return mmio_a64_align_fixup((ucontext_t *)ucv, fault);
 #else
     (void)ucv; (void)fault;
 #endif

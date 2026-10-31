@@ -204,6 +204,58 @@ int main(void)
         CHECK_U64("ldxr refused", unknown - before, 1);
     }
 
+    /* The ordered forms lifted code uses when guest memory is x86-ordered
+     * (an _Atomic MEM32()): LDAR, STLR, B/H/W, and a W load clearing 63:32. */
+    {
+        int before = unknown;
+        uint64_t v = ~0ULL;
+        __asm__ volatile("stlr %w1, [%0]" : : "r"(win + 0x70), "r"(0xCAFEF00Du) : "memory");
+        CHECK_U64("stlr w lands in model", *(uint32_t *)(model + 0x70), 0xCAFEF00Du);
+        __asm__ volatile("ldar %w0, [%1]" : "+r"(v) : "r"(win + 0x70) : "memory");
+        CHECK_U64("ldar w clears 63:32", v, 0xCAFEF00Du);
+        __asm__ volatile("stlrh %w1, [%0]" : : "r"(win + 0x74), "r"(0xBEEFu) : "memory");
+        __asm__ volatile("ldarh %w0, [%1]" : "=r"(v) : "r"(win + 0x74) : "memory");
+        CHECK_U64("stlrh/ldarh", v, 0xBEEF);
+        __asm__ volatile("stlrb %w1, [%0]" : : "r"(win + 0x76), "r"(0x5Au) : "memory");
+        __asm__ volatile("ldarb %w0, [%1]" : "=r"(v) : "r"(win + 0x76) : "memory");
+        CHECK_U64("stlrb/ldarb", v, 0x5A);
+        CHECK_U64("ordered forms all handled", unknown - before, 0);
+        CHECK_U64("ldapr w decodes", decode_only(0xB8BFC000u | (1u << 5)), 1);
+    }
+
+    /* A misaligned ordered access to ordinary memory: done as a plain
+     * access, stepped over (mmio_a64_align_fixup). Exercised through the
+     * decoder alone, since whether the CPU faults depends on FEAT_LSE2 and
+     * on whether the access crosses 16 bytes. */
+    {
+        static uint8_t ram[64];
+        ucontext_t uc;
+        uint32_t insn = 0x88DFFC00u | (1u << 5) | 2u;   /* ldar w2, [x1] */
+#if defined(__APPLE__)
+        static struct __darwin_mcontext64 mc;
+        memset(&mc, 0, sizeof mc);
+#endif
+        memset(&uc, 0, sizeof uc);
+#if defined(__APPLE__)
+        uc.uc_mcontext = &mc;
+#endif
+        memcpy(ram + 15, "\x11\x22\x33\x44", 4);
+        A64_CTX_PC(&uc) = (uintptr_t)&insn;
+        A64_CTX_X(&uc, 1) = (uintptr_t)(ram + 15);
+        CHECK_U64("align fixup ldar handled", mmio_a64_align_fixup(&uc, (uintptr_t)(ram + 15)), 1);
+        CHECK_U64("align fixup ldar value", A64_CTX_X(&uc, 2), 0x44332211u);
+        CHECK_U64("align fixup steps", A64_CTX_PC(&uc), (uintptr_t)&insn + 4);
+        insn = 0x889FFC00u | (1u << 5) | 3u;            /* stlr w3, [x1] */
+        A64_CTX_PC(&uc) = (uintptr_t)&insn;
+        A64_CTX_X(&uc, 3) = 0xA1B2C3D4u;
+        CHECK_U64("align fixup stlr handled", mmio_a64_align_fixup(&uc, (uintptr_t)(ram + 15)), 1);
+        CHECK_U64("align fixup stlr value", (uint32_t)(ram[15] | ram[16] << 8 | ram[17] << 16
+                                                       | (uint32_t)ram[18] << 24), 0xA1B2C3D4u);
+        A64_CTX_PC(&uc) = (uintptr_t)&insn;
+        A64_CTX_X(&uc, 1) = (uintptr_t)(ram + 16);       /* aligned: a real fault */
+        CHECK_U64("align fixup refuses an aligned access", mmio_a64_align_fixup(&uc, (uintptr_t)(ram + 16)), 0);
+    }
+
     printf("%d traps, %d unknown, %d failures\n", traps, unknown, failures);
     return failures ? 1 : 0;
 }

@@ -93,6 +93,27 @@ static inline uint64_t *mmio_a64_xreg(ucontext_t *uc, int r)
     return (uint64_t *)&A64_CTX_SP(uc);
 }
 
+/* The ordered accesses lifted code makes when guest memory is x86-ordered
+ * (recomp_types.h, RECOMP_MEM_ORDERED): LDAR, LDAPR (load-acquire) and STLR
+ * (store-release) of B/H/W/X, base register only. Returns 1 for a load, 0
+ * for a store, -1 for anything else; *bytes, *rt, *rn are filled in. */
+static inline int mmio_a64_ordered(uint32_t insn, int *bytes, int *rt, int *rn)
+{
+    int kind;
+    if ((insn & 0x3FFFFC00u) == 0x08DFFC00u)        /* LDAR  */
+        kind = 1;
+    else if ((insn & 0x3FFFFC00u) == 0x38BFC000u)   /* LDAPR */
+        kind = 1;
+    else if ((insn & 0x3FFFFC00u) == 0x089FFC00u)   /* STLR  */
+        kind = 0;
+    else
+        return -1;
+    *bytes = 1 << ((insn >> 30) & 3);
+    *rt = insn & 31;
+    *rn = (insn >> 5) & 31;
+    return kind;
+}
+
 /* 1 if the instruction at pc was serviced against (rd, wr) and pc advanced.
  * off is the device offset of the faulting data address (from si_addr). */
 static inline int mmio_emulate_a64(ucontext_t *uc, uint32_t off, void *dev,
@@ -104,6 +125,24 @@ static inline int mmio_emulate_a64(ucontext_t *uc, uint32_t off, void *dev,
 
     if (!rd || !wr)
         return 0;
+
+    {   /* load-acquire / store-release: no offset, no writeback */
+        int bytes, rt, rn, kind = mmio_a64_ordered(insn, &bytes, &rt, &rn);
+        (void)rn;
+        if (kind == 1) {
+            uint64_t v = rd(dev, off, bytes);
+            if (bytes < 8)
+                v &= (1ULL << (bytes * 8)) - 1;
+            if (rt != 31) *mmio_a64_xreg(uc, rt) = v;
+            A64_CTX_PC(uc) += 4;
+            return 1;
+        }
+        if (kind == 0) {
+            wr(dev, off, rt == 31 ? 0 : *mmio_a64_xreg(uc, rt), bytes);
+            A64_CTX_PC(uc) += 4;
+            return 1;
+        }
+    }
     if (V && !A64_CTX_V_OK(uc))                  /* no FP/SIMD record to edit */
         return 0;
 
@@ -245,6 +284,37 @@ static inline int mmio_emulate_a64(ucontext_t *uc, uint32_t off, void *dev,
         return 1;
     }
     return 0;
+}
+
+/* An alignment fault on an ordered access to ordinary memory: LDAR, LDAPR
+ * and STLR fault on an address that is not naturally aligned (one that
+ * crosses a 16-byte boundary, with FEAT_LSE2), where the plain LDR/STR that
+ * x86 code's unaligned accesses used to lift to did not. Done here as a
+ * plain access between full barriers -- what the x86 instruction was,
+ * ordered against everything around it -- and stepped over. 1 if handled. */
+static inline int mmio_a64_align_fixup(ucontext_t *uc, uintptr_t addr)
+{
+    uint32_t insn = *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc);
+    int bytes, rt, rn, kind = mmio_a64_ordered(insn, &bytes, &rt, &rn);
+    uint64_t v = 0;
+
+    /* Only a misaligned access: an aligned one that faulted is a real fault
+     * (an unmapped page), and doing it again here would fault in the
+     * handler. */
+    if (kind < 0 || *mmio_a64_xreg(uc, rn) != (uint64_t)addr
+            || !(addr & (uintptr_t)(bytes - 1)))
+        return 0;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (kind == 1) {
+        __builtin_memcpy(&v, (const void *)addr, (unsigned long)bytes);   /* little-endian */
+        if (rt != 31) *mmio_a64_xreg(uc, rt) = v;
+    } else {
+        v = rt == 31 ? 0 : *mmio_a64_xreg(uc, rt);
+        __builtin_memcpy((void *)addr, &v, (unsigned long)bytes);
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    A64_CTX_PC(uc) += 4;
+    return 1;
 }
 
 #endif /* __aarch64__ && !_WIN32 */
