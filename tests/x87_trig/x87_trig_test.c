@@ -17,7 +17,7 @@
 #include <string.h>
 #include <time.h>
 
-RECOMP_TLS uint16_t g_fp_cc;
+RECOMP_TLS struct RecompRegs g_regs;   /* g_fp_cc lives in it */
 
 /* The value step of each op. -DX87_TRIG_PLAIN_LIBM puts back libm's. */
 #ifdef X87_TRIG_PLAIN_LIBM

@@ -7,7 +7,7 @@
 #include <string.h>
 typedef void (*guest_fn)(void);
 extern guest_fn recomp_lookup_kernel(uint32_t);
-extern RECOMP_TLS uint32_t g_eax, g_esp;
+/* the guest registers: g_regs (xbox_memory_layout.h) */
 extern ptrdiff_t g_xbox_mem_offset;
 void *recomp_lookup(ULONG a) { (void)a; abort(); }
 void *recomp_lookup_manual(ULONG a) { (void)a; abort(); }

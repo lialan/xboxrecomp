@@ -29,7 +29,7 @@
 typedef void (*recomp_func_t)(void);
 
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
-extern RECOMP_TLS uint32_t g_eax, g_esp;
+/* the guest registers: g_regs (xbox_memory_layout.h) */
 extern ptrdiff_t g_xbox_mem_offset;
 
 #define APC_VA       0x00005000u   /* "guest" address of the APC routine */

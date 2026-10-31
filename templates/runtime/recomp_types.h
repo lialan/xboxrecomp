@@ -383,7 +383,11 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
  * So a plain (float) cast is right only inside float's range -- outside it,
  * it would turn a large intermediate into inf (and inf*0 into NaN) or flush a
  * tiny one to 0, where the x87 carries on. Those go the long way. */
-static inline double recomp_fp_round24(double x) {
+/* The reference: what recomp_fp_round24 computes, the long way. Kept out of
+ * line for the two cases the bit path leaves to it -- a double subnormal
+ * and a NaN/infinity -- and as the oracle tests/fp_round24 checks the bit
+ * path against. */
+static inline double recomp_fp_round24_ref(double x) {
     double ax = fabs(x);
     int e;
     if ((ax <= 3.4028234663852886e38 && ax >= 1.1754943508222875e-38) || ax == 0.0
@@ -391,6 +395,34 @@ static inline double recomp_fp_round24(double x) {
         return (double)(float)x;
     x = frexp(x, &e);                      /* |x| in [0.5, 1): float-exact range */
     return ldexp((double)(float)x, e);
+}
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline, cold))
+#endif
+static double recomp_fp_round24_slow(double x) { return recomp_fp_round24_ref(x); }
+
+/* The same, on the bits: a normal double keeps its exponent and has its 52
+ * fraction bits rounded to float's 23, to nearest even -- add half an ulp
+ * of float (less one, plus the kept lsb) and clear the 29 dropped bits; a
+ * carry out of the fraction raises the exponent, to infinity past the top,
+ * as ldexp would. That is (double)(float)x inside float's range and
+ * frexp/round/ldexp outside it, without either libm call: it is inlined at
+ * every x87 result (15,900 sites in VC3), and the two calls were in every
+ * one of them. Zero returns as it is; a subnormal double, a NaN or an
+ * infinity goes out of line. Host rounding mode: nearest, as the cast
+ * assumed. */
+static inline double recomp_fp_round24(double x) {
+    union { double d; uint64_t u; } b;
+    uint64_t ex;
+    b.d = x;
+    ex = b.u & 0x7ff0000000000000ull;
+    if (!(b.u << 1))
+        return x;                          /* +-0 */
+    if (ex == 0 || ex == 0x7ff0000000000000ull)
+        return recomp_fp_round24_slow(x);
+    b.u += 0x0fffffffull + ((b.u >> 29) & 1);
+    b.u &= ~0x1fffffffull;
+    return b.d;
 }
 #define RECOMP_FP_PC(x) ((g_fp_control_word & 0x300u) ? (double)(x) : recomp_fp_round24(x))
 #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))

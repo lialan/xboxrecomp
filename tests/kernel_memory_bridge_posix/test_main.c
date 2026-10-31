@@ -38,7 +38,7 @@ recomp_func_t recomp_lookup(uint32_t va)
 recomp_func_t recomp_lookup_manual(uint32_t va) { (void)va; return NULL; }
 
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
-extern RECOMP_TLS uint32_t g_eax, g_esp, g_ecx;
+/* the guest registers: g_regs (xbox_memory_layout.h) */
 extern ptrdiff_t g_xbox_mem_offset;
 
 static int failures;

@@ -54,7 +54,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NULL; }
 
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
-extern RECOMP_TLS uint32_t g_eax, g_esp;
+/* the guest registers: g_regs (xbox_memory_layout.h) */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
 enum { S_ALLOC, S_FREE, S_QUERY, N_SLOTS };
