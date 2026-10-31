@@ -374,6 +374,61 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
+#ifndef RECOMP_REGS_DEFINED
+#define RECOMP_REGS_DEFINED
+/* Every guest register in one thread-local block. Each separate __thread
+ * variable cost generated code its own TLS address computation -- on
+ * Android, where the runtime is dlopen'd, a TLSDESC resolver call -- about
+ * five per function; one block is one address per function, the registers
+ * at fixed offsets from it. The g_* names are the block's fields. */
+struct RecompRegs {
+    /* r_ prefixed: the generated code's short names (eax, esp, ...) are
+     * macros for the g_ ones */
+    uint32_t r_eax, r_ecx, r_edx, r_esp, r_ebx, r_esi, r_edi, r_ebp;
+    uint32_t r_fs_base, r_seh_ebp, r_eflags, r_mxcsr;
+    int r_fp_top, r_df, r_fp_cmp;
+    uint16_t r_fp_control_word, r_fp_cc;
+    double r_fp_stack[8];
+    RecompXmm r_xmm0, r_xmm1, r_xmm2, r_xmm3, r_xmm4, r_xmm5, r_xmm6, r_xmm7;
+    RecompMmx r_mm0, r_mm1, r_mm2, r_mm3, r_mm4, r_mm5, r_mm6, r_mm7;
+};
+extern RECOMP_TLS struct RecompRegs g_regs;
+#define g_eax g_regs.r_eax
+#define g_ecx g_regs.r_ecx
+#define g_edx g_regs.r_edx
+#define g_esp g_regs.r_esp
+#define g_ebx g_regs.r_ebx
+#define g_esi g_regs.r_esi
+#define g_edi g_regs.r_edi
+#define g_ebp g_regs.r_ebp
+#define g_fs_base g_regs.r_fs_base
+#define g_seh_ebp g_regs.r_seh_ebp
+#define g_eflags g_regs.r_eflags
+#define g_mxcsr g_regs.r_mxcsr
+#define g_fp_top g_regs.r_fp_top
+#define g_df g_regs.r_df
+#define g_fp_cmp g_regs.r_fp_cmp
+#define g_fp_control_word g_regs.r_fp_control_word
+#define g_fp_cc g_regs.r_fp_cc
+#define g_fp_stack g_regs.r_fp_stack
+#define g_xmm0 g_regs.r_xmm0
+#define g_xmm1 g_regs.r_xmm1
+#define g_xmm2 g_regs.r_xmm2
+#define g_xmm3 g_regs.r_xmm3
+#define g_xmm4 g_regs.r_xmm4
+#define g_xmm5 g_regs.r_xmm5
+#define g_xmm6 g_regs.r_xmm6
+#define g_xmm7 g_regs.r_xmm7
+#define g_mm0 g_regs.r_mm0
+#define g_mm1 g_regs.r_mm1
+#define g_mm2 g_regs.r_mm2
+#define g_mm3 g_regs.r_mm3
+#define g_mm4 g_regs.r_mm4
+#define g_mm5 g_regs.r_mm5
+#define g_mm6 g_regs.r_mm6
+#define g_mm7 g_regs.r_mm7
+#endif
+
 /* The toolkit region: scratch structures, then the main stack, then the heap.
  *
  * These used to be fixed -- scratch at 0x00700000, stack at 0x00780000, heap
@@ -435,7 +490,6 @@ extern uint32_t g_xbox_stack_size;
  * thread gets its own from xbox_AllocThreadTib() and points g_fs_base at
  * it. */
 #define XBOX_TIB_MAIN       0x00004000
-extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
 
 #define XBOX_STACK_BASE     g_xbox_stack_base

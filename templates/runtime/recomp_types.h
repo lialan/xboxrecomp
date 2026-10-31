@@ -165,13 +165,91 @@ extern uint32_t g_xbox_code_hi;
 #  define RECOMP_TLS _Thread_local
 #endif
 
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+/* The vector register types, here because the register block below holds
+ * them (defined again further down, under the same guards, with their
+ * helpers). */
+#ifndef RECOMP_XMM_DEFINED
+#define RECOMP_XMM_DEFINED
+typedef union RecompXmm {
+    float    f[4];
+    double   d[2];
+    uint32_t u[4];
+    int32_t  i[4];
+    uint64_t q[2];
+} RecompXmm;
+#endif
+#ifndef RECOMP_MMX_DEFINED
+#define RECOMP_MMX_DEFINED
+typedef union RecompMmx {
+    int8_t   b[8];
+    uint8_t  ub[8];
+    int16_t  w[4];
+    uint16_t uw[4];
+    int32_t  d[2];
+    uint32_t ud[2];
+    uint64_t q;
+} RecompMmx;
+#endif
+
+#ifndef RECOMP_REGS_DEFINED
+#define RECOMP_REGS_DEFINED
+/* Every guest register in one thread-local block. Each separate __thread
+ * variable cost generated code its own TLS address computation -- on
+ * Android, where the runtime is dlopen'd, a TLSDESC resolver call -- about
+ * five per function; one block is one address per function, the registers
+ * at fixed offsets from it. The g_* names are the block's fields. */
+struct RecompRegs {
+    /* r_ prefixed: the generated code's short names (eax, esp, ...) are
+     * macros for the g_ ones */
+    uint32_t r_eax, r_ecx, r_edx, r_esp, r_ebx, r_esi, r_edi, r_ebp;
+    uint32_t r_fs_base, r_seh_ebp, r_eflags, r_mxcsr;
+    int r_fp_top, r_df, r_fp_cmp;
+    uint16_t r_fp_control_word, r_fp_cc;
+    double r_fp_stack[8];
+    RecompXmm r_xmm0, r_xmm1, r_xmm2, r_xmm3, r_xmm4, r_xmm5, r_xmm6, r_xmm7;
+    RecompMmx r_mm0, r_mm1, r_mm2, r_mm3, r_mm4, r_mm5, r_mm6, r_mm7;
+};
+extern RECOMP_TLS struct RecompRegs g_regs;
+#define g_eax g_regs.r_eax
+#define g_ecx g_regs.r_ecx
+#define g_edx g_regs.r_edx
+#define g_esp g_regs.r_esp
+#define g_ebx g_regs.r_ebx
+#define g_esi g_regs.r_esi
+#define g_edi g_regs.r_edi
+#define g_ebp g_regs.r_ebp
+#define g_fs_base g_regs.r_fs_base
+#define g_seh_ebp g_regs.r_seh_ebp
+#define g_eflags g_regs.r_eflags
+#define g_mxcsr g_regs.r_mxcsr
+#define g_fp_top g_regs.r_fp_top
+#define g_df g_regs.r_df
+#define g_fp_cmp g_regs.r_fp_cmp
+#define g_fp_control_word g_regs.r_fp_control_word
+#define g_fp_cc g_regs.r_fp_cc
+#define g_fp_stack g_regs.r_fp_stack
+#define g_xmm0 g_regs.r_xmm0
+#define g_xmm1 g_regs.r_xmm1
+#define g_xmm2 g_regs.r_xmm2
+#define g_xmm3 g_regs.r_xmm3
+#define g_xmm4 g_regs.r_xmm4
+#define g_xmm5 g_regs.r_xmm5
+#define g_xmm6 g_regs.r_xmm6
+#define g_xmm7 g_regs.r_xmm7
+#define g_mm0 g_regs.r_mm0
+#define g_mm1 g_regs.r_mm1
+#define g_mm2 g_regs.r_mm2
+#define g_mm3 g_regs.r_mm3
+#define g_mm4 g_regs.r_mm4
+#define g_mm5 g_regs.r_mm5
+#define g_mm6 g_regs.r_mm6
+#define g_mm7 g_regs.r_mm7
+#endif
+
+
 
 /* x87 stack. Per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
-extern RECOMP_TLS double g_fp_stack[8];
-extern RECOMP_TLS int g_fp_top;
 
 /**
  * SEH frame pointer bridge.
@@ -189,10 +267,8 @@ extern RECOMP_TLS int g_fp_top;
  * Per-thread, because a TIB is. fs:[0] is the SEH chain head and fs:[4]
  * reaches the CRT's per-thread data, so a single shared base makes every
  * guest thread the same thread as far as the CRT is concerned. */
-extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE g_fs_base
 
-extern RECOMP_TLS uint32_t g_seh_ebp;
 
 /* ---- non-local jumps (setjmp / longjmp) --------------------------------
  *
@@ -234,7 +310,6 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
 #include <setjmp.h>
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
-extern RECOMP_TLS uint32_t g_ebp;
 
 /* EFLAGS.DF, and the signed step the string instructions take because of it.
  *
@@ -248,8 +323,6 @@ extern RECOMP_TLS uint32_t g_ebp;
  * be found by name, and the dashboard rebooted rather than showing a UI.
  * memmove's overlapping case is the same instruction and the same bug.
  */
-extern RECOMP_TLS int g_df;
-extern RECOMP_TLS uint32_t g_eflags; /* EFLAGS image: pushfd, popfd */
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
 /* EFLAGS as pushfd and popfd see it.
@@ -284,16 +357,12 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
-extern RECOMP_TLS uint16_t g_fp_control_word;
-extern RECOMP_TLS int g_fp_cmp;
-extern RECOMP_TLS uint16_t g_fp_cc;
 /* SSE control and status (MXCSR), reset value 0x1F80: every exception
  * masked, rounding to nearest. Like the x87 control word it is guest state
  * that STMXCSR stores and LDMXCSR loads; the host's MXCSR is never changed.
  * The rounding-control bits (13-14) steer CVTSS2SI/CVTSD2SI. The exception
  * flags (bits 0-5) are not modelled and read as clear, as the x87 status
  * word's exception byte is not. */
-extern RECOMP_TLS uint32_t g_mxcsr;
 /* x87 precision control (control word bits 8-9). The stack is double-backed,
  * which matches PC=53 and is close enough for PC=64, but PC=24 -- what the
  * Xbox runs with -- rounds every arithmetic result to float. A title that
@@ -649,8 +718,6 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
-extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
-extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 
 /* -- construction -- */
 
@@ -1397,8 +1464,6 @@ typedef union RecompMmx {
 } RecompMmx;
 #endif
 
-extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
-extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
 
 static inline RecompMmx MMX_ZERO(void) { RecompMmx r; r.q = 0; return r; }
 
