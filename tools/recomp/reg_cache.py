@@ -3,6 +3,20 @@ locals (templates/runtime/recomp_rc_on.h). A pass over the C text the
 translator produced for one function; kept apart so it can be tested
 without the disassembler."""
 import re
+# What is cached, and what is not and why:
+# - ebp and the arithmetic flags need no cache: every lifted function already
+#   holds ebp in a C local (`uint32_t ebp`, handed over through g_ebp /
+#   g_seh_ebp at calls) and computes flags into locals (_fa, _fb, _fas, _fbs,
+#   _flags); nothing of either is read from the thread-local block in a
+#   function body.
+# - The x87 stack top (g_fp_top) and last compare (g_fp_cmp) were tried as
+#   locals the same way and made the code larger: in VC3's most x87-heavy
+#   file (recomp_0005.c, Quest flags) 87,826 instructions with only the
+#   general-purpose registers cached, 88,141 with the stack top too and
+#   89,773 with both -- the write-back and reload at every call cost more
+#   than the reloads they save. The condition codes (g_fp_cc) and the
+#   direction flag (g_df) cannot be: header functions write them
+#   (recomp_fp_trig_in_range, recomp_fprem, recomp_pushfd/popfd).
 _RC_REGS = ("eax", "ecx", "edx", "ebx", "esi", "edi", "esp")
 # A direct call to a lifted function (the tail calls and fall-throughs);
 # not the FPU stack macros (fp_pop(), fp_top()), which look the same.
