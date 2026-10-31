@@ -2034,6 +2034,9 @@ static void bridge_KeSetEvent(void)
         HANDLE ge = ke_guest_event(guest_va, &type);
         if (ge) {
             g_eax = BRIDGE_MEM32(guest_va + 4) != 0;   /* previous state */
+            /* from a DPC: woken once the DPC is done (xbox_IrqlDeferWake) */
+            if (xbox_IrqlDeferWake(ge, (volatile uint32_t *)&BRIDGE_MEM32(guest_va + 4)))
+                return;
             BRIDGE_MEM32(guest_va + 4) = 1;
             SetEvent(ge);
             return;
@@ -2044,7 +2047,9 @@ static void bridge_KeSetEvent(void)
         h = bridge_resolve_handle(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
-    if (h)
+    if (h && ke_shadow_lookup(guest_va) == h && xbox_IrqlDeferWake(h, NULL))
+        g_eax = 1;
+    else if (h)
         g_eax = (uint32_t)SetEvent(h);
     else
         g_eax = 0;

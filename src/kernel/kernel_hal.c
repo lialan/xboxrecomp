@@ -886,6 +886,64 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     irql_track_gated(old_level, new_level, ra, 1);
 }
 
+/* Events set at DISPATCH_LEVEL or above, woken when the level drops.
+ *
+ * On the console's one CPU a thread an event releases cannot run before the
+ * code that set it lowers the IRQL: a DPC finishes first. D3D's vblank DPC
+ * relies on that -- it sets the vertical-blank event and only then calls the
+ * title's vblank callback, which VC3's main loop counts vblanks with: wake,
+ * then "has the callback counted a vblank yet?". With the waiter woken at
+ * once on another host core, it often looked before the callback had run,
+ * found no vblank and waited a whole extra frame: 49 frames a second on the
+ * Quest, where the DPC runs slower than the wake. So a wake at DISPATCH or
+ * above, the SignalState write with it, is held on the setting thread and
+ * done when that thread goes back below DISPATCH (the end of the DPC or ISR
+ * bracket, or a KfLowerIrql). RECOMP_DPC_WAKE_DEFER=0 wakes at once, as
+ * before. */
+#define IRQL_DEFERRED_WAKES 16
+static XBOX_THREAD_LOCAL HANDLE t_wake_h[IRQL_DEFERRED_WAKES];
+static XBOX_THREAD_LOCAL volatile uint32_t *t_wake_state[IRQL_DEFERRED_WAKES];
+static XBOX_THREAD_LOCAL int t_wake_n;
+
+static int dpc_wake_defer_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_DPC_WAKE_DEFER");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+int xbox_IrqlDeferWake(HANDLE h, volatile uint32_t *signal_state)
+{
+    int i;
+    if (g_current_irql < DISPATCH_LEVEL || !h || !dpc_wake_defer_on())
+        return 0;
+    for (i = 0; i < t_wake_n; i++)
+        if (t_wake_h[i] == h)
+            return 1;                       /* set twice: one wake */
+    if (t_wake_n >= IRQL_DEFERRED_WAKES)
+        return 0;                           /* full: wake at once */
+    t_wake_h[t_wake_n] = h;
+    t_wake_state[t_wake_n] = signal_state;
+    t_wake_n++;
+    return 1;
+}
+
+static void irql_wake_flush(void)
+{
+    int i, n = t_wake_n;
+    if (!n || g_current_irql >= DISPATCH_LEVEL)
+        return;
+    t_wake_n = 0;
+    for (i = 0; i < n; i++) {
+        if (t_wake_state[i])
+            *t_wake_state[i] = 1;
+        SetEvent(t_wake_h[i]);
+    }
+}
+
 /* Bracket a host-delivered ISR or DPC.
  *
  * The kernel's interrupt and DPC dispatchers put the processor back at the
@@ -918,6 +976,7 @@ void xbox_IrqlLeaveInterrupt(int saved)
         g_current_irql = (KIRQL)saved;
         irql_publish();
     }
+    irql_wake_flush();
 }
 
 /* Whether this thread is at DISPATCH_LEVEL or above, or holds the one-CPU
@@ -951,6 +1010,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
     irql_track(old, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
     irql_publish();
+    irql_wake_flush();                      /* a "raise" that lowered */
     /* This thread now owns the processor at DISPATCH or above (any raise
      * that crosses DISPATCH from below, to a device IRQL too): what an ISR
      * queued runs before the caller's critical region, as it would have run
@@ -1003,6 +1063,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
     irql_track(old, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
     irql_publish();
+    irql_wake_flush();
     /* Down from a device level to DISPATCH: the thread keeps the gate, and
      * the interrupts the level held off are taken now, as the console takes
      * them at the lower. The thunk's safe point came before this, still at

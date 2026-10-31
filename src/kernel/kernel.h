@@ -895,6 +895,10 @@ int     xbox_DispatchGateTryEnter(void);       /* the one-CPU gate: ISR delivery
 void    xbox_DispatchGateEnter(void);
 void    xbox_DispatchGateLeave(void);
 void    xbox_IrqlLeaveInterrupt(int saved);
+/* At DISPATCH_LEVEL or above: hold a KeSetEvent's wake (and its SignalState
+ * write, when signal_state is given) until this thread drops below DISPATCH;
+ * returns 1 if held, 0 if the caller should wake now (kernel_hal.c). */
+int     xbox_IrqlDeferWake(HANDLE h, volatile uint32_t *signal_state);
 /* This thread is at DISPATCH_LEVEL or above, or holds the one-CPU gate. */
 int     xbox_IrqlThisThreadBlocksDpcs(void);
 /* This thread's IRQL (KPCR.Irql), for tests and reports. */
