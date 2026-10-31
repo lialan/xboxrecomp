@@ -95,6 +95,25 @@ int xa2_init(void)
     if (e && *e && *e != '0')
         SDL_setenv("SDL_AUDIODRIVER", "dummy", 0);
 
+#if defined(__ANDROID__)
+    /* Android: AAudio rather than SDL's default there, OpenSL ES. On the
+     * Quest an OpenSL ES player now and then stopped calling back for good
+     * a moment after the title started the APU -- a silent session -- and
+     * SDL can neither restart one nor open a second (xa2_recover). AAudio
+     * reports a broken stream and streams can be reopened. Falls back to
+     * SDL's default if AAudio will not start; SDL_AUDIODRIVER, if set,
+     * decides instead. */
+    if (!getenv("SDL_AUDIODRIVER") && !SDL_WasInit(SDL_INIT_AUDIO)) {
+        SDL_setenv("SDL_AUDIODRIVER", "aaudio", 1);
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
+            g_audio_opened = 1;
+        } else {
+            fprintf(stderr, "[SDL2] AAudio would not start (%s): SDL's default instead\n",
+                    SDL_GetError());
+            unsetenv("SDL_AUDIODRIVER");
+        }
+    }
+#endif
     if (!SDL_WasInit(SDL_INIT_AUDIO)) {
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
             fprintf(stderr, "[SDL2] audio init failed: %s\n", SDL_GetError());
