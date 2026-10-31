@@ -40,6 +40,12 @@ static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
 static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
+/* For a back end that runs programs itself: the constants' change count,
+ * and the program's identity (recomputed only after a change). */
+static uint32_t s_const_gen = 1;
+static int      s_prog_dirty = 1;
+static uint64_t s_prog_hash;
+static uint32_t s_prog_len;
 
 static int vsh_dump_enabled(void)
 {
@@ -63,6 +69,7 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
 
 void nv2a_vsh_program_word(uint32_t word)
 {
+    s_prog_dirty = 1;
     if (s_load_slot < NV2A_VSH_SLOTS)
         s_program[s_load_slot][s_load_word] = word;
     if (++s_load_word == 4) {
@@ -71,7 +78,7 @@ void nv2a_vsh_program_word(uint32_t word)
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; s_prog_dirty = 1; }
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
@@ -84,6 +91,7 @@ void nv2a_vsh_set_constant_load(uint32_t index)
 
 void nv2a_vsh_constant_word(uint32_t word)
 {
+    s_const_gen++;
     if (s_const_load < NV2A_VSH_CONSTANTS)
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
     else if (vsh_dump_enabled()) {
@@ -110,12 +118,14 @@ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
     if (index < NV2A_VSH_CONSTANTS)
         memcpy(s_const[index], v, sizeof s_const[index]);
+    s_const_gen++;
 }
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
     if (slot < NV2A_VSH_SLOTS)
         memcpy(s_program[slot], words, sizeof s_program[slot]);
+    s_prog_dirty = 1;
 }
 
 /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
@@ -192,6 +202,37 @@ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 {
     if (index < NV2A_VSH_CONSTANTS && comp < 4)
         memcpy(&s_const[index][comp], &word, 4);
+    s_const_gen++;
+}
+
+const uint32_t (*nv2a_vsh_program_words(void))[4] { return (const uint32_t (*)[4])s_program; }
+const float (*nv2a_vsh_constants(void))[4] { return (const float (*)[4])s_const; }
+uint32_t nv2a_vsh_const_gen(void) { return s_const_gen; }
+uint32_t nv2a_vsh_cxt_write(void) { return s_cxt_write; }
+
+int nv2a_vsh_program_info(uint32_t *start, uint32_t *len, uint64_t *hash)
+{
+    if (s_prog_dirty) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        uint32_t t;
+        int i;
+        s_prog_len = 0;
+        for (t = s_start_slot; t < NV2A_VSH_SLOTS; t++) {
+            for (i = 0; i < 4; i++)
+                h = (h ^ s_program[t][i]) * 0x100000001b3ull;
+            if (field(s_program[t], 3, 0, 1)) {
+                s_prog_len = t - s_start_slot + 1;
+                break;
+            }
+        }
+        h = (h ^ s_start_slot) * 0x100000001b3ull;
+        s_prog_hash = h;
+        s_prog_dirty = 0;
+    }
+    *start = s_start_slot;
+    *len = s_prog_len;
+    *hash = s_prog_hash;
+    return s_prog_len != 0;
 }
 
 /* ---- execution ----------------------------------------------------------- */
@@ -401,8 +442,10 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         if (omask) {
             const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
             if (!field(ins, 3, 11, 1)) {                  /* to c[] */
-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
+                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS) {
                     write_masked(s_const[oaddr], src, omask);
+                    s_const_gen++;
+                }
             } else if (oaddr == 0) {
                 write_masked(opos.v, src, omask);
             } else if (oaddr < 13) {

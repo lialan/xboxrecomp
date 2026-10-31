@@ -58,4 +58,15 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
 
+/* For a back end that runs the program itself (NV2A_RAW_PROGRAM): program
+ * memory; the loaded program's start slot, length to its FINAL and identity
+ * (a hash of its words and start; recomputed only after an upload), 0 when
+ * there is no FINAL; the constants and a count bumped at every change to
+ * them; whether the program may write c[] (CXT_WRITE). */
+const uint32_t (*nv2a_vsh_program_words(void))[4];
+int nv2a_vsh_program_info(uint32_t *start, uint32_t *len, uint64_t *hash);
+const float (*nv2a_vsh_constants(void))[4];
+uint32_t nv2a_vsh_const_gen(void);
+uint32_t nv2a_vsh_cxt_write(void);
+
 #endif

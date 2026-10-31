@@ -111,10 +111,12 @@ typedef struct {
  * would: the same screen position, colours and texture coordinates per
  * vertex, clipped at w = 1e-3 and (near_z) at the near plane.
  *
- * Fixed function only (NV2A_RAW_FIXED): it carries nearly all of a 3D
- * scene's vertices. Vertex-program batches -- a few vertices each, HUD and
- * composite quads in VC3 -- stay on the CPU. */
+ * Fixed function (NV2A_RAW_FIXED) carries nearly all of a 3D scene's
+ * vertices. Vertex-program batches (NV2A_RAW_PROGRAM) come with the program
+ * and its constants instead of Nv2aFixedState; nv2a_vsh_glsl.h translates
+ * the program. */
 
+#define NV2A_RAW_PROGRAM 1
 #define NV2A_RAW_FIXED   2
 
 /* One NV2A vertex attribute as the title set it. */
@@ -165,8 +167,22 @@ typedef struct {
     const uint16_t *indices;      /* rebased: 0 is min_index */
     uint32_t index_count, min_index, max_index;
     Nv2aAttrib attr[16];
-    uint32_t kind;                /* NV2A_RAW_FIXED */
-    const Nv2aFixedState *ff;
+    uint32_t kind;                /* NV2A_RAW_FIXED or NV2A_RAW_PROGRAM */
+    const Nv2aFixedState *ff;     /* NV2A_RAW_FIXED */
+    /* NV2A_RAW_PROGRAM: program memory, the program's start slot, length to
+     * its FINAL and identity (a hash of its words); the constants c[0..191]
+     * and their change count. Inputs v0..v15 are attr[0..15] (an attribute
+     * with no array is a constant: its current SET_VERTEX_DATA value). The
+     * shader's oPos is the interpreter's: x y z in surface pixels before the
+     * anti-aliasing scale, w the clip w (+0 read as 1). w0 is what the CPU
+     * gets for the first vertex -- 1 for a screen-space batch -- for the
+     * back end's decisions that look at the transformed vertices. */
+    const uint32_t (*program)[4];
+    uint32_t program_start, program_len;
+    uint64_t program_hash;
+    const float (*constants)[4];
+    uint32_t const_gen;
+    float w0;
     /* Screen space: surface pixels = (clip.xy / w + c59.xy) * aa. */
     float aa_sx, aa_sy;
     float vp_off_z;               /* c59.z: the near plane is z = vp_off_z */

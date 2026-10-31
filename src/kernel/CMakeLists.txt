@@ -29,6 +29,7 @@ set(KERNEL_SOURCES
     nv2a_pb_exec.c
     nv2a_flip_hold.c
     nv2a_vsh_interp.c
+    nv2a_vsh_glsl.c
     nv2a_combiner.c
 )
 

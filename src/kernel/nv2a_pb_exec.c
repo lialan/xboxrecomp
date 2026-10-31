@@ -3430,31 +3430,39 @@ static void batch_note_state(void)
  * draw_raw() untransformed; unset or 0, none are. Whatever the back end
  * declines, and every batch while it is off, goes through the CPU transform
  * below as before. Vertex-program batches always do. */
-enum { RAW_D_PRIM, RAW_D_RANGE, RAW_D_SPAN, RAW_D_BACKEND, RAW_D_N };
+enum { RAW_D_PRIM, RAW_D_RANGE, RAW_D_SPAN, RAW_D_BACKEND, RAW_D_PROGRAM, RAW_D_N };
 static const char *const k_raw_decline[RAW_D_N] = {
-    "points/lines", "index range", "attribute span", "back end"
+    "points/lines", "index range", "attribute span", "back end", "program (no FINAL / writes c[])"
 };
 static struct {
     uint32_t ff_batches, ff_tris, ff_verts, cpu_batches;
+    uint32_t vp_batches, vp_tris, vp_verts, vp_cpu_batches;
+    uint32_t vp_checked, vp_check_verts, vp_mismatch_batches, vp_mismatch_verts;
     uint32_t declined[RAW_D_N];
     /* RECOMP_GPU_XF_CHECK */
     uint32_t checked, check_verts, mismatch_batches, mismatch_verts, cpu_aborts;
     uint32_t eye_plane;
 } s_raw;
 
-static int raw_xf_enabled(void)
-{
-    static int on = -1;
+/* RECOMP_GPU_XF: 1 or ff (fixed function), vp (vertex programs), all (both). */
+static int s_raw_on = -1;              /* bit 0 fixed function, bit 1 programs */
 
-    if (on < 0) {
+static int raw_mode_bits(void)
+{
+    if (s_raw_on < 0) {
         const char *e = getenv("RECOMP_GPU_XF");
-        on = e && (e[0] == '1' || !strcmp(e, "ff"));
-        if (on)
+        s_raw_on = !e ? 0 : (!strcmp(e, "1") || !strcmp(e, "ff")) ? 1
+                 : !strcmp(e, "vp") ? 2 : !strcmp(e, "all") ? 3 : 0;
+        if (s_raw_on)
             fprintf(stderr, "[GPU] raw draws (RECOMP_GPU_XF=%s): the back end"
-                    " transforms fixed-function batches\n", e);
+                    " transforms %s\n", e, s_raw_on == 3 ? "fixed-function and vertex-program batches"
+                    : s_raw_on == 2 ? "vertex-program batches" : "fixed-function batches");
     }
-    return on && s_backend && s_backend->draw_raw;
+    return s_backend && s_backend->draw_raw ? s_raw_on : 0;
 }
+
+static int raw_xf_enabled(void) { return raw_mode_bits() & 1; }
+static int raw_vp_enabled(void) { return raw_mode_bits() & 2; }
 
 /* Can fetch_attr read this attribute at all (array batches)? */
 static int attr_usable(const VertexAttr *a)
@@ -3665,37 +3673,39 @@ static void raw_check(const Nv2aRawGeometry *g, const float *gpu)
                     o[18], o[19], o[20]);
         }
     }
+    if (g->kind == NV2A_RAW_PROGRAM) {
+        s_raw.vp_checked++;
+        s_raw.vp_check_verts += s_gpu.idx_count;
+        if (bad) {
+            s_raw.vp_mismatch_batches++;
+            s_raw.vp_mismatch_verts += bad;
+        }
+    }
     if (bad) {
         s_raw.mismatch_batches++;
         s_raw.mismatch_verts += bad;
         if (logged_batches++ < 16) {
-            fprintf(stderr, "[XFCHK] batch %u: %u of %u vertices differ\n",
-                    s_raw.ff_batches, bad, s_gpu.idx_count);
-            raw_dump_state(g->ff);
+            fprintf(stderr, "[XFCHK] %s batch %u: %u of %u vertices differ\n",
+                    g->kind == NV2A_RAW_PROGRAM ? "program" : "fixed-function",
+                    g->kind == NV2A_RAW_PROGRAM ? s_raw.vp_batches : s_raw.ff_batches,
+                    bad, s_gpu.idx_count);
+            if (g->ff)
+                raw_dump_state(g->ff);
+            else
+                fprintf(stderr, "[XFCHK]   program at slot %u, %u instructions, hash %016llx"
+                        " (RECOMP_VSH_DUMP=1 disassembles it)\n", g->program_start,
+                        g->program_len, (unsigned long long)g->program_hash);
         }
     }
 }
 
-/* Offer the batch to the back end untransformed. Returns 1 when it has been
- * drawn, 0 to transform it on the CPU instead. */
-static int try_draw_raw(void)
+/* The batch's indices for a raw draw: rebased to the lowest, quads split as
+ * raster_batch_program splits them. Returns -1, or the decline reason. */
+static int raw_indices(uint16_t *ridx, uint32_t *prim_out, uint32_t *count_out,
+                       uint32_t *lo_out, uint32_t *hi_out)
 {
-    static uint16_t *ridx;
-    static float *check_buf;
-    static int check_n = -1;
-    uint32_t n = s_gpu.idx_count, i, lo, hi, prim, count = 0, tris;
-    Nv2aFixedState ff;
-    Nv2aRawGeometry g;
-    Nv2aSurface surf;
-    Nv2aRenderState rs;
-    Nv2aTexture tex, stex[4];
-    Nv2aBatch batch;
-    const VertexAttr *tc;
-    int check = 0;
-    uint64_t t0 = prof_on() ? xbox_HostNowNs() : 0;
+    uint32_t n = s_gpu.idx_count, i, lo, hi, prim, count = 0;
 
-    if (!ridx && !(ridx = (uint16_t *)malloc((NV_MAX_INDICES / 4 * 6 + 8) * sizeof *ridx)))
-        return 0;
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
     case NV_PRIM_QUADS:
@@ -3704,13 +3714,7 @@ static int try_draw_raw(void)
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:        prim = NV_PRIM_TRIANGLE_FAN;   break;
     default:
-        s_raw.declined[RAW_D_PRIM]++;
-        return 0;
-    }
-    /* The position must be readable, or the CPU path drops the batch. */
-    if (!attr_usable(&s_gpu.attr[0])) {
-        s_raw.declined[RAW_D_SPAN]++;
-        return 0;
+        return RAW_D_PRIM;
     }
     lo = hi = s_gpu.idx[0];
     for (i = 1; i < n; i++) {
@@ -3719,8 +3723,7 @@ static int try_draw_raw(void)
         if (v > hi) hi = v;
     }
     if (hi - lo >= 65536u) {
-        s_raw.declined[RAW_D_RANGE]++;
-        return 0;
+        return RAW_D_RANGE;
     }
     /* Indices rebased to lo; quads split as raster_batch_program splits them. */
     if (s_gpu.prim == NV_PRIM_QUADS) {
@@ -3747,8 +3750,46 @@ static int try_draw_raw(void)
             ridx[i] = (uint16_t)(s_gpu.idx[i] - lo);
     }
     if (count < 3) {
-        s_raw.declined[RAW_D_PRIM]++;
+        return RAW_D_PRIM;
+    }
+    *prim_out = prim;
+    *count_out = count;
+    *lo_out = lo;
+    *hi_out = hi;
+    return -1;
+}
+
+/* Offer the batch to the back end untransformed. Returns 1 when it has been
+ * drawn, 0 to transform it on the CPU instead. */
+static int try_draw_raw(void)
+{
+    static uint16_t *ridx;
+    static float *check_buf;
+    static int check_n = -1;
+    uint32_t i, lo, hi, prim, count = 0, tris;
+    Nv2aFixedState ff;
+    Nv2aRawGeometry g;
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    Nv2aTexture tex, stex[4];
+    Nv2aBatch batch;
+    const VertexAttr *tc;
+    int check = 0;
+    uint64_t t0 = prof_on() ? xbox_HostNowNs() : 0;
+
+    if (!ridx && !(ridx = (uint16_t *)malloc((NV_MAX_INDICES / 4 * 6 + 8) * sizeof *ridx)))
         return 0;
+    /* The position must be readable, or the CPU path drops the batch. */
+    if (!attr_usable(&s_gpu.attr[0])) {
+        s_raw.declined[RAW_D_SPAN]++;
+        return 0;
+    }
+    {
+        int why = raw_indices(ridx, &prim, &count, &lo, &hi);
+        if (why >= 0) {
+            s_raw.declined[why]++;
+            return 0;
+        }
     }
     tris = prim == NV_PRIM_TRIANGLES ? count / 3 : count - 2;
 
@@ -3827,6 +3868,162 @@ static int try_draw_raw(void)
     return 1;
 }
 
+/* One program input for a raw draw, by transform_vertex's rules: no array
+ * (size 0) reads the attribute's current value; an array fetch_attr cannot
+ * read is (0,0,0,1); an inline batch's arrays are in the buffered payload.
+ * Returns 0 when the array is there but not all of min..max is readable --
+ * fetch_attr would read some vertices and not others, so the batch stays
+ * on the CPU. */
+static int raw_vp_attrib(uint32_t a, uint32_t min, uint32_t max, Nv2aAttrib *out)
+{
+    const VertexAttr *va = &s_gpu.attr[a];
+
+    memset(out, 0, sizeof *out);
+    out->value[3] = 1.0f;
+    if (!va->size) {
+        memcpy(out->value, s_gpu.imm_attr[a], sizeof out->value);
+        return 1;
+    }
+    if (!va->stride)
+        return 1;
+    switch (va->type) {
+    case 0: case 1: case 2: case 4: case 5: case 6: break;
+    default: return 1;                        /* fetch_attr: (0,0,0,1) */
+    }
+    if (s_gpu.inline_active) {
+        size_t at = (size_t)va->offset + (size_t)min * va->stride;
+        size_t bytes = (size_t)(max - min) * va->stride + attr_elem_bytes(va);
+        if (at + bytes > (size_t)s_gpu.inline_count * 4)
+            return 0;
+        out->data = (const uint8_t *)s_gpu.inline_buf + at;
+    } else {
+        uint64_t at = (uint64_t)va->offset + (uint64_t)min * va->stride;
+        uint32_t bytes = (max - min) * va->stride + attr_elem_bytes(va);
+        if (!va->offset)
+            return 1;
+        if (!guest_span_ok(at, bytes))
+            return 0;
+        out->data = (const uint8_t *)xbox_GetMemoryOffset() + at;
+        out->guest_va = (uint32_t)at;
+    }
+    out->type = va->type;
+    out->size = va->size < 4 ? va->size : 4;
+    out->stride = va->stride;
+    out->bytes = (max - min) * va->stride + attr_elem_bytes(va);
+    return 1;
+}
+
+/* A vertex-program batch offered to the back end untransformed (RECOMP_GPU_XF
+ * vp or all): the program, its constants and the inputs. Returns 1 when it
+ * has been drawn. */
+static int try_draw_raw_vp(void)
+{
+    static uint16_t *ridx;
+    static float *check_buf;
+    static int check_n = -1;
+    uint32_t i, lo, hi, prim, count, tris, start, len;
+    uint64_t hash;
+    Nv2aRawGeometry g;
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    Nv2aTexture tex, stex[4];
+    Nv2aBatch batch;
+    Nv2aVshOutput v0;
+    const VertexAttr *tc;
+    int check = 0;
+    uint64_t t0 = prof_on() ? xbox_HostNowNs() : 0;
+
+    if (!ridx && !(ridx = (uint16_t *)malloc((NV_MAX_INDICES / 4 * 6 + 8) * sizeof *ridx)))
+        return 0;
+    if (!nv2a_vsh_program_info(&start, &len, &hash) || nv2a_vsh_cxt_write()) {
+        s_raw.declined[RAW_D_PROGRAM]++;
+        return 0;
+    }
+    {
+        int why = raw_indices(ridx, &prim, &count, &lo, &hi);
+        if (why >= 0) {
+            s_raw.declined[why]++;
+            return 0;
+        }
+    }
+    tris = prim == NV_PRIM_TRIANGLES ? count / 3 : count - 2;
+    memset(&g, 0, sizeof g);
+    for (i = 0; i < NV2A_VSH_INPUTS; i++)
+        if (!raw_vp_attrib(i, lo, hi, &g.attr[i])) {
+            s_raw.declined[RAW_D_SPAN]++;
+            return 0;
+        }
+    /* The first vertex as the CPU path computes it: the back end's
+     * screen-space (2D) decisions look at it. */
+    if (!transform_vertex(s_gpu.idx[0], &v0)) {
+        s_raw.declined[RAW_D_PROGRAM]++;
+        return 0;
+    }
+    g.prim = prim;
+    g.indices = ridx;
+    g.index_count = count;
+    g.min_index = lo;
+    g.max_index = hi;
+    g.kind = NV2A_RAW_PROGRAM;
+    g.program = nv2a_vsh_program_words();
+    g.program_start = start;
+    g.program_len = len;
+    g.program_hash = hash;
+    g.constants = nv2a_vsh_constants();
+    g.const_gen = nv2a_vsh_const_gen();
+    g.w0 = v0.pos[3];
+    g.aa_sx = s_gpu.aa_sx;
+    g.aa_sy = s_gpu.aa_sy;
+    g.vp_off_z = nv2a_vsh_constant(59)[2];
+    g.near_z = (uint32_t)clip_near_z();
+    g.fog_enable = s_gpu.fog_enable;
+    g.fog_mode = s_gpu.fog_mode;
+    g.fog_param[0] = s_gpu.fog_param[0];
+    g.fog_param[1] = s_gpu.fog_param[1];
+    g.uv_scale0[0] = g.uv_scale0[1] = 1.0f;
+    if (tex_size_from_format(s_gpu.texs[0].color)) {
+        g.uv_scale0[0] = (float)s_gpu.texs[0].width;
+        g.uv_scale0[1] = (float)s_gpu.texs[0].height;
+    }
+    if (check_n < 0) {
+        const char *e = getenv("RECOMP_GPU_XF_CHECK");
+        check_n = e ? atoi(e) : 0;
+    }
+    if (check_n > 0 && (s_raw.vp_batches < (uint32_t)check_n
+                        || s_raw.vp_batches % 1000 == 0)) {
+        if (!check_buf)
+            check_buf = (float *)malloc((size_t)65536 * NV2A_RAW_CHECK_FLOATS
+                                        * sizeof *check_buf);
+        if (check_buf) {
+            g.check_out = check_buf;
+            check = 1;
+        }
+    }
+    /* As raster_batch_program: no texture coordinates, no texture. */
+    tc = texcoord_attr();
+    s_xf_no_tex = !(tc->offset && tc->stride);
+    backend_batch_init(&batch, &surf, &rs, &tex, stex, !s_xf_no_tex, backend_use_rc());
+    batch.raw = &g;
+    if (!s_backend->draw_raw(&surf, &batch)) {
+        s_raw.declined[RAW_D_BACKEND]++;
+        return 0;
+    }
+    if (check)
+        raw_check(&g, check_buf);
+    s_raw.vp_batches++;
+    s_raw.vp_tris += tris;
+    s_raw.vp_verts += hi - lo + 1;
+    s_gpu.batches_program++;
+    batch_note_state();
+    s_gpu.tris_drawn += tris;
+    note_drawn();
+    if (t0) {
+        s_prof.raw += xbox_HostNowNs() - t0;
+        s_prof.raw_n++;
+    }
+    return 1;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
@@ -3834,8 +4031,12 @@ static void raster_batch_program(void)
 
     if (!batch_uses_program() && raw_xf_enabled() && try_draw_raw())
         return;
+    if (batch_uses_program() && raw_vp_enabled() && try_draw_raw_vp())
+        return;
     if (!batch_uses_program())
         s_raw.cpu_batches++;
+    else
+        s_raw.vp_cpu_batches++;
     t0 = prof_on() ? xbox_HostNowNs() : 0;
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
@@ -5593,13 +5794,20 @@ void nv2a_pb_exec_report(void)
     if (s_gpu.batches_ffp)
         fprintf(stderr, "[GPU] fixed-function transform: %u batches\n",
                 s_gpu.batches_ffp);
-    if (s_raw.ff_batches || (s_raw.cpu_batches && raw_xf_enabled())) {
+    if (s_raw.ff_batches || s_raw.vp_batches || (s_raw.cpu_batches && raw_xf_enabled())
+        || (s_raw.vp_cpu_batches && raw_vp_enabled())) {
         fprintf(stderr, "[GPU]   on the back end: %u batches, %u triangles, %u vertices;"
                 " on the CPU %u; declined:", s_raw.ff_batches, s_raw.ff_tris,
                 s_raw.ff_verts, s_raw.cpu_batches);
         for (i = 0; i < RAW_D_N; i++)
             fprintf(stderr, " %s %u", k_raw_decline[i], s_raw.declined[i]);
         fputc(10, stderr);
+        if (s_raw.vp_batches || (s_raw.vp_cpu_batches && raw_vp_enabled()))
+            fprintf(stderr, "[GPU]   vertex programs on the back end: %u batches, %u triangles,"
+                    " %u vertices; on the CPU %u; checked %u batches (%u vertices), %u with"
+                    " %u differing vertices\n", s_raw.vp_batches, s_raw.vp_tris,
+                    s_raw.vp_verts, s_raw.vp_cpu_batches, s_raw.vp_checked,
+                    s_raw.vp_check_verts, s_raw.vp_mismatch_batches, s_raw.vp_mismatch_verts);
         if (s_raw.checked)
             fprintf(stderr, "[GPU]   check: %u batches (%u vertices), %u batches with"
                     " %u differing vertices, %u the CPU dropped whole, %u vertices at"
