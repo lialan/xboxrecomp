@@ -50,6 +50,9 @@ static int       g_dry;
 static int64_t   g_underrun_logged_ms;
 static SDL_AudioSpec g_want;        /* what xa2_init asked for, to reopen with */
 static unsigned  g_recoveries;
+/* xa2_recover's helper thread: the device it opened, for the APU thread to
+ * take (dev_take), and whether it is still at work. */
+static SDL_atomic_t g_new_dev, g_recovering;
 
 static int env_int(const char *name, int def, int lo, int hi)
 {
@@ -167,8 +170,25 @@ int xa2_is_active(void)
 /* Hand one EP period to the queue. SDL copies the samples, so the caller's
  * buffer is free on return. Nothing is ever refused by depth: the queue is
  * unbounded and pacing by queue depth holds it at the marks. */
+/* A device xa2_recover's helper opened replaces the stalled one here, on
+ * the APU thread, the only thread that uses g_dev. The stalled device is
+ * left as it is -- not closed, cleared or paused: on Android each of those
+ * waits on its stuck audio thread (SDL_CloseAudioDevice joins it), which is
+ * how the first version of this hung the game. It is lost; one a stall. */
+static void dev_take(void)
+{
+    SDL_AudioDeviceID d = (SDL_AudioDeviceID)SDL_AtomicSet(&g_new_dev, 0);
+    if (d) {
+        fprintf(stderr, "[SDL2] audio: now on the new device %u (the stalled %u left alone)\n",
+                (unsigned)d, (unsigned)g_dev);
+        g_dev = d;
+        g_dry = 0;
+    }
+}
+
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
+    dev_take();
     if (!g_initialized || !g_dev || num_samples <= 0) return 0;
     {   /* RECOMP_AUDIO_STALL_TEST=<s>: that many seconds in, the device stops
          * pulling (paused behind the backend's back) -- the stall the pacer
@@ -216,6 +236,7 @@ int xa2_queued_samples(void)
 {
     Uint32 bytes;
 
+    dev_take();
     if (!g_initialized || !g_dev) return 0;
     bytes = SDL_GetQueuedAudioSize(g_dev);
     if (bytes == 0 && g_frames_written > 0) {
@@ -248,37 +269,67 @@ unsigned xa2_underruns(void)
  * reopen it. The queue's contents go with the old device (they are stale by
  * now); the pacer refills the new one. Called by the APU's pacer when it
  * declares the stall and again every few seconds while it lasts. */
-int xa2_recover(void)
+/* Open a fresh device, off the APU thread: opening one can take a while on
+ * Android, and nothing about it may stall the game. */
+static int recover_thread(void *arg)
 {
     SDL_AudioSpec have;
+    SDL_AudioDeviceID d;
+    uint64_t t0 = SDL_GetTicks64();
+    (void)arg;
+    memset(&have, 0, sizeof have);
+    d = SDL_OpenAudioDevice(NULL, 0, &g_want, &have, 0);
+    if (!d) {
+        fprintf(stderr, "[SDL2] audio: opening a new device failed: %s\n", SDL_GetError());
+    } else {
+        SDL_PauseAudioDevice(d, 0);
+        fprintf(stderr, "[SDL2] audio: new device %u open in %llu ms (%d-sample buffers)\n",
+                (unsigned)d, (unsigned long long)(SDL_GetTicks64() - t0),
+                have.samples ? have.samples : g_buf_samples);
+        SDL_AtomicSet(&g_new_dev, (int)d);
+    }
+    SDL_AtomicSet(&g_recovering, 0);
+    return 0;
+}
+
+/* The device stopped consuming: say what SDL reports of it and have a
+ * helper thread open a new one (recover_thread; dev_take swaps it in). The
+ * APU meanwhile paces on the host clock and drops periods, as a stall
+ * always did: the game never waits on audio. RECOMP_AUDIO_RECOVER=0 only
+ * logs. Returns 0: any new device arrives later. */
+int xa2_recover(void)
+{
+    static int off = -1;
     SDL_AudioStatus st;
     const char *driver;
+    SDL_Thread *t;
 
-    if (!g_initialized)
+    if (!g_initialized || !g_dev)
         return 0;
-    st = g_dev ? SDL_GetAudioDeviceStatus(g_dev) : SDL_AUDIO_STOPPED;
+    if (off < 0) {
+        const char *e = getenv("RECOMP_AUDIO_RECOVER");
+        off = e && *e == '0';
+    }
+    st = SDL_GetAudioDeviceStatus(g_dev);       /* reads flags; takes no lock */
     driver = SDL_GetCurrentAudioDriver();
     g_recoveries++;
-    fprintf(stderr, "[SDL2] audio device not consuming: SDL says %s, driver %s, %u bytes"
-            " queued; reopening it (attempt %u)\n",
+    fprintf(stderr, "[SDL2] audio device %u not consuming: SDL says %s, driver %s, %u bytes"
+            " queued; %s (attempt %u)\n", (unsigned)g_dev,
             st == SDL_AUDIO_PLAYING ? "playing" : st == SDL_AUDIO_PAUSED ? "paused" : "stopped",
-            driver ? driver : "?", g_dev ? SDL_GetQueuedAudioSize(g_dev) : 0, g_recoveries);
-    if (g_dev) {
-        SDL_ClearQueuedAudio(g_dev);
-        SDL_CloseAudioDevice(g_dev);
-        g_dev = 0;
-    }
-    memset(&have, 0, sizeof have);
-    g_dev = SDL_OpenAudioDevice(NULL, 0, &g_want, &have, 0);
-    if (!g_dev) {
-        fprintf(stderr, "[SDL2] reopening the audio device failed: %s\n", SDL_GetError());
+            driver ? driver : "?", SDL_GetQueuedAudioSize(g_dev),
+            off ? "left alone (RECOMP_AUDIO_RECOVER=0)"
+                : SDL_AtomicGet(&g_recovering) ? "a new one is still being opened"
+                : "opening a new one", g_recoveries);
+    if (off || SDL_AtomicGet(&g_recovering))
+        return 0;
+    SDL_AtomicSet(&g_recovering, 1);
+    t = SDL_CreateThread(recover_thread, "audio recover", NULL);
+    if (!t) {
+        SDL_AtomicSet(&g_recovering, 0);
         return 0;
     }
-    g_dry = 0;
-    SDL_PauseAudioDevice(g_dev, 0);
-    fprintf(stderr, "[SDL2] audio device reopened (%d-sample buffers)\n",
-            have.samples ? have.samples : g_buf_samples);
-    return 1;
+    SDL_DetachThread(t);
+    return 0;
 }
 
 /* What the device thread has pulled off the queue; it pulls one device
