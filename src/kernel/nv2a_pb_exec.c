@@ -891,7 +891,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
     s_gpu.texs[0].color  = tex->color;
     s_gpu.texs[0].addr_u = 3;
     s_gpu.texs[0].addr_v = 3;
-    s_gpu.texs[0].palette = 0;          /* ponytail: no palettised formats */
+    s_gpu.texs[0].palette = tex->palette;   /* P8's CLUT; 0 fails a P8 decode */
     s_gpu.texs[0].levels = 1;
     s_gpu.texs[0].filter = 0;
     s_gpu.texs[0].cube   = 0;
@@ -2368,6 +2368,7 @@ static void backend_texture(int st, Nv2aTexture *tex)
     tex->levels = tex_size_from_format(s_gpu.texs[st].color) ? s_gpu.texs[st].levels : 1;
     tex->filter = s_gpu.texs[st].filter;
     tex->cube   = s_gpu.texs[st].cube;
+    tex->palette = s_gpu.texs[st].color == 0x0B ? s_gpu.texs[st].palette : 0;
 }
 
 /* `textured`: the batch carried texture coordinates, so the bound texture is

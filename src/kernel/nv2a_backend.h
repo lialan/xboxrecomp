@@ -57,6 +57,9 @@ typedef struct {
     /* A cube map (the format word's CUBEMAP_ENABLE): six faces, +X -X +Y -Y
      * +Z -Z, each a full mip chain, each starting on a 128-byte boundary. */
     uint32_t cube;
+    /* Guest address of the 256-entry A8R8G8B8 palette of an SZ_I8_A8R8G8B8
+     * (P8) texture (SET_TEXTURE_PALETTE); 0 for every other format. */
+    uint32_t palette;
 } Nv2aTexture;
 
 typedef struct {
