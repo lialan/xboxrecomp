@@ -553,6 +553,8 @@ static uint32_t attr_elem_bytes(const VertexAttr *a)
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
+static const Nv2aRawGeometry *s_check_geometry; /* only while raw_check runs */
+
 static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -563,6 +565,22 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     out[3] = 1.0f;
     if (!a->size || !a->stride)
         return 0;
+    if (s_check_geometry) {
+        uint32_t slot;
+        for (slot = 0; slot < NV_VERTEX_ATTRS; slot++)
+            if (a == &s_gpu.attr[slot]) {
+                const Nv2aAttrib *snap = &s_check_geometry->attr[slot];
+                if (!snap->data) {
+                    memcpy(out, snap->value, sizeof snap->value);
+                    return 1;
+                }
+                if (index < s_check_geometry->min_index || index > s_check_geometry->max_index)
+                    return 0;
+                p = (const uint8_t *)snap->data
+                  + (size_t)(index - s_check_geometry->min_index) * snap->stride;
+                goto decode;
+            }
+    }
     if (s_gpu.inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
          * the buffered payload rather than a guest address -- and 0 is a legal
@@ -580,6 +598,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         p = mem + at;
     }
 
+decode:
     switch (a->type) {
     case 0:                                  /* D3DCOLOR */
         /* A DWORD 0xAARRGGBB, so little-endian bytes are B,G,R,A -- not the
@@ -3658,6 +3677,34 @@ static int raw_close(float a, float b, float rel, float abs_tol)
 /* RECOMP_GPU_XF_CHECK: transform the batch on the CPU as well and compare,
  * vertex by vertex, with what the back end's shader produced (check_out):
  * a translation bug shows here apart from any rasterisation difference. */
+/* Both the submitted GPU draw and CPU checker must read the same bytes.
+ * The guest producer can overwrite a vertex buffer while a checked draw
+ * drains the GL thread, even though the executor itself is synchronous. */
+static int raw_check_snapshot(Nv2aRawGeometry *g)
+{
+    static uint8_t *data;
+    static size_t capacity;
+    size_t bytes = 0, at = 0;
+    uint32_t slot;
+    for (slot = 0; slot < NV_VERTEX_ATTRS; slot++)
+        if (g->attr[slot].data)
+            bytes += ((size_t)g->attr[slot].bytes + 15) & ~(size_t)15;
+    if (bytes > capacity) {
+        uint8_t *next = (uint8_t *)realloc(data, bytes);
+        if (!next)
+            return 0;
+        data = next;
+        capacity = bytes;
+    }
+    for (slot = 0; slot < NV_VERTEX_ATTRS; slot++)
+        if (g->attr[slot].data) {
+            memcpy(data + at, g->attr[slot].data, g->attr[slot].bytes);
+            g->attr[slot].data = data + at;
+            at += ((size_t)g->attr[slot].bytes + 15) & ~(size_t)15;
+        }
+    return 1;
+}
+
 static void raw_check(const Nv2aRawGeometry *g, const float *gpu)
 {
     static int logged_batches;
@@ -3667,13 +3714,16 @@ static void raw_check(const Nv2aRawGeometry *g, const float *gpu)
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
     s_raw.checked++;
+    s_check_geometry = g;
     for (i = 0; i < s_gpu.idx_count; i++)
         if (!transform_vertex(s_gpu.idx[i], &s_xf[i])) {
             /* The CPU drops the whole batch for one vertex at w = 0; the
              * shader clips only the triangles touching it. */
             s_raw.cpu_aborts++;
+            s_check_geometry = NULL;
             return;
         }
+    s_check_geometry = NULL;
     for (i = 0; i < s_gpu.idx_count; i++) {
         const Nv2aVshOutput *c = &s_xf[i];
         const float *o = gpu + (size_t)(s_gpu.idx[i] - g->min_index) * NV2A_RAW_CHECK_FLOATS;
@@ -3918,6 +3968,10 @@ static int try_draw_raw(void)
     tc = texcoord_attr();
     s_xf_no_tex = !(tc->offset && tc->stride);
     backend_batch_init(&batch, &surf, &rs, &tex, stex, !s_xf_no_tex, backend_use_rc());
+    if (check && !raw_check_snapshot(&g)) {
+        check = 0;
+        g.check_out = NULL;
+    }
     batch.raw = &g;
     if (!s_backend->draw_raw(&surf, &batch)) {
         s_raw.declined[RAW_D_BACKEND]++;
@@ -4145,6 +4199,10 @@ static int try_draw_raw_vp(void)
     tc = texcoord_attr();
     s_xf_no_tex = g.w0 > 0.0f && g.w0 != 1.0f && !(tc->offset && tc->stride);
     backend_batch_init(&batch, &surf, &rs, &tex, stex, !s_xf_no_tex, backend_use_rc());
+    if (check && !raw_check_snapshot(&g)) {
+        check = 0;
+        g.check_out = NULL;
+    }
     batch.raw = &g;
     if (!s_backend->draw_raw(&surf, &batch)) {
         s_raw.declined[RAW_D_BACKEND]++;
