@@ -4282,8 +4282,14 @@ static void raster_batch_program(void)
             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
+        /* every other triangle of a strip the other way round, as the GPU
+         * (and GL) wind them: one facing for the whole strip, which culling
+         * (the back end's) depends on */
         for (i = 0; i + 2 < n; i++)
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+            if (i & 1)
+                raster_xf_clipped(&s_xf[i+1], &s_xf[i], &s_xf[i+2]);
+            else
+                raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -4351,9 +4357,9 @@ static void raster_batch(void)
             raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
                            vertex_color(s_gpu.idx[i]));
         break;
-    case NV_PRIM_TRIANGLE_STRIP:
+    case NV_PRIM_TRIANGLE_STRIP:     /* alternate triangles reversed, as above */
         for (i = 0; i + 2 < s_gpu.idx_count; i++)
-            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+            raster_indexed(s_gpu.idx[i + (i & 1)], s_gpu.idx[i + 1 - (i & 1)], s_gpu.idx[i+2],
                            vertex_color(s_gpu.idx[i]));
         break;
     case NV_PRIM_TRIANGLE_FAN:
