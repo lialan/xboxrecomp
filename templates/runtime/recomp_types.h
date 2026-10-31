@@ -1273,6 +1273,50 @@ void xbox_GuestCpuPreempt(uint32_t va);
     do { if (RECOMP_LOAD_RELAXED32(&g_xbox_guest_cpu_preempt)) \
              xbox_GuestCpuPreempt(va); } while (0)
 
+/* The recent-indirect-call ring and the call count, printed by the crash
+ * reports. Three volatile stores (one a 64-bit increment) on every indirect
+ * call, so only built in with -DRECOMP_ICALL_TRACE; otherwise the ring stays
+ * empty and the count 0. */
+#ifdef RECOMP_ICALL_TRACE
+#define RECOMP_ICALL_TRACE_RECORD(va) do { \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = (va); \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+} while (0)
+#else
+#define RECOMP_ICALL_TRACE_RECORD(va) ((void)0)
+#endif
+
+/* Resolving an indirect-call target. The flat dispatch table, when the
+ * generated recomp_dispatch_init publishes it (recomp_dispatch_publish), is
+ * read inline: a subtract, a compare and a load. It is published only when
+ * no translated function has a manual override, so a hit is exactly what
+ * recomp_lookup_manual -> recomp_lookup would have returned. Anything else
+ * -- a miss, a kernel thunk, a table that was never published (an older
+ * generated dispatch, RECOMP_ICALL_FAST=0) -- takes the full chain, manual
+ * override first, out of line. */
+#if defined(__GNUC__) || defined(__clang__)
+#define RECOMP_HIDDEN __attribute__((visibility("hidden")))
+#define RECOMP_LIKELY(x) __builtin_expect(!!(x), 1)
+#else
+#define RECOMP_HIDDEN
+#define RECOMP_LIKELY(x) (x)
+#endif
+typedef void (*recomp_icall_fn_t)(void);   /* = recomp_func_t */
+extern RECOMP_HIDDEN recomp_icall_fn_t *g_recomp_flat;
+extern RECOMP_HIDDEN uint32_t g_recomp_flat_base, g_recomp_flat_span;
+void recomp_dispatch_publish(recomp_icall_fn_t *table, uint32_t base, uint32_t span);
+recomp_icall_fn_t recomp_icall_resolve_slow(uint32_t xbox_va);
+static inline recomp_icall_fn_t recomp_icall_resolve(uint32_t xbox_va)
+{
+    uint32_t off = xbox_va - g_recomp_flat_base;
+    if (RECOMP_LIKELY(off < g_recomp_flat_span)) {
+        recomp_icall_fn_t fn = g_recomp_flat[off];
+        if (RECOMP_LIKELY(fn != 0)) return fn;
+    }
+    return recomp_icall_resolve_slow(xbox_va);
+}
+
 /**
  * RECOMP_ICALL - Indirect call through the dispatch table.
  *
@@ -1292,17 +1336,13 @@ void xbox_GuestCpuPreempt(uint32_t va);
  */
 #define RECOMP_ICALL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_trace_idx++; \
-    g_icall_count++; \
+    RECOMP_ICALL_TRACE_RECORD(_va); \
     /* Skip garbage VAs outside code section + kernel thunk range */ \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
         g_esp += 4; eax = 0; break; \
     } \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    recomp_func_t _fn = recomp_icall_resolve(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
@@ -1319,16 +1359,12 @@ void xbox_GuestCpuPreempt(uint32_t va);
  */
 #define RECOMP_ICALL_SAFE(xbox_va, saved_esp) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_trace_idx++; \
-    g_icall_count++; \
+    RECOMP_ICALL_TRACE_RECORD(_va); \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
         g_esp = (saved_esp); eax = 0; break; \
     } \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    recomp_func_t _fn = recomp_icall_resolve(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
@@ -1339,16 +1375,12 @@ void xbox_GuestCpuPreempt(uint32_t va);
 #define RECOMP_ICALL_SAFE_CC(xbox_va, saved_esp) do { \
     (void)(saved_esp); \
     uint32_t _va = (uint32_t)(xbox_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_trace_idx++; \
-    g_icall_count++; \
+    RECOMP_ICALL_TRACE_RECORD(_va); \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
         g_esp += 4; eax = 0; break; \
     } \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    recomp_func_t _fn = recomp_icall_resolve(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
@@ -1365,17 +1397,13 @@ void xbox_GuestCpuPreempt(uint32_t va);
  */
 #define RECOMP_ICALL_SAFE_AT(xbox_va, saved_esp, site) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_trace_idx++; \
-    g_icall_count++; \
+    RECOMP_ICALL_TRACE_RECORD(_va); \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
         g_esp = (saved_esp); eax = 0; break; \
     } \
     RECOMP_ICALL_OBSERVE_SITE((site), _va); \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    recomp_func_t _fn = recomp_icall_resolve(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
@@ -1386,17 +1414,13 @@ void xbox_GuestCpuPreempt(uint32_t va);
 #define RECOMP_ICALL_SAFE_AT_CC(xbox_va, saved_esp, site) do { \
     (void)(saved_esp); \
     uint32_t _va = (uint32_t)(xbox_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_trace_idx++; \
-    g_icall_count++; \
+    RECOMP_ICALL_TRACE_RECORD(_va); \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
         g_esp += 4; eax = 0; break; \
     } \
     RECOMP_ICALL_OBSERVE_SITE((site), _va); \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    recomp_func_t _fn = recomp_icall_resolve(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
@@ -1412,9 +1436,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
  */
 #define RECOMP_ITAIL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    recomp_func_t _fn = recomp_icall_resolve(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \

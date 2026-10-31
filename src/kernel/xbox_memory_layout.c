@@ -2526,6 +2526,42 @@ volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
+/* The flat dispatch table as the indirect-call macros read it inline
+ * (recomp_icall_resolve). Empty until the generated recomp_dispatch_init
+ * publishes its table, so until then -- or for a title whose generated
+ * dispatch predates this -- every call takes recomp_icall_resolve_slow. */
+typedef void (*xbox_guest_fn)(void);
+xbox_guest_fn recomp_lookup(uint32_t xbox_va);
+xbox_guest_fn recomp_lookup_manual(uint32_t xbox_va);
+xbox_guest_fn recomp_lookup_kernel(uint32_t xbox_va);
+#if defined(__GNUC__) || defined(__clang__)
+#define XBOX_HIDDEN __attribute__((visibility("hidden")))
+#else
+#define XBOX_HIDDEN
+#endif
+XBOX_HIDDEN xbox_guest_fn *g_recomp_flat = NULL;
+XBOX_HIDDEN uint32_t g_recomp_flat_base = 0, g_recomp_flat_span = 0;
+
+void recomp_dispatch_publish(xbox_guest_fn *table, uint32_t base, uint32_t span)
+{
+    const char *e = getenv("RECOMP_ICALL_FAST");
+    if (e && *e == '0') {
+        fprintf(stderr, "[BOOT] indirect calls: full lookup (RECOMP_ICALL_FAST=0)\n");
+        return;
+    }
+    g_recomp_flat = table;
+    g_recomp_flat_base = base;
+    g_recomp_flat_span = table ? span : 0;
+}
+
+xbox_guest_fn recomp_icall_resolve_slow(uint32_t xbox_va)
+{
+    xbox_guest_fn fn = recomp_lookup_manual(xbox_va);
+    if (!fn) fn = recomp_lookup(xbox_va);
+    if (!fn) fn = recomp_lookup_kernel(xbox_va);
+    return fn;
+}
+
 static void xbox_heap_reset_base(void);
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
