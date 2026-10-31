@@ -41,6 +41,7 @@
 #include "nv2a_vsh_interp.h"
 #include "nv2a_combiner.h"
 #include "nv2a_backend.h"
+#include "nv2a_check_span.h"
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -3705,7 +3706,69 @@ static int raw_check_snapshot(Nv2aRawGeometry *g)
     return 1;
 }
 
-static void raw_check(const Nv2aRawGeometry *g, const float *gpu)
+/* Bounded cumulative samples per surface/kind. Called only after a valid
+ * GPU capture and a complete CPU transform of the immutable input snapshot.
+ * Counts are indexed vertex references (duplicates included), not unique
+ * mesh vertices, and describe sampled batches rather than the whole scene. */
+static void raw_check_span(const Nv2aRawGeometry *g, const Nv2aSurface *surf)
+{
+    static struct {
+        uint32_t va, kind, width, height, batches;
+        float aa_x, aa_y;
+        Nv2aCheckSpan span;
+    } table[16];
+    static unsigned entries;
+    static unsigned char code[65536];
+    unsigned slot, i;
+    float ax = g->aa_sx > 0 ? g->aa_sx : 1;
+    float ay = g->aa_sy > 0 ? g->aa_sy : 1;
+    float width = surf->width / ax, height = surf->height / ay;
+    Nv2aCheckSpan *span;
+    for (slot = 0; slot < entries; slot++)
+        if (table[slot].va == surf->color_va && table[slot].kind == g->kind
+            && table[slot].width == surf->width && table[slot].height == surf->height
+            && table[slot].aa_x == ax && table[slot].aa_y == ay)
+            break;
+    if (slot == entries) {
+        if (entries == 16) return;
+        entries++;
+        table[slot].va = surf->color_va;
+        table[slot].kind = g->kind;
+        table[slot].width = surf->width;
+        table[slot].height = surf->height;
+        table[slot].aa_x = ax;
+        table[slot].aa_y = ay;
+    }
+    span = &table[slot].span;
+    memset(code, 16, sizeof code);
+    for (i = 0; i < s_gpu.idx_count; i++) {
+        const float *p = s_xf[i].pos;
+        float logical[4] = {p[0] / ax, p[1] / ay, p[2], p[3]};
+        uint32_t index = s_gpu.idx[i] - g->min_index;
+        nv2a_check_span_vertex(span, logical, width, height);
+        if (index < 65536)
+            code[index] = (unsigned char)nv2a_check_outcode(logical, width, height);
+    }
+    for (i = 0; i + 2 < g->index_count; i += g->prim == 5 ? 3 : 1) {
+        unsigned a = g->prim == 7 ? 0 : i;
+        nv2a_check_span_triangle(span, code[g->indices[a]],
+                                 code[g->indices[i + 1]], code[g->indices[i + 2]]);
+    }
+    table[slot].batches++;
+    if (table[slot].batches & (table[slot].batches - 1)) return;
+    fprintf(stderr, "[XFSPAN] target %08X kind %s logical %.0fx%.0f sampled-batches %u"
+            " refs %llu invalid %llu nonforward %llu positive %llu clip-w %.9g..%.9g"
+            " w>2000 %llu xy-outside %llu triangles inside/outside/crossing/invalid %llu/%llu/%llu/%llu\n",
+            surf->color_va, g->kind == NV2A_RAW_PROGRAM ? "VP" : "FFP", width, height,
+            table[slot].batches, (unsigned long long)span->refs,
+            (unsigned long long)span->invalid, (unsigned long long)span->nonforward,
+            (unsigned long long)span->positive, span->wmin, span->wmax,
+            (unsigned long long)span->over2000, (unsigned long long)span->outside,
+            (unsigned long long)span->tri_inside, (unsigned long long)span->tri_outside,
+            (unsigned long long)span->tri_crossing, (unsigned long long)span->tri_invalid);
+}
+
+static void raw_check(const Nv2aRawGeometry *g, const Nv2aSurface *surf, const float *gpu)
 {
     static int logged_batches;
     uint32_t i, k, bad = 0;
@@ -3730,6 +3793,7 @@ static void raw_check(const Nv2aRawGeometry *g, const float *gpu)
             return;
         }
     s_check_geometry = NULL;
+    raw_check_span(g, surf);
     for (i = 0; i < s_gpu.idx_count; i++) {
         const Nv2aVshOutput *c = &s_xf[i];
         const float *o = gpu + (size_t)(s_gpu.idx[i] - g->min_index) * NV2A_RAW_CHECK_FLOATS;
@@ -3986,7 +4050,7 @@ static int try_draw_raw(void)
         return 0;
     }
     if (check)
-        raw_check(&g, check_buf);
+        raw_check(&g, &surf, check_buf);
     s_raw.ff_batches++;
     s_raw.ff_tris += tris;
     s_raw.ff_verts += hi - lo + 1;
@@ -4219,7 +4283,7 @@ static int try_draw_raw_vp(void)
         return 0;
     }
     if (check)
-        raw_check(&g, check_buf);
+        raw_check(&g, &surf, check_buf);
     if (g.w0 == 1.0f)
         s_raw.vp2d_batches++;
     s_raw.vp_batches++;
