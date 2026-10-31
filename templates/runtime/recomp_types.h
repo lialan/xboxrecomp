@@ -724,15 +724,38 @@ void recomp_trace_esp(const char *name, const char *tag);
  * in most runs under load that way, its sound engine and game threads
  * handing work through memory.
  *
- * On arm64 the accesses are atomic instead: a load is a load-acquire (LDAR)
- * and a store a store-release (STLR), which keeps every order x86 keeps and
- * a little more. Lifted code makes only plain loads and stores of these
+ * On arm64 the accesses are atomic instead: a load is LDAR and a store
+ * STLR, which together are sequentially consistent -- stronger than x86's
+ * TSO, and that is needed: the console has one CPU, so its threads never saw
+ * even TSO's one reordering (a store passing a later load), and VC3 leans on
+ * that too (below). Lifted code makes only plain loads and stores of these
  * (never a compound assignment), so nothing becomes a read-modify-write.
- * LDAR/STLR fault where LDR/STR did not -- on a misaligned address (one
- * that crosses 16 bytes, with FEAT_LSE2) -- and on a trapped device page;
- * the POSIX fault path does both (mmio_decode_a64.h). x86-64 hosts are TSO
- * already and keep the plain accesses. -DRECOMP_GUEST_MEM_ORDERED=0 turns
- * it off. */
+ * The ordered forms fault where LDR/STR did not -- on a misaligned address
+ * (one that crosses 16 bytes, with FEAT_LSE2) -- and on a trapped device
+ * page; the POSIX fault path does both (mmio_decode_a64.h). x86-64 hosts
+ * are TSO already and keep the plain accesses. -DRECOMP_GUEST_MEM_ORDERED=0
+ * turns it off.
+ *
+ * Code lifted with --ordered-mem (RECOMP_MEM_SPLIT, which the lifter
+ * defines in each file) spells loads MEMn(a) and stores STn(a, v), and the
+ * accesses through esp (or a frame's ebp) MEMn_STK / STn_STK
+ * (tools/recomp/mem_order.py), so each kind can be relaxed on its own.
+ * Both relaxations were tried on VC3 and neither holds, so by default the
+ * split compiles to exactly what the _Atomic lvalue does:
+ *  - RECOMP_MEM_LOAD_ORDER=__ATOMIC_ACQUIRE: loads LDAPR (RCpc, x86's TSO
+ *    exactly) -- the attract stalled again, 3 runs in 9;
+ *  - RECOMP_MEM_STACK_PLAIN=1: the stack accesses plain LDR/STR -- stalled,
+ *    3 in 10 (a thread keeps what it waits on in its locals: an I/O status
+ *    block, a completion flag, a timer, and another thread writes them).
+ * Cost, VC3's game thread on an M4 Pro (ms of CPU a second, regression
+ * run, interleaved): 89 plain, 106 ordered. Of the 17, the loads are most
+ * (93 with plain loads), the stores the rest (99 with plain stores); plain
+ * stack accesses gave back 4 (102), LDAPR nothing measurable, and "dmb
+ * ishst; str" for the stores was dearer than STLR (104).
+ *
+ * Without the split -- everything else that includes this header (the
+ * runtime, a game's hand-written replacements), and code lifted without
+ * --ordered-mem -- MEMn is an _Atomic lvalue: LDAR and STLR. */
 #ifndef RECOMP_GUEST_MEM_ORDERED
 #  if defined(__aarch64__) && !defined(_MSC_VER)
 #    define RECOMP_GUEST_MEM_ORDERED 1
@@ -740,7 +763,21 @@ void recomp_trace_esp(const char *name, const char *tag);
 #    define RECOMP_GUEST_MEM_ORDERED 0
 #  endif
 #endif
-#if RECOMP_GUEST_MEM_ORDERED
+#if RECOMP_GUEST_MEM_ORDERED && defined(RECOMP_MEM_SPLIT)
+/* LDAR by default; __ATOMIC_ACQUIRE gives LDAPR (TSO), see above. */
+#ifndef RECOMP_MEM_LOAD_ORDER
+#define RECOMP_MEM_LOAD_ORDER __ATOMIC_SEQ_CST
+#endif
+#define MEM8(addr)   ((uint8_t)__atomic_load_n((volatile uint8_t *)XBOX_PTR(addr), RECOMP_MEM_LOAD_ORDER))
+#define MEM16(addr)  ((uint16_t)__atomic_load_n((volatile uint16_t *)XBOX_PTR(addr), RECOMP_MEM_LOAD_ORDER))
+#define MEM32(addr)  ((uint32_t)__atomic_load_n((volatile uint32_t *)XBOX_PTR(addr), RECOMP_MEM_LOAD_ORDER))
+#define SMEM8(addr)  ((int8_t)__atomic_load_n((volatile int8_t *)XBOX_PTR(addr), RECOMP_MEM_LOAD_ORDER))
+#define SMEM16(addr) ((int16_t)__atomic_load_n((volatile int16_t *)XBOX_PTR(addr), RECOMP_MEM_LOAD_ORDER))
+#define SMEM32(addr) ((int32_t)__atomic_load_n((volatile int32_t *)XBOX_PTR(addr), RECOMP_MEM_LOAD_ORDER))
+#define ST8(addr, v)  __atomic_store_n((volatile uint8_t *)XBOX_PTR(addr), (uint8_t)(v), __ATOMIC_RELEASE)
+#define ST16(addr, v) __atomic_store_n((volatile uint16_t *)XBOX_PTR(addr), (uint16_t)(v), __ATOMIC_RELEASE)
+#define ST32(addr, v) __atomic_store_n((volatile uint32_t *)XBOX_PTR(addr), (uint32_t)(v), __ATOMIC_RELEASE)
+#elif RECOMP_GUEST_MEM_ORDERED
 #define MEM8(addr)   (*(_Atomic volatile uint8_t  *)XBOX_PTR(addr))
 #define MEM16(addr)  (*(_Atomic volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(_Atomic volatile uint32_t *)XBOX_PTR(addr))
@@ -758,6 +795,41 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
 #endif
 #define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
+
+/* Stores as a statement (lifted with --ordered-mem); without the split, an
+ * assignment to the lvalue above. */
+#if !(RECOMP_GUEST_MEM_ORDERED && defined(RECOMP_MEM_SPLIT))
+#define ST8(addr, v)  ((void)(MEM8(addr) = (uint8_t)(v)))
+#define ST16(addr, v) ((void)(MEM16(addr) = (uint16_t)(v)))
+#define ST32(addr, v) ((void)(MEM32(addr) = (uint32_t)(v)))
+#endif
+
+/* The stack accesses: ordered like the rest unless RECOMP_MEM_STACK_PLAIN
+ * (see above: it does not hold). */
+#ifndef RECOMP_MEM_STACK_PLAIN
+#define RECOMP_MEM_STACK_PLAIN 0
+#endif
+#if RECOMP_MEM_STACK_PLAIN
+#define MEM8_STK(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
+#define MEM16_STK(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
+#define MEM32_STK(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
+#define SMEM8_STK(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
+#define SMEM16_STK(addr) (*(volatile int16_t  *)XBOX_PTR(addr))
+#define SMEM32_STK(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
+#define ST8_STK(addr, v)  ((void)(MEM8_STK(addr) = (uint8_t)(v)))
+#define ST16_STK(addr, v) ((void)(MEM16_STK(addr) = (uint16_t)(v)))
+#define ST32_STK(addr, v) ((void)(MEM32_STK(addr) = (uint32_t)(v)))
+#else
+#define MEM8_STK(addr)   MEM8(addr)
+#define MEM16_STK(addr)  MEM16(addr)
+#define MEM32_STK(addr)  MEM32(addr)
+#define SMEM8_STK(addr)  SMEM8(addr)
+#define SMEM16_STK(addr) SMEM16(addr)
+#define SMEM32_STK(addr) SMEM32(addr)
+#define ST8_STK(addr, v)  ST8(addr, v)
+#define ST16_STK(addr, v) ST16(addr, v)
+#define ST32_STK(addr, v) ST32(addr, v)
+#endif
 
 /** Float/double memory access. */
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
@@ -827,8 +899,8 @@ static inline RecompXmm XMM_MEM(uint32_t addr) {
 }
 
 static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
-    MEM32(addr)      = v.u[0]; MEM32(addr + 4)  = v.u[1];
-    MEM32(addr + 8)  = v.u[2]; MEM32(addr + 12) = v.u[3];
+    ST32(addr, v.u[0]);     ST32(addr + 4, v.u[1]);
+    ST32(addr + 8, v.u[2]); ST32(addr + 12, v.u[3]);
 }
 
 /* movlps/movhps move 8 bytes into or out of one half, leaving the
@@ -846,8 +918,8 @@ static inline void recomp_xmm_load_half(RecompXmm *dst, uint32_t addr,
 
 static inline void recomp_xmm_store_half(uint32_t addr, RecompXmm src,
                                          int high) {
-    MEM32(addr)     = src.u[high * 2];
-    MEM32(addr + 4) = src.u[high * 2 + 1];
+    ST32(addr, src.u[high * 2]);
+    ST32(addr + 4, src.u[high * 2 + 1]);
 }
 
 /** movlhps: dst high = src low. */
@@ -1144,7 +1216,7 @@ static inline uint16_t ROR16(uint16_t val, int n) {
 #define PUSH32(sp, val) do { \
     uint32_t _pv = (uint32_t)(val); \
     (sp) -= 4; \
-    MEM32(sp) = _pv; \
+    ST32_STK(sp, _pv); \
 } while(0)
 
 /**
@@ -1169,7 +1241,7 @@ static inline int recomp_parity8(uint32_t x) {
  * stack and later pops read the wrong slots.
  */
 #define POP32(sp, dst) do { \
-    uint32_t _pv = MEM32(sp); \
+    uint32_t _pv = MEM32_STK(sp); \
     (sp) += 4; \
     (dst) = _pv; \
 } while(0)

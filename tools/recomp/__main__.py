@@ -284,6 +284,14 @@ def main():
                              "a loop that makes no kernel call; it costs a "
                              "load and a branch per edge when the lock is "
                              "off. Off by default: edges stay bare")
+    parser.add_argument("--ordered-mem", action="store_true",
+                        help="Spell each guest memory access by kind: loads "
+                             "MEMn(), stores STn(), those through esp or a "
+                             "frame's ebp MEMn_STK()/STn_STK() "
+                             "(mem_order.py, RECOMP_MEM_SPLIT), so that "
+                             "recomp_types.h can relax one kind of arm64 "
+                             "ordering on its own. By default every kind "
+                             "stays ordered (LDAR/STLR), as without it")
     parser.add_argument("--reg-cache", action="store_true",
                         help="Hold the general-purpose guest registers a "
                              "function uses (eax..edi, esp) in C locals, "
@@ -373,6 +381,7 @@ def main():
         back_edge_yield=args.back_edge_yield,
         entry_stubs=args.entry_stubs,
         reg_cache=args.reg_cache,
+        ordered_mem=args.ordered_mem,
     )
 
     t_load = time.time() - t0

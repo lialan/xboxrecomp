@@ -472,6 +472,7 @@ def _mark_back_edges(bb, stmts):
 
 
 from .reg_cache import reg_cache_function as _reg_cache_function
+from .mem_order import mem_order_function as _mem_order_function
 
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
@@ -532,6 +533,8 @@ class FunctionTranslator:
         # (RECOMP_BACK_EDGE), with --back-edge-yield; off, edges stay bare.
         self.back_edge_yield = False
         self.reg_cache = False
+        # --ordered-mem: ordered (STn/MEMn) and stack (_STK) accesses apart.
+        self.ordered_mem = False
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover callbacks and the gap entries their bodies reference."""
@@ -3183,6 +3186,8 @@ class FunctionTranslator:
         lines.append(f"")
 
         code = "\n".join(lines)
+        if self.ordered_mem:
+            code = _mem_order_function(code, self._func_owns_a_frame(instructions))
         if self.reg_cache:
             code = _reg_cache_function(code)
         return code
@@ -3233,7 +3238,7 @@ class BatchTranslator:
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
                  icall_sites_json_path=None, back_edge_yield=False,
-                 entry_stubs=False, reg_cache=False):
+                 entry_stubs=False, reg_cache=False, ordered_mem=False):
         """back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
         (--back-edge-yield; off by default). entry_stubs: an unresolved
         target inside a function enters a copy of it (--entry-stubs)."""
@@ -3241,6 +3246,7 @@ class BatchTranslator:
         self.back_edge_yield = back_edge_yield
         self.entry_stubs = entry_stubs
         self.reg_cache = reg_cache
+        self.ordered_mem = ordered_mem
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
         self.icall_sites = {}
@@ -3302,6 +3308,7 @@ class BatchTranslator:
             force_returns=force_returns, icall_sites=self.icall_sites)
         self.translator.back_edge_yield = self.back_edge_yield
         self.translator.reg_cache = self.reg_cache
+        self.translator.ordered_mem = self.ordered_mem
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         for explicit_helper in (seh_prolog, seh_epilog):
@@ -3720,6 +3727,8 @@ class BatchTranslator:
                 " */",
                 "",
                 "#define RECOMP_GENERATED_CODE",
+            ] + (["#define RECOMP_MEM_SPLIT 1   /* --ordered-mem (mem_order.py) */"]
+                 if self.ordered_mem else []) + [
                 f'#include "{header_name}"',
                 '#include <math.h>',
                 "",
