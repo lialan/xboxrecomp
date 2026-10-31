@@ -1732,6 +1732,35 @@ static int voice_list_of(MCPXAPUState *d, uint16_t v)
     return 0;
 }
 
+/* RECOMP_STALL_DUMP's view of the voice processor: the front end and
+ * interrupt registers and every voice on the three lists -- state, offsets,
+ * format -- unlocked, a snapshot for a stalled run. */
+void mcpx_apu_vp_dump(MCPXAPUState *d)
+{
+    fprintf(stderr, "[STALL] APU ISTS %08X IEN %08X FECTL %08X FETFORCE1 %08X FEDECMETH %08X"
+            " FEDECPARAM %08X SECTL %08X\n", d->regs[NV_PAPU_ISTS], d->regs[NV_PAPU_IEN],
+            d->regs[NV_PAPU_FECTL], d->regs[NV_PAPU_FETFORCE1], d->regs[NV_PAPU_FEDECMETH],
+            d->regs[NV_PAPU_FEDECPARAM], d->regs[NV_PAPU_SECTL]);
+    for (int list = 0; list < 3; list++) {
+        uint32_t v = d->regs[voice_list_regs[list].top];
+        for (int i = 0; v != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
+            uint16_t h = (uint16_t)v;
+            fprintf(stderr, "[STALL] APU list %d voice %u state %08X cbo %06X ebo %06X"
+                    " lbo %06X fmt %08X ba %06X\n", list, v,
+                    voice_get_mask(d, h, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFFu),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_CUR_PSH_SAMPLE,
+                                   NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu),
+                    voice_get_mask(d, h, NV_PAVS_VOICE_CUR_PSL_START,
+                                   NV_PAVS_VOICE_CUR_PSL_START_BA));
+            v = voice_get_mask(d, h, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        }
+    }
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -1765,6 +1794,14 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             uint16_t v = (uint16_t)d->regs[current];
             vlog_len[list]++;
+            if (s_vlog_on > 0 && s_vlog_frame % 1500 == 0)
+                VLOG("frame %u:   list %d voice %u state %08X cbo %06X ebo %06X fmt %08X"
+                     " lbo %06X", s_vlog_frame, list, (unsigned)v,
+                     voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFFu),
+                     voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                     voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+                     voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu),
+                     voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSH_SAMPLE, NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO));
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
 

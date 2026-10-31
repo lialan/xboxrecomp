@@ -1114,6 +1114,14 @@ static void se_frame(MCPXAPUState *d)
 
 ApuIrqStats apu_irq_stats;
 
+/* RECOMP_STALL_DUMP's view of the APU (kernel_bridge.c calls it). */
+static void apu_stall_dump(void)
+{
+    MCPXAPUState *d = g_state;
+    if (d)
+        mcpx_apu_vp_dump(d);
+}
+
 /* Every 5 s under RECOMP_APU_TRACE: front-end traps, the running count of
  * VP/DSP frames (se_frame), the frames that found FECTL trapped, and the
  * device underruns. Trapped frames climbing while se_frames stands still is
@@ -1337,6 +1345,10 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
 
     g_apu_ram_ptr = ram_ptr;
     g_state = d;
+    {
+        extern void (*g_stall_dump_hook)(void);
+        g_stall_dump_hook = apu_stall_dump;
+    }
     d->ram_ptr = ram_ptr;
     /* A line left up by a previous instance would call the guest ISR
      * against this one's empty ISTS. */

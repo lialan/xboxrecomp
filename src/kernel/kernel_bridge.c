@@ -10909,7 +10909,46 @@ typedef struct {
 } StallRec;
 static StallRec s_stall[STALL_THREADS];
 static int s_stall_on = -1;
+/* RECOMP_KCALL_LOG=<s>: every <s> seconds, per guest thread, the kernel
+ * calls it made in that period by ordinal and caller, the busiest first --
+ * what each thread is doing, to set a stalled run beside a healthy one at
+ * the same moment. Rides on the stall records. */
+#define KCALL_SLOTS 24
+typedef struct { uint32_t ordinal, caller, n; } KcallRec;
+static KcallRec s_kcall[STALL_THREADS][KCALL_SLOTS];
+static int s_kcall_secs;
+static DWORD WINAPI kcall_reporter(LPVOID arg)
+{
+    unsigned period = 0;
+    (void)arg;
+    for (;;) {
+        int i, j, k;
+        Sleep((DWORD)s_kcall_secs * 1000);
+        period++;
+        for (i = 0; i < STALL_THREADS; i++) {
+            KcallRec snap[KCALL_SLOTS];
+            if (!s_stall[i].used)
+                continue;
+            memcpy(snap, s_kcall[i], sizeof snap);
+            memset(s_kcall[i], 0, sizeof snap);
+            for (j = 0; j < KCALL_SLOTS; j++)           /* busiest first */
+                for (k = j + 1; k < KCALL_SLOTS; k++)
+                    if (snap[k].n > snap[j].n) {
+                        KcallRec t = snap[j]; snap[j] = snap[k]; snap[k] = t;
+                    }
+            fprintf(stderr, "[KCALL] %us t%-2d", period * s_kcall_secs, i);
+            for (j = 0; j < KCALL_SLOTS && snap[j].n; j++)
+                fprintf(stderr, " %u@%08X x%u", snap[j].ordinal, snap[j].caller, snap[j].n);
+            fprintf(stderr, "%s\n", snap[0].n ? "" : " (none)");
+        }
+        fflush(stderr);
+    }
+    return 0;
+}
 static RECOMP_TLS int s_stall_slot = -1;
+
+/* A device model's own state for the dump (the APU sets it). */
+void (*g_stall_dump_hook)(void);
 
 static void stall_dump(void)
 {
@@ -10917,6 +10956,19 @@ static void stall_dump(void)
     int i;
     fprintf(stderr, "[STALL] thread dump (%llu calls total)\n",
             (unsigned long long)g_kernel_call_count);
+    {   /* RECOMP_STALL_PEEK=<ptr>:<off>[,...]: the dword at *(ptr) + off */
+        const char *pk = getenv("RECOMP_STALL_PEEK");
+        while (pk && *pk) {
+            char *end;
+            uint32_t ptr = (uint32_t)strtoul(pk, &end, 0), off = 0, base;
+            if (*end == ':')
+                off = (uint32_t)strtoul(end + 1, &end, 0);
+            base = BRIDGE_MEM32(ptr);
+            fprintf(stderr, "[STALL] peek *(%08X)=%08X +%X: %08X\n", ptr, base, off,
+                    base ? BRIDGE_MEM32(base + off) : 0);
+            pk = *end == ',' ? end + 1 : NULL;
+        }
+    }
     for (i = 0; i < STALL_THREADS; i++) {
         const StallRec *r = &s_stall[i];
         uint32_t k, shown = 0;
@@ -10937,6 +10989,19 @@ static void stall_dump(void)
         }
         fprintf(stderr, "\n");
     }
+    {   /* the kernel timers armed, and the DPC queue */
+        long long now_ms = kernel_timer_clock_ms();
+        LONG q;
+        for (i = 0; i < XBOX_MAX_TIMERS; i++)
+            if (g_timers[i].timer_va)
+                fprintf(stderr, "[STALL] timer %08X dpc %08X due in %lld ms period %ld\n",
+                        g_timers[i].timer_va, g_timers[i].dpc_va,
+                        g_timers[i].due_ms - now_ms, g_timers[i].period_ms);
+        for (q = g_dpc_head; q != g_dpc_tail; q = (q + 1) % XBOX_MAX_PENDING_DPC)
+            fprintf(stderr, "[STALL] DPC queued %08X\n", g_dpc_queue[q].dpc);
+    }
+    if (g_stall_dump_hook)
+        g_stall_dump_hook();
     fflush(stderr);
 }
 
@@ -10970,6 +11035,18 @@ static void stall_enter(uint32_t ordinal, uint32_t esp_args)
                 CloseHandle(th);
         }
         s_stall_on = e && *e;
+        {
+            const char *kc = getenv("RECOMP_KCALL_LOG");
+            static volatile int kstarting;
+            if (kc && atoi(kc) > 0 && __sync_bool_compare_and_swap(&kstarting, 0, 1)) {
+                HANDLE th;
+                s_kcall_secs = atoi(kc);
+                th = CreateThread(NULL, 0, kcall_reporter, NULL, 0, NULL);
+                if (th)
+                    CloseHandle(th);
+                s_stall_on = 1;
+            }
+        }
     }
     if (!s_stall_on)
         return;
@@ -10992,6 +11069,17 @@ static void stall_enter(uint32_t ordinal, uint32_t esp_args)
     r->t_enter = xbox_HostNowNs();
     r->calls++;
     r->in_call = 1;
+    if (s_kcall_secs) {
+        KcallRec *t = s_kcall[s_stall_slot];
+        for (k = 0; k < KCALL_SLOTS; k++) {
+            if (t[k].n && (t[k].ordinal != ordinal || t[k].caller != r->caller))
+                continue;
+            t[k].ordinal = ordinal;           /* racy with the reporter: a count off */
+            t[k].caller = r->caller;
+            t[k].n++;
+            break;
+        }
+    }
 }
 
 static void stall_leave(void)
