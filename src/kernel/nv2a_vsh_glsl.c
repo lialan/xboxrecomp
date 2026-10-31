@@ -4,7 +4,9 @@
  *
  *     void nv2a_vsh(in vec4 v[16], out vec4 oPos, out vec4 O[13])
  *
- * reading constants from `uniform vec4 u_vc[192]`, that computes exactly what
+ * reading constants from u_vc[192] -- a uniform block, VshConst (std140),
+ * so a back end binds the constants for every program at once and sends
+ * them as a buffer range, not 192 uniforms a draw -- that computes exactly what
  * nv2a_vsh_run (nv2a_vsh_interp.c) computes: the same field decoding, the
  * same order of reads and writes within an instruction (all three sources
  * read before either unit writes; the ILU's temp write goes to R1 whenever a
@@ -96,7 +98,7 @@ static void write_masked(Buf *b, const char *dst, const char *val, uint32_t mask
 const char *nv2a_vsh_glsl_helpers(void)
 {
     return
-        "uniform vec4 u_vc[192];\n"
+        "layout(std140) uniform VshConst { vec4 u_vc[192]; };\n"
         "int a0;\n"
         "vec4 vc_rel(int i) { return (i < 0 || i >= 192) ? u_vc[0] : u_vc[i]; }\n"
         "float vsh_inf(bool neg) { return uintBitsToFloat(neg ? 0xff800000u : 0x7f800000u); }\n"

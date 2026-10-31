@@ -14,7 +14,10 @@
  *     state, textures, combiners, the fixed-function state, the CPU path's
  *     vertices, the index list, the program and its constants, an inline
  *     batch's payload, and the batch's extent (computed now, for the batches
- *     a back end may ask it of);
+ *     a back end may ask it of). Of the 192 constants (3 KB, most of a
+ *     program draw's record) only the run that changed since the last
+ *     program draw recorded is copied; the submission thread applies it to
+ *     its own copy, which the draw it replays then points at;
  *   - not guest memory (vertex streams, textures). The title reuses those
  *     only after the GPU has said it is done with them -- GET, the semaphore
  *     its fences read, the kick-off latch, a visibility report -- and none of
@@ -87,7 +90,14 @@ typedef struct {
     Nv2aRawExtent ext;
     int ext_ok;
     int *result;                  /* draw_raw's answer, for a synchronous one */
+    uint32_t c_lo, c_n;           /* constants c_lo..c_lo+c_n-1 at c_data (c_n 0: none) */
+    const uint8_t *c_data;
 } DrawRec;
+
+/* The constants as last recorded (executor thread) and as replayed so far
+ * (submission thread): a record carries the run that differs. */
+static float s_rec_const[192][4], s_rep_const[192][4];
+static int s_rec_const_ok;
 
 typedef struct {
     RecHdr h;
@@ -191,6 +201,8 @@ static void replay(RecHdr *h)
     case REC_DRAW:
     case REC_DRAW_RAW: {
         DrawRec *d = (DrawRec *)h;
+        if (d->c_n)                  /* the constants that changed, in order */
+            memcpy(s_rep_const[d->c_lo], d->c_data, d->c_n * 16u);
         delay_stand_in(s_gl_us);
         if (h->type == REC_DRAW) {
             if (s_real->draw)
@@ -385,6 +397,7 @@ static DrawRec *record_draw(const Nv2aSurface *s, const Nv2aBatch *b, int raw)
     const Nv2aRawGeometry *g = b->raw;   /* also on a draw(): a back end may look at it */
     uint32_t size = align(sizeof(DrawRec)), off, i;
     uint32_t vbytes = 0, xbytes = 0, ibytes = 0, cbytes = 0, pbytes = 0, abytes[16];
+    uint32_t c_lo = 0, c_n = 0;
     DrawRec *d;
     uint8_t *p;
 
@@ -398,8 +411,22 @@ static DrawRec *record_draw(const Nv2aSurface *s, const Nv2aBatch *b, int raw)
             abytes[i] = align(attr_copy_bytes(&g->attr[i]));
         if (g->kind == NV2A_RAW_PROGRAM) {
             s_st.prog++;
-            if (g->constants)
-                cbytes = align(192u * 16u);
+            if (g->constants) {
+                uint32_t lo = 0, hi = 191;
+                if (s_rec_const_ok) {
+                    while (lo < 192 && !memcmp(g->constants[lo], s_rec_const[lo], 16))
+                        lo++;
+                    while (hi > lo && !memcmp(g->constants[hi], s_rec_const[hi], 16))
+                        hi--;
+                }
+                c_lo = lo;
+                c_n = lo < 192 ? hi - lo + 1 : 0;
+                if (c_n) {
+                    memcpy(s_rec_const[lo], g->constants[lo], c_n * 16u);
+                    s_rec_const_ok = 1;
+                }
+                cbytes = align(c_n * 16u);
+            }
             if (g->program)
                 pbytes = align((g->program_start + g->program_len) * 16u);
         }
@@ -416,6 +443,8 @@ static DrawRec *record_draw(const Nv2aSurface *s, const Nv2aBatch *b, int raw)
     d->b = *b;
     d->result = NULL;
     d->ext_ok = 0;
+    d->c_lo = c_lo;
+    d->c_n = c_n;
     if (b->texture) {
         d->tex = *b->texture;
         d->b.texture = &d->tex;
@@ -464,10 +493,12 @@ static DrawRec *record_draw(const Nv2aSurface *s, const Nv2aBatch *b, int raw)
                 off += abytes[i];
             }
         if (cbytes) {
-            memcpy(p + off, g->constants, 192u * 16u);
-            d->g.constants = (const float (*)[4])(p + off);
+            memcpy(p + off, g->constants[c_lo], c_n * 16u);
+            d->c_data = p + off;
             off += cbytes;
         }
+        if (g->constants)                /* replay: the submission thread's copy */
+            d->g.constants = (const float (*)[4])s_rep_const;
         if (pbytes) {
             memcpy(p + off, g->program, (g->program_start + g->program_len) * 16u);
             d->g.program = (const uint32_t (*)[4])(p + off);
