@@ -160,7 +160,15 @@ typedef struct {
     uint32_t has_normal, has_color;   /* 0: no normal stream / white diffuse */
 } Nv2aFixedState;
 
+/* Where a batch's vertices land, as the CPU path's Nv2aVertex would hold
+ * them: x and y in surface pixels, u and v as Nv2aVertex.u/v (stage 0, in
+ * texels for a swizzled or compressed texture). */
 typedef struct {
+    float x0, x1, y0, y1;
+    float u0, u1, v0, v1;
+} Nv2aRawExtent;
+
+typedef struct Nv2aRawGeometry {
     /* NV_PRIM_TRIANGLES (5), _TRIANGLE_STRIP (6) or _TRIANGLE_FAN (7); quads
      * arrive already split into triangles, points and lines never. */
     uint32_t prim;
@@ -183,6 +191,16 @@ typedef struct {
     const float (*constants)[4];
     uint32_t const_gen;
     float w0;
+    /* A screen-space program batch (w0 = 1: HUD, sprites, copies, the E.S.
+     * distortion meshes) is drawn by the back end too, but some of its
+     * choices look at where the vertices land: a full-screen copy of a
+     * render target, the immersive HUD panel, 16:9 HUD placement. d0 is the
+     * first vertex's diffuse packed as Nv2aVertex.diffuse; extent(), when
+     * set, transforms the batch's vertices on the CPU (once a batch, at the
+     * first call: only a batch that needs it pays) and returns 0 if it
+     * cannot. */
+    uint32_t d0;
+    int (*extent)(const struct Nv2aRawGeometry *g, Nv2aRawExtent *out);
     /* Screen space: surface pixels = (clip.xy / w + c59.xy) * aa. */
     float aa_sx, aa_sy;
     float vp_off_z;               /* c59.z: the near plane is z = vp_off_z */

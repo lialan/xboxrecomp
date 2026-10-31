@@ -784,8 +784,8 @@ static const Nv2aBackend *s_backend;
  * off the CPU next; guessing had it at texture hashing. */
 static struct {
     int on;
-    uint64_t start, ff, vp, clip, draw, raw, flip, batch;
-    uint32_t ff_n, vp_n, raw_n, draw_n;
+    uint64_t start, ff, vp, clip, draw, raw, flip, batch, ext;
+    uint32_t ff_n, vp_n, raw_n, draw_n, ext_n;
 } s_prof = { .on = -1 };
 
 static int prof_on(void)
@@ -807,10 +807,12 @@ static void prof_flip(void)
     if (dt < 1000000000ull)
         return;
     fprintf(stderr, "[PROF] %.2f s: batches %.0f ms | FF xf %.0f ms (%u) | VP xf %.0f ms (%u)"
-            " | clip+expand %.0f ms | draw %.0f ms (%u) | raw %.0f ms (%u) | flip %.0f ms\n",
+            " | clip+expand %.0f ms | draw %.0f ms (%u) | raw %.0f ms (%u) | flip %.0f ms"
+            " | VP extent %.1f ms (%u)\n",
             dt / 1e9, s_prof.batch / 1e6, s_prof.ff / 1e6, s_prof.ff_n,
             s_prof.vp / 1e6, s_prof.vp_n, s_prof.clip / 1e6, s_prof.draw / 1e6,
-            s_prof.draw_n, s_prof.raw / 1e6, s_prof.raw_n, s_prof.flip / 1e6);
+            s_prof.draw_n, s_prof.raw / 1e6, s_prof.raw_n, s_prof.flip / 1e6,
+            s_prof.ext / 1e6, s_prof.ext_n);
     memset(&s_prof, 0, sizeof s_prof);
     s_prof.on = 1;
     s_prof.start = now;
@@ -3437,6 +3439,10 @@ static const char *const k_raw_decline[RAW_D_N] = {
 static struct {
     uint32_t ff_batches, ff_tris, ff_verts, cpu_batches;
     uint32_t vp_batches, vp_tris, vp_verts, vp_cpu_batches;
+    uint32_t vp2d_batches, ext_batches, ext_verts;  /* screen-space ones; extent() */
+    uint32_t vp_check_2d, vp_check_behind;  /* checked: w0 = 1, w0 <= 0 */
+    float vp_worst[3], vp_worst_at[3];  /* failing: largest |diff| (and |value|) of
+                                           position, colour/fog, texture coordinate */
     uint32_t vp_checked, vp_check_verts, vp_mismatch_batches, vp_mismatch_verts;
     uint32_t declined[RAW_D_N];
     /* RECOMP_GPU_XF_CHECK */
@@ -3659,6 +3665,19 @@ static void raw_check(const Nv2aRawGeometry *g, const float *gpu)
         if (ok)
             continue;
         bad++;
+        if (g->kind == NV2A_RAW_PROGRAM)      /* the worst failing output, per kind */
+            for (k = 0; k < NV2A_RAW_CHECK_FLOATS; k++) {
+                int pass = k < 4 ? (fabsf(want[3]) < 1e-2f || fabsf(o[3]) < 1e-2f
+                                    || raw_close(o[k], want[k], 1e-4f, k < 2 ? 1e-2f : 1e-6f))
+                         : k < 13 ? raw_close(o[k], want[k], 0.0f, 1.0f / 255.0f)
+                                  : raw_close(o[k], want[k], 1e-4f, 1e-5f);
+                float d = fabsf(o[k] - want[k]);
+                int c = k < 4 ? 0 : k < 13 ? 1 : 2;
+                if (!pass && d == d && d > s_raw.vp_worst[c]) {
+                    s_raw.vp_worst[c] = d;
+                    s_raw.vp_worst_at[c] = fabsf(want[k]);
+                }
+            }
         if (logged_batches < 16 && logged < 3) {
             logged++;
             fprintf(stderr, "[XFCHK] batch %u index %u (vertex %u):\n", s_raw.ff_batches,
@@ -3676,6 +3695,10 @@ static void raw_check(const Nv2aRawGeometry *g, const float *gpu)
     if (g->kind == NV2A_RAW_PROGRAM) {
         s_raw.vp_checked++;
         s_raw.vp_check_verts += s_gpu.idx_count;
+        if (g->w0 == 1.0f)
+            s_raw.vp_check_2d++;
+        else if (!(g->w0 > 0.0f))
+            s_raw.vp_check_behind++;
         if (bad) {
             s_raw.vp_mismatch_batches++;
             s_raw.vp_mismatch_verts += bad;
@@ -3913,6 +3936,67 @@ static int raw_vp_attrib(uint32_t a, uint32_t min, uint32_t max, Nv2aAttrib *out
     return 1;
 }
 
+/* Nv2aRawGeometry.extent for a program batch: its vertices transformed on
+ * the CPU, as raster_batch_program would, for their extent only -- once per
+ * batch (s_rext.done), and only when the back end asks. Vertices the CPU
+ * path would clip away (w < 1e-3) are left out, and with them the points
+ * clipping would add: the back end's tests (does it cover the surface?)
+ * are coarse. For a screen-space batch the extent is exact. */
+static struct {
+    uint32_t done;                      /* the batch it was computed for */
+    int ok;
+    Nv2aRawExtent e;
+} s_rext;
+static uint32_t s_raw_serial;           /* bumped per program batch offered */
+
+static int raw_extent(const Nv2aRawGeometry *g, Nv2aRawExtent *out)
+{
+    if (s_rext.done != s_raw_serial) {
+        uint64_t t0 = prof_on() ? xbox_HostNowNs() : 0;
+        uint32_t i, n = s_gpu.idx_count, span = g->max_index - g->min_index + 1;
+        float su = 1.0f, sv = 1.0f;
+        Nv2aRawExtent e = { 1e30f, -1e30f, 1e30f, -1e30f, 1e30f, -1e30f, 1e30f, -1e30f };
+        int ok = n > 0;
+
+        if (tex_size_from_format(s_gpu.texs[0].color)) {
+            su = (float)s_gpu.texs[0].width;
+            sv = (float)s_gpu.texs[0].height;
+        }
+        /* each vertex once: the range when the indices cover it, else them */
+        for (i = 0; ok && i < (span <= n ? span : n); i++) {
+            Nv2aVshOutput o;
+            float u, v;
+            if (!transform_vertex(span <= n ? g->min_index + i : s_gpu.idx[i], &o)) {
+                ok = 0;
+                break;
+            }
+            if (!(o.pos[3] >= 1e-3f))
+                continue;                   /* clipped away (raster_xf_clipped) */
+            u = o.tex[0][0] * su;
+            v = o.tex[0][1] * sv;
+            if (o.pos[0] < e.x0) e.x0 = o.pos[0];
+            if (o.pos[0] > e.x1) e.x1 = o.pos[0];
+            if (o.pos[1] < e.y0) e.y0 = o.pos[1];
+            if (o.pos[1] > e.y1) e.y1 = o.pos[1];
+            if (u < e.u0) e.u0 = u;
+            if (u > e.u1) e.u1 = u;
+            if (v < e.v0) e.v0 = v;
+            if (v > e.v1) e.v1 = v;
+        }
+        s_rext.done = s_raw_serial;
+        s_rext.ok = ok;
+        s_rext.e = e;
+        s_raw.ext_batches++;
+        s_raw.ext_verts += span <= n ? span : n;
+        if (t0) {
+            s_prof.ext += xbox_HostNowNs() - t0;
+            s_prof.ext_n++;
+        }
+    }
+    *out = s_rext.e;
+    return s_rext.ok;
+}
+
 /* A vertex-program batch offered to the back end untransformed (RECOMP_GPU_XF
  * vp or all): the program, its constants and the inputs. Returns 1 when it
  * has been drawn. */
@@ -3923,6 +4007,7 @@ static int try_draw_raw_vp(void)
     static int check_n = -1;
     uint32_t i, lo, hi, prim, count, tris, start, len;
     uint64_t hash;
+    static uint32_t check_every = 1000;
     Nv2aRawGeometry g;
     Nv2aSurface surf;
     Nv2aRenderState rs;
@@ -3972,6 +4057,9 @@ static int try_draw_raw_vp(void)
     g.constants = nv2a_vsh_constants();
     g.const_gen = nv2a_vsh_const_gen();
     g.w0 = v0.pos[3];
+    g.d0 = pack_color(v0.d0);
+    g.extent = raw_extent;
+    s_raw_serial++;
     g.aa_sx = s_gpu.aa_sx;
     g.aa_sy = s_gpu.aa_sy;
     g.vp_off_z = nv2a_vsh_constant(59)[2];
@@ -3986,11 +4074,14 @@ static int try_draw_raw_vp(void)
         g.uv_scale0[1] = (float)s_gpu.texs[0].height;
     }
     if (check_n < 0) {
-        const char *e = getenv("RECOMP_GPU_XF_CHECK");
+        /* RECOMP_GPU_XF_CHECK_EVERY: after the first n, every k-th program
+         * batch (default 1000) */
+        const char *e = getenv("RECOMP_GPU_XF_CHECK"), *k = getenv("RECOMP_GPU_XF_CHECK_EVERY");
         check_n = e ? atoi(e) : 0;
+        check_every = k && atoi(k) > 0 ? (uint32_t)atoi(k) : 1000;
     }
     if (check_n > 0 && (s_raw.vp_batches < (uint32_t)check_n
-                        || s_raw.vp_batches % 1000 == 0)) {
+                        || s_raw.vp_batches % check_every == 0)) {
         if (!check_buf)
             check_buf = (float *)malloc((size_t)65536 * NV2A_RAW_CHECK_FLOATS
                                         * sizeof *check_buf);
@@ -3999,9 +4090,12 @@ static int try_draw_raw_vp(void)
             check = 1;
         }
     }
-    /* As raster_batch_program: no texture coordinates, no texture. */
+    /* No texture coordinates, no texture -- except that a screen-space
+     * batch, or one whose first vertex is behind the eye, keeps its texture
+     * as raster_batch_program keeps every program batch's (those were drawn
+     * that way, on the CPU, until they moved here). */
     tc = texcoord_attr();
-    s_xf_no_tex = !(tc->offset && tc->stride);
+    s_xf_no_tex = g.w0 > 0.0f && g.w0 != 1.0f && !(tc->offset && tc->stride);
     backend_batch_init(&batch, &surf, &rs, &tex, stex, !s_xf_no_tex, backend_use_rc());
     batch.raw = &g;
     if (!s_backend->draw_raw(&surf, &batch)) {
@@ -4010,6 +4104,8 @@ static int try_draw_raw_vp(void)
     }
     if (check)
         raw_check(&g, check_buf);
+    if (g.w0 == 1.0f)
+        s_raw.vp2d_batches++;
     s_raw.vp_batches++;
     s_raw.vp_tris += tris;
     s_raw.vp_verts += hi - lo + 1;
@@ -4037,6 +4133,19 @@ static void raster_batch_program(void)
         s_raw.cpu_batches++;
     else
         s_raw.vp_cpu_batches++;
+    /* Points and lines: nothing below draws them (the switch at the end), so
+     * nothing transforms them either -- VC3's E.S. mode has two such program
+     * batches a frame, ~50 us each. A frame trace still sees them. */
+    if (s_gpu.prim < NV_PRIM_TRIANGLES && s_ftrace != 2) {
+        if (batch_uses_program()) {
+            s_gpu.batches_program++;
+            s_gpu.verts_program += n;
+        } else {
+            s_gpu.batches_ffp++;
+        }
+        batch_note_state();
+        return;
+    }
     t0 = prof_on() ? xbox_HostNowNs() : 0;
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
@@ -5808,6 +5917,17 @@ void nv2a_pb_exec_report(void)
                     " %u differing vertices\n", s_raw.vp_batches, s_raw.vp_tris,
                     s_raw.vp_verts, s_raw.vp_cpu_batches, s_raw.vp_checked,
                     s_raw.vp_check_verts, s_raw.vp_mismatch_batches, s_raw.vp_mismatch_verts);
+        if (s_raw.vp2d_batches)
+            fprintf(stderr, "[GPU]   of them screen space (w = 1): %u; extent asked for %u"
+                    " (%u vertices on the CPU); checked: %u screen space, %u starting behind"
+                    " the eye\n", s_raw.vp2d_batches, s_raw.ext_batches, s_raw.ext_verts,
+                    s_raw.vp_check_2d, s_raw.vp_check_behind);
+        if (s_raw.vp_mismatch_verts)
+            fprintf(stderr, "[GPU]   program outputs outside the tolerance, the largest"
+                    " difference (at value): position %g (%g), colour/fog %g (%g), texture"
+                    " coordinate %g (%g)\n", s_raw.vp_worst[0], s_raw.vp_worst_at[0],
+                    s_raw.vp_worst[1], s_raw.vp_worst_at[1], s_raw.vp_worst[2],
+                    s_raw.vp_worst_at[2]);
         if (s_raw.checked)
             fprintf(stderr, "[GPU]   check: %u batches (%u vertices), %u batches with"
                     " %u differing vertices, %u the CPU dropped whole, %u vertices at"
