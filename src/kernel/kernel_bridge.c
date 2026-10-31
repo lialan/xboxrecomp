@@ -3745,6 +3745,18 @@ static int kernel_fire_timers(long long now, long long *next_due_ms)
         } else {
             g_timers[i].timer_va = 0;      /* one-shot, done */
         }
+        /* Signal it before letting go of the lock: KeSetTimer resets the
+         * same event under it (kernel_set_timer), so a re-arm and this fire
+         * are ordered one way or the other and the reset can never land on
+         * the signal of the arming it belongs to. Wake anyone parked on the
+         * timer's shadow event; a timer with no DPC is just a kernel sleep. */
+        {
+            HANDLE ev = ke_shadow_lookup(fired_va);
+            if (ev) {
+                BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
+                SetEvent(ev);
+            }
+        }
         LeaveCriticalSection(&g_timer_lock);
         fired++;
 
@@ -3758,16 +3770,6 @@ static int kernel_fire_timers(long long now, long long *next_due_ms)
                 xbox_DispatchGateLeave();
             } else {
                 xbox_DpcQueue(dpc, 0, 0);
-            }
-        }
-
-        /* Wake anyone parked on the timer's shadow event; a timer with no
-         * DPC is just a kernel sleep. */
-        {
-            HANDLE ev = ke_shadow_lookup(fired_va);
-            if (ev) {
-                SetEvent(ev);
-                BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
             }
         }
     }
@@ -3903,6 +3905,22 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     }
 
     EnterCriticalSection(&g_timer_lock);
+    /* A freshly set timer starts unsignaled, like the real KeSetTimer --
+     * reset here, under the lock and before the slot is armed. It used to
+     * be reset after the lock was let go, and a short timer (VC3's timer
+     * service re-arms with a 0 ms due time, hundreds of times a second)
+     * could fire in that gap: the fire's SetEvent landed first, the late
+     * reset erased it, the one-shot was already consumed, and the waiter
+     * never woke for it. The service thread then never re-armed that timer
+     * and whatever it drove stopped -- the attract sat on the title logo
+     * for good, intermittently, more often under load. */
+    {
+        HANDLE ev = ke_shadow_lookup(timer_va);
+        if (ev)
+            ResetEvent(ev);
+        if (timer_va)
+            BRIDGE_MEM32(timer_va + 4) = 0;       /* SignalState */
+    }
     for (i = 0; i < XBOX_MAX_TIMERS; i++) {
         if (g_timers[i].timer_va == timer_va) { free_slot = i; was_set = 1; break; }
         if (!g_timers[i].timer_va && free_slot < 0) free_slot = i;
@@ -3914,13 +3932,6 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
         g_timers[free_slot].period_ms = period_ms;
     }
     LeaveCriticalSection(&g_timer_lock);
-
-    /* A freshly set timer starts unsignaled, like the real KeSetTimer. */
-    {
-        HANDLE ev = ke_shadow_lookup(timer_va);
-        if (ev)
-            ResetEvent(ev);
-    }
     g_eax = was_set;
 }
 
@@ -10857,6 +10868,114 @@ static void kernel_watch_arm_once(void)
 /* Current dispatching slot */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
+/* ── RECOMP_STALL_DUMP=<flag file>: what every guest thread is doing ──────
+ *
+ * A title that stops making progress with every thread blocked shows nothing
+ * in the log -- the watchdog sees the boot thread's stack, and the waits that
+ * matter belong to other threads. Each thread records the kernel call it is
+ * in (ordinal, caller, arguments, guest esp, since when) or, between calls,
+ * the last one it made; when the flag file appears, a watcher thread prints
+ * them all, with the code addresses on each thread's guest stack. Costs a few
+ * stores per kernel call when set, one compare when not. */
+#define STALL_THREADS 64
+typedef struct {
+    uint32_t used, in_call, ordinal, caller, esp, args[4];
+    uint64_t t_enter, calls;
+    unsigned long host_tid;
+} StallRec;
+static StallRec s_stall[STALL_THREADS];
+static int s_stall_on = -1;
+static RECOMP_TLS int s_stall_slot = -1;
+
+static void stall_dump(void)
+{
+    const uint64_t now = xbox_HostNowNs();
+    int i;
+    fprintf(stderr, "[STALL] thread dump (%llu calls total)\n",
+            (unsigned long long)g_kernel_call_count);
+    for (i = 0; i < STALL_THREADS; i++) {
+        const StallRec *r = &s_stall[i];
+        uint32_t k, shown = 0;
+        if (!r->used)
+            continue;
+        fprintf(stderr, "[STALL] t%-2d host %lu %s ordinal %u from %08X args %08X %08X %08X %08X"
+                " esp %08X, %.1f s ago, %llu calls\n", i, r->host_tid,
+                r->in_call ? "IN" : "last", r->ordinal, r->caller, r->args[0], r->args[1],
+                r->args[2], r->args[3], r->esp, (now - r->t_enter) / 1e9,
+                (unsigned long long)r->calls);
+        fprintf(stderr, "[STALL]     stack:");
+        for (k = 0; k < 512 && shown < 16 && r->esp; k++) {
+            uint32_t v = BRIDGE_MEM32(r->esp + 4 * k);
+            if (v >= g_xbox_code_lo && v < g_xbox_code_hi) {
+                fprintf(stderr, " +%X:%08X", 4 * k, v);
+                shown++;
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+}
+
+static DWORD WINAPI stall_watcher(LPVOID arg)
+{
+    const char *flag = (const char *)arg;
+    int was = 0;
+    for (;;) {
+        FILE *f = fopen(flag, "rb");
+        int is = f != NULL;
+        if (f)
+            fclose(f);
+        if (is && !was)
+            stall_dump();
+        was = is;
+        Sleep(250);
+    }
+    return 0;
+}
+
+static void stall_enter(uint32_t ordinal, uint32_t esp_args)
+{
+    StallRec *r;
+    int k;
+    if (s_stall_on < 0) {
+        static volatile int starting;
+        const char *e = getenv("RECOMP_STALL_DUMP");
+        if (e && *e && __sync_bool_compare_and_swap(&starting, 0, 1)) {
+            HANDLE th = CreateThread(NULL, 0, stall_watcher, (LPVOID)e, 0, NULL);
+            if (th)
+                CloseHandle(th);
+        }
+        s_stall_on = e && *e;
+    }
+    if (!s_stall_on)
+        return;
+    if (s_stall_slot < 0) {
+        for (k = 0; k < STALL_THREADS; k++)
+            if (__sync_bool_compare_and_swap(&s_stall[k].used, 0, 1)) {
+                s_stall_slot = k;
+                s_stall[k].host_tid = (unsigned long)GetCurrentThreadId();
+                break;
+            }
+        if (s_stall_slot < 0)
+            return;
+    }
+    r = &s_stall[s_stall_slot];
+    r->ordinal = ordinal;
+    r->caller = g_xbox_kernel_caller;
+    r->esp = esp_args;
+    for (k = 0; k < 4; k++)
+        r->args[k] = esp_args ? BRIDGE_MEM32(esp_args + 4 * k) : 0;
+    r->t_enter = xbox_HostNowNs();
+    r->calls++;
+    r->in_call = 1;
+}
+
+static void stall_leave(void)
+{
+    if (s_stall_on > 0 && s_stall_slot >= 0)
+        s_stall[s_stall_slot].in_call = 0;
+}
+
 static void kernel_thunk_dispatch_body(void);
 
 /* The guest CPU lock (RECOMP_GUEST_LOCK=1).
@@ -11017,6 +11136,7 @@ static void kernel_thunk_dispatch_body(void)
         }
     }
 
+    stall_enter(ordinal, g_esp);
     if (bridge) {
         bridge();
     } else {
@@ -11047,6 +11167,7 @@ static void kernel_thunk_dispatch_body(void)
         g_eax = 0;
     }
 
+    stall_leave();
     /* Clean stdcall args from the simulated stack.
      * On real x86, stdcall callee does "ret N" to pop the return address
      * and N bytes of arguments. We already popped the dummy return address
