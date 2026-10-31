@@ -3484,10 +3484,12 @@ static int raw_mode_bits(void)
 static int raw_xf_enabled(void) { return raw_mode_bits() & 1; }
 static int raw_vp_enabled(void) { return raw_mode_bits() & 2; }
 
-/* Can fetch_attr read this attribute at all (array batches)? */
+/* Can fetch_attr read this attribute at all? For an array batch the offset
+ * is a guest address, 0 meaning none; for an inline batch it is a byte
+ * offset into the payload, and attribute 0 legitimately starts at 0. */
 static int attr_usable(const VertexAttr *a)
 {
-    if (!a->size || !a->stride || !a->offset)
+    if (!a->size || !a->stride || (!a->offset && !s_gpu.inline_active))
         return 0;
     switch (a->type) {
     case 0: case 1: case 2: case 4: case 5: case 6:
@@ -3513,10 +3515,21 @@ static int raw_attrib(uint32_t a, uint32_t min, uint32_t max, Nv2aAttrib *out)
         return 1;
     at = (uint64_t)va->offset + (uint64_t)min * va->stride;
     bytes = (max - min) * va->stride + attr_elem_bytes(va);
-    if (!guest_span_ok(at, bytes))
-        return 0;
-    out->data = (const uint8_t *)xbox_GetMemoryOffset() + at;
-    out->guest_va = (uint32_t)at;
+    if (s_gpu.inline_active) {
+        /* An inline batch (DrawPrimitiveUP): the vertices are the payload
+         * buffered between BEGIN and END, as raw_vp_attrib reads them. These
+         * used to be declined here ("attribute span") and transformed on the
+         * CPU one vertex at a time -- VC3's comm-window faces, a fifth of the
+         * executor's time in the mission intro. */
+        if (at + bytes > (uint64_t)s_gpu.inline_count * 4)
+            return 0;
+        out->data = (const uint8_t *)s_gpu.inline_buf + at;
+    } else {
+        if (!guest_span_ok(at, bytes))
+            return 0;
+        out->data = (const uint8_t *)xbox_GetMemoryOffset() + at;
+        out->guest_va = (uint32_t)at;
+    }
     out->type = va->type;
     out->size = va->size < 4 ? va->size : 4;
     out->stride = va->stride;
@@ -3816,6 +3829,17 @@ static int try_draw_raw(void)
 
     if (!ridx && !(ridx = (uint16_t *)malloc((NV_MAX_INDICES / 4 * 6 + 8) * sizeof *ridx)))
         return 0;
+    {   /* RECOMP_INLINE_RAW=0: inline batches stay on the CPU, as before */
+        static int inline_raw = -1;
+        if (inline_raw < 0) {
+            const char *e = getenv("RECOMP_INLINE_RAW");
+            inline_raw = !(e && e[0] == '0');
+        }
+        if (s_gpu.inline_active && !inline_raw) {
+            s_raw.declined[RAW_D_SPAN]++;
+            return 0;
+        }
+    }
     /* The position must be readable, or the CPU path drops the batch. */
     if (!attr_usable(&s_gpu.attr[0])) {
         s_raw.declined[RAW_D_SPAN]++;
