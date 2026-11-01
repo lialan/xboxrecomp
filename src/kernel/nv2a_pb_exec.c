@@ -4265,11 +4265,11 @@ static void raster_batch_program(void)
             const char *value = getenv("RECOMP_VSH_VERTEX_CACHE");
             reuse = !value || !strcmp(value, "1");
         }
-        uint32_t recent[64];
+        uint32_t recent[256];
         int cached = reuse && batch_uses_program() && !nv2a_vsh_cxt_write();
         if (cached) memset(recent, 255, sizeof recent);
         for (i = 0; i < n; i++) {
-            uint32_t index = s_gpu.idx[i], slot = index & 63u;
+            uint32_t index = s_gpu.idx[i], slot = index & 255u;
             if (cached && recent[slot] != UINT32_MAX && s_gpu.idx[recent[slot]] == index) {
                 s_xf[i] = s_xf[recent[slot]];
             } else {

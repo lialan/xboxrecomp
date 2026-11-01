@@ -55,7 +55,7 @@ static void draw(const Nv2aSurface *s,const Nv2aBatch *b) {
 static const Nv2aBackend backend={.draw=draw};
 extern void nv2a_pb_exec_method(uint32_t,uint32_t,uint32_t);
 static void m(uint32_t method,uint32_t value) {nv2a_pb_exec_method(0,method,value);}
-static const unsigned indices[]={0,1,2,0,2,3,64,65,66,0,1,2};
+static const unsigned indices[]={0,1,2,0,2,3,256,257,258,0,1,2};
 static void program(int add,int context) {
     uint32_t move[4]={0,1u<<21,0,0};
     move[1]|=0x1b;move[2]|=2u<<26; /* A=v0.xyzw */
@@ -94,8 +94,8 @@ int main(void) {
     m(0x1e94,2);m(0x1720,0x2000);m(0x1760,2|(4<<4)|(16<<8));
     const float points[][4]={{2,2,.5,1},{10,2,.5,1},{10,10,.5,1},{2,10,.5,1}};
     memcpy(s_mem+0x2000,points,sizeof points);
-    memcpy(s_mem+0x2000+64*16,points,3*16);
-    ((float *)(s_mem+0x2000+64*16))[0]=3;
+    memcpy(s_mem+0x2000+256*16,points,3*16);
+    ((float *)(s_mem+0x2000+256*16))[0]=3;
     program(0,0);if(run(0,0,0)) return 1;
     ((float *)(s_mem+0x2000))[0]=4;if(run(0,0,0)) return 1;
     const float offset[4]={.5f,.25f,0,0};nv2a_vsh_set_constant(0,offset);
