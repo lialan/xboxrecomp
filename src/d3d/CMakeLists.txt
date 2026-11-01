@@ -2,7 +2,11 @@
 #   _WIN32 -> backed by Direct3D 11 (d3d8_*.c, d3d8_combiners.c, d3d8_vsh.c)
 #   POSIX  -> backed by OpenGL 3.3 core via SDL2 + libepoxy (d3d8_gl.c)
 
-if(WIN32)
+option(XBOXRECOMP_NO_HOST_D3D8 "Title links D3D into its XBE and uses the NV2A executor" OFF)
+if(XBOXRECOMP_NO_HOST_D3D8)
+    add_library(xbox_d3d8 STATIC d3d8_none.c)
+    target_link_libraries(xbox_d3d8 PUBLIC platform)
+elseif(WIN32)
     add_library(xbox_d3d8 STATIC
         d3d8_device.c
         d3d8_gamma.c
