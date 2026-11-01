@@ -4257,9 +4257,28 @@ static void raster_batch_program(void)
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
-    for (i = 0; i < n; i++)
-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
-            return;                                    /* no program loaded */
+    {
+        /* All attributes/program/constants are fixed for this draw. Context
+         * writes are an interpreter side effect and must execute per index. */
+        static int reuse = -1;
+        if (reuse < 0) {
+            const char *value = getenv("RECOMP_VSH_VERTEX_CACHE");
+            reuse = !value || !strcmp(value, "1");
+        }
+        uint32_t recent[64];
+        int cached = reuse && batch_uses_program() && !nv2a_vsh_cxt_write();
+        if (cached) memset(recent, 255, sizeof recent);
+        for (i = 0; i < n; i++) {
+            uint32_t index = s_gpu.idx[i], slot = index & 63u;
+            if (cached && recent[slot] != UINT32_MAX && s_gpu.idx[recent[slot]] == index) {
+                s_xf[i] = s_xf[recent[slot]];
+            } else {
+                if (!transform_vertex(index, &s_xf[i]))
+                    return;                            /* no program loaded */
+                if (cached) recent[slot] = i;
+            }
+        }
+    }
     if (t0) {
         t1 = xbox_HostNowNs();
         if (batch_uses_program()) {
