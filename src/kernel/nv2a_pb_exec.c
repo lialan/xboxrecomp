@@ -904,31 +904,6 @@ static void current_render_state(Nv2aRenderState *r)
 static int sample_tex(const Texture *t, uint32_t face_offset,
                       uint32_t u, uint32_t v, uint32_t *argb);
 
-int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
-{
-    /* Its own Texture, not stage 0's: under RECOMP_PB_DECODE_THREAD the back
-     * end calls this from the submission thread while the executor decodes. */
-    Texture t;
-    uint32_t x, y;
-
-    memset(&t, 0, sizeof t);
-    t.offset = tex->offset;
-    t.width  = tex->width;
-    t.height = tex->height;
-    t.pitch  = tex->pitch;
-    t.color  = tex->color;
-    t.addr_u = 3;
-    t.addr_v = 3;
-    t.palette = tex->palette;   /* P8's CLUT; 0 fails a P8 decode */
-    t.levels = 1;
-    t.valid  = 1;
-    for (y = 0; y < tex->height; y++)
-        for (x = 0; x < tex->width; x++)
-            if (!sample_tex(&t, 0, x, y, &argb_out[(size_t)y * tex->width + x]))
-                return 0;
-    return 1;
-}
-
 /* Swizzled colour surfaces (SURFACE_FORMAT type 2, log2 width/height in bits
  * 16-19/24-27): render-to-texture. The pixel at (x, y) lives at the same
  * Morton offset a swizzled texture of that size uses, so the texture sampler
@@ -1209,74 +1184,9 @@ static uint32_t linear_twin(uint32_t fmt)
     }
 }
 
-/* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
-static int sample_tex(const Texture *t, uint32_t face_offset,
-                      uint32_t u, uint32_t v, uint32_t *argb)
+static int decode_texel(const uint8_t *mem, const uint8_t *p, uint32_t u,
+                        uint32_t fmt, uint32_t palette, uint32_t *argb)
 {
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    const uint8_t *p;
-    uint32_t fmt, base = t->offset + face_offset;
-
-    if (!t->valid)
-        return 0;
-    /* BORDER (4) with FORMAT's border source set to "colour": texels outside
-     * the image read SET_TEXTURE_BORDER_COLOR. Projected shadow maps rely on
-     * it -- clamped instead, everything outside the projection takes the
-     * edge texel and the shadow's frustum is drawn as a dark wedge.
-     * (Coordinates are signed in unsigned: a negative one is >= the size.) */
-    if (t->border_color
-        && ((t->addr_u == 4 && u >= t->width) || (t->addr_v == 4 && v >= t->height))) {
-        *argb = t->border;
-        return 1;
-    }
-    u = wrap_coord(u, t->width,  t->addr_u);
-    v = wrap_coord(v, t->height, t->addr_v);
-
-    fmt = t->color;
-    if (d3d8_format_dxt_block_bytes(fmt)) {
-        /* Decoded blocks, direct-mapped by address. Every texel of a DXT
-         * texture decodes its whole 4x4 block, and bilinear reads four
-         * neighbours that nearly always share one -- this was a tenth of
-         * the executor's time. Keyed on the block's bytes as well as its
-         * address, so a texture rewritten in place (a render target reused,
-         * a streamed mip) never returns stale texels.
-         * ponytail: single-threaded executor, so a plain static table. */
-        static NV_TLS struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
-                        uint32_t px[16]; } cache[4096];
-        uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
-        uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
-        const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
-        uintptr_t key = (uintptr_t)blk;
-        size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
-        uint64_t raw[2] = {0, 0};
-        memcpy(raw, blk, bb);
-        if (cache[slot].key != key || cache[slot].fmt != fmt
-            || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
-            uint32_t i;
-            for (i = 0; i < 16; i++)
-                d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
-                                      by * 4 + (i >> 2), t->width,
-                                      &cache[slot].px[i]);
-            cache[slot].key = key;
-            cache[slot].fmt = fmt;
-            cache[slot].raw[0] = raw[0];
-            cache[slot].raw[1] = raw[1];
-        }
-        *argb = cache[slot].px[(v & 3) * 4 + (u & 3)];
-        return 1;
-    }
-    if (d3d8_format_is_swizzled(fmt)) {
-        /* Morton order: a texel's index is interleaved from x and y instead of
-         * v*pitch + u, so index from the base of the image. The switch below
-         * casts to each format's own width, which makes that index a texel
-         * index for every one of them. */
-        fmt = linear_twin(fmt);
-        p = mem + base;
-        u = swizzle_offset(u, v, t->width, t->height);
-    } else {
-        p = mem + base + (size_t)v * t->pitch;
-    }
-
     switch (fmt) {
 
     /* 32-bit, alpha-red-green-blue in the dword. */
@@ -1291,9 +1201,9 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
      * header art this way; without a case every such quad came out as the
      * unsupported-format fill, a white box where the logo should be. */
     case 0x0B:                                      /* SZ_I8_A8R8G8B8 */
-        if (!t->palette)
+        if (!palette)
             return 0;
-        *argb = ((const uint32_t *)(mem + t->palette))[p[u]];
+        *argb = ((const uint32_t *)(mem + palette))[p[u]];
         return 1;
 
     /* 32-bit, other channel orders. The name gives the byte order from the
@@ -1396,6 +1306,125 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
         return 0;
     }
 }
+
+/* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
+static int sample_tex(const Texture *t, uint32_t face_offset,
+                      uint32_t u, uint32_t v, uint32_t *argb)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint8_t *p;
+    uint32_t fmt, base = t->offset + face_offset;
+
+    if (!t->valid)
+        return 0;
+    /* BORDER (4) with FORMAT's border source set to "colour": texels outside
+     * the image read SET_TEXTURE_BORDER_COLOR. Projected shadow maps rely on
+     * it -- clamped instead, everything outside the projection takes the
+     * edge texel and the shadow's frustum is drawn as a dark wedge.
+     * (Coordinates are signed in unsigned: a negative one is >= the size.) */
+    if (t->border_color
+        && ((t->addr_u == 4 && u >= t->width) || (t->addr_v == 4 && v >= t->height))) {
+        *argb = t->border;
+        return 1;
+    }
+    u = wrap_coord(u, t->width,  t->addr_u);
+    v = wrap_coord(v, t->height, t->addr_v);
+
+    fmt = t->color;
+    if (d3d8_format_dxt_block_bytes(fmt)) {
+        /* Decoded blocks, direct-mapped by address. Every texel of a DXT
+         * texture decodes its whole 4x4 block, and bilinear reads four
+         * neighbours that nearly always share one -- this was a tenth of
+         * the executor's time. Keyed on the block's bytes as well as its
+         * address, so a texture rewritten in place (a render target reused,
+         * a streamed mip) never returns stale texels.
+         * ponytail: single-threaded executor, so a plain static table. */
+        static NV_TLS struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
+                        uint32_t px[16]; } cache[4096];
+        uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
+        uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
+        const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
+        uintptr_t key = (uintptr_t)blk;
+        size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
+        uint64_t raw[2] = {0, 0};
+        memcpy(raw, blk, bb);
+        if (cache[slot].key != key || cache[slot].fmt != fmt
+            || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
+            uint32_t i;
+            for (i = 0; i < 16; i++)
+                d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
+                                      by * 4 + (i >> 2), t->width,
+                                      &cache[slot].px[i]);
+            cache[slot].key = key;
+            cache[slot].fmt = fmt;
+            cache[slot].raw[0] = raw[0];
+            cache[slot].raw[1] = raw[1];
+        }
+        *argb = cache[slot].px[(v & 3) * 4 + (u & 3)];
+        return 1;
+    }
+    if (d3d8_format_is_swizzled(fmt)) {
+        /* Morton order: a texel's index is interleaved from x and y instead of
+         * v*pitch + u, so index from the base of the image. The switch below
+         * casts to each format's own width, which makes that index a texel
+         * index for every one of them. */
+        fmt = linear_twin(fmt);
+        p = mem + base;
+        u = swizzle_offset(u, v, t->width, t->height);
+    } else {
+        p = mem + base + (size_t)v * t->pitch;
+    }
+
+    return decode_texel(mem, p, u, fmt, t->palette, argb);
+}
+
+int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+{
+    /* Its own Texture, not stage 0's: under RECOMP_PB_DECODE_THREAD the back
+     * end calls this from the submission thread while the executor decodes. */
+    Texture t;
+    uint32_t x, y;
+
+    memset(&t, 0, sizeof t);
+    t.offset = tex->offset;
+    t.width  = tex->width;
+    t.height = tex->height;
+    t.pitch  = tex->pitch;
+    t.color  = tex->color;
+    t.addr_u = 3;
+    t.addr_v = 3;
+    t.palette = tex->palette;   /* P8's CLUT; 0 fails a P8 decode */
+    t.levels = 1;
+    t.valid  = 1;
+    if (!d3d8_format_dxt_block_bytes(tex->color)) {
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        int swizzled = d3d8_format_is_swizzled(tex->color);
+        uint32_t fmt = swizzled ? linear_twin(tex->color) : tex->color;
+        uint32_t mx = 0, my = 0, oy = 0;
+        if (swizzled) xbox_swizzle_masks(tex->width, tex->height, &mx, &my);
+        /* Bulk uploads visit only in-bounds texels. Hoist immutable format,
+         * memory and layout state; walk Morton bits with the same masked
+         * increment used by xbox_unswizzle, including rectangular mips. */
+        for (y = 0; y < tex->height; y++) {
+            const uint8_t *row = mem + tex->offset + (swizzled ? 0 : (size_t)y * tex->pitch);
+            uint32_t ox = 0;
+            for (x = 0; x < tex->width; x++) {
+                if (!decode_texel(mem, row, swizzled ? (ox | oy) : x,
+                                  fmt, tex->palette, &argb_out[(size_t)y * tex->width + x]))
+                    return 0;
+                ox = (ox - mx) & mx;
+            }
+            oy = (oy - my) & my;
+        }
+        return 1;
+    }
+    for (y = 0; y < tex->height; y++)
+        for (x = 0; x < tex->width; x++)
+            if (!sample_tex(&t, 0, x, y, &argb_out[(size_t)y * tex->width + x]))
+                return 0;
+    return 1;
+}
+
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
 {
