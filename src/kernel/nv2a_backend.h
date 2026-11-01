@@ -264,6 +264,10 @@ typedef struct {
      * goes on with the next frame while the submission thread does the flip,
      * instead of waiting for it. NULL: it waits. */
     int  (*flip_async)(void);
+    /* Optional: finish prior rendering and publish guest-visible target writes
+     * before a semaphore/report/kickoff completion becomes visible. Deferred
+     * submission replays this on the owning submission thread. */
+    void (*flush)(void);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts

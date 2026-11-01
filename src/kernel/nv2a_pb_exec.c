@@ -5433,6 +5433,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
         if (!r)
             return;
+        if (s_backend && s_backend->flush) s_backend->flush();
         nv2a_defer_sync(NV2A_SYNC_KICKOFF);
         if (!s_sem_va) {
             uint32_t va = xbox_Nv2aFenceWordVa();
@@ -5549,6 +5550,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         uint32_t at = dma_resolve(param & 0x00FFFFFFu);
         uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
+        if (s_backend && s_backend->flush) s_backend->flush();
         nv2a_defer_sync(NV2A_SYNC_REPORT);   /* the count includes the draws before it */
         memcpy(mem + at, &stamp, 8);
         memcpy(mem + at + 8, &s_gpu.zpass_count, 4);

@@ -71,7 +71,7 @@
 #define RING_BYTES (8u << 20)
 #define REC_ALIGN 16u
 
-enum { REC_PAD, REC_CLEAR, REC_DRAW, REC_DRAW_RAW, REC_FLIP, REC_WRITE };
+enum { REC_PAD, REC_CLEAR, REC_DRAW, REC_DRAW_RAW, REC_FLIP, REC_WRITE, REC_FLUSH };
 
 typedef struct {
     uint32_t type, size;          /* size of the whole record, aligned */
@@ -229,10 +229,14 @@ static void replay(RecHdr *h)
     }
     case REC_WRITE: {             /* after everything before it */
         WriteRec *w = (WriteRec *)h;
+        if (s_real->flush) s_real->flush();
         store_rel32(w->at, w->value);
         s_st.writes++;
         break;
     }
+    case REC_FLUSH:
+        if (s_real->flush) s_real->flush();
+        break;
     case REC_FLIP:
         if (s_real->flip) {
             nv2a_backend_presented_override(1, ((FlipRec *)h)->presented);
@@ -554,8 +558,10 @@ int nv2a_defer_write(volatile uint32_t *at, uint32_t value)
 {
     uint32_t size = align(sizeof(WriteRec));
     WriteRec *w;
-    if (!nv2a_defer_active())
+    if (!nv2a_defer_active()) {
+        if (s_real && s_real->flush) s_real->flush();
         return 0;
+    }
     w = (WriteRec *)reserve(size);
     w->h.type = REC_WRITE;
     w->h.size = size;
@@ -563,6 +569,16 @@ int nv2a_defer_write(volatile uint32_t *at, uint32_t value)
     w->value = value;
     publish(&w->h);
     return 1;
+}
+
+static void p_flush(void)
+{
+    uint32_t size = align(sizeof(RecHdr));
+    RecHdr *r = (RecHdr *)reserve(size);
+    r->type = REC_FLUSH;
+    r->size = size;
+    publish(r);
+    nv2a_defer_sync(NV2A_SYNC_OTHER);
 }
 
 static void p_flip(void)
@@ -673,5 +689,6 @@ const Nv2aBackend *nv2a_defer_wrap(const Nv2aBackend *real)
     s_proxy.draw = real->draw ? p_draw : NULL;
     s_proxy.flip = real->flip ? p_flip : NULL;
     s_proxy.draw_raw = real->draw_raw ? p_draw_raw : NULL;
+    s_proxy.flush = real->flush ? p_flush : NULL;
     return &s_proxy;
 }
