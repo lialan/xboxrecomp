@@ -414,7 +414,9 @@ static DrawRec *record_draw(const Nv2aSurface *s, const Nv2aBatch *b, int raw)
 {
     const Nv2aRawGeometry *g = b->raw;   /* also on a draw(): a back end may look at it */
     uint32_t size = align(sizeof(DrawRec)), off, i;
-    uint32_t vbytes = 0, xbytes = 0, ibytes = 0, cbytes = 0, pbytes = 0, abytes[16];
+    uint32_t vbytes = 0, xbytes = 0, ibytes = 0, cbytes = 0, pbytes = 0;
+    struct AttrSpan { uintptr_t first, last; uint32_t offset; } spans[16];
+    unsigned span_count = 0;
     uint32_t c_lo = 0, c_n = 0;
     DrawRec *d;
     uint8_t *p;
@@ -425,8 +427,32 @@ static DrawRec *record_draw(const Nv2aSurface *s, const Nv2aBatch *b, int raw)
         xbytes = align(b->count * (uint32_t)sizeof(Nv2aVertexEx));
     if (g) {
         ibytes = align(g->index_count * 2u);
-        for (i = 0; i < 16; i++)
-            abytes[i] = align(attr_copy_bytes(&g->attr[i]));
+        /* Inline attributes often point into one interleaved payload. Keep
+         * that aliasing in the owned record instead of copying the same
+         * stream once per attribute. Guest-backed streams remain borrowed. */
+        for (i = 0; i < 16; i++) {
+            uint32_t bytes = attr_copy_bytes(&g->attr[i]);
+            if (bytes) {
+                uintptr_t first = (uintptr_t)g->attr[i].data;
+                spans[span_count++] = (struct AttrSpan){first, first + bytes, 0};
+            }
+        }
+        for (i = 1; i < span_count; i++) {
+            struct AttrSpan span = spans[i];
+            unsigned j = i;
+            while (j && spans[j - 1].first > span.first) {
+                spans[j] = spans[j - 1];j--;
+            }
+            spans[j] = span;
+        }
+        unsigned groups = 0;
+        for (i = 0; i < span_count; i++) {
+            if (groups && spans[i].first <= spans[groups - 1].last) {
+                if (spans[i].last > spans[groups - 1].last)
+                    spans[groups - 1].last = spans[i].last;
+            } else spans[groups++] = spans[i];
+        }
+        span_count = groups;
         if (g->kind == NV2A_RAW_PROGRAM) {
             s_st.prog++;
             if (g->constants) {
@@ -448,12 +474,10 @@ static DrawRec *record_draw(const Nv2aSurface *s, const Nv2aBatch *b, int raw)
             if (g->program)
                 pbytes = align((g->program_start + g->program_len) * 16u);
         }
-    } else {
-        memset(abytes, 0, sizeof abytes);
     }
     size += vbytes + xbytes + ibytes + cbytes + pbytes;
-    for (i = 0; i < 16; i++)
-        size += abytes[i];
+    for (i = 0; i < span_count; i++)
+        size += align((uint32_t)(spans[i].last - spans[i].first));
     d = (DrawRec *)reserve(size);
     d->h.type = raw ? REC_DRAW_RAW : REC_DRAW;
     d->h.size = size;
@@ -504,12 +528,20 @@ static DrawRec *record_draw(const Nv2aSurface *s, const Nv2aBatch *b, int raw)
             d->g.indices = (const uint16_t *)(p + off);
             off += ibytes;
         }
-        for (i = 0; i < 16; i++)
-            if (abytes[i]) {
-                memcpy(p + off, g->attr[i].data, g->attr[i].bytes);
-                d->g.attr[i].data = p + off;
-                off += abytes[i];
-            }
+        for (i = 0; i < span_count; i++) {
+            uint32_t bytes = (uint32_t)(spans[i].last - spans[i].first);
+            spans[i].offset = off;
+            memcpy(p + off, (const void *)spans[i].first, bytes);
+            off += align(bytes);
+        }
+        for (i = 0; i < 16; i++) if (attr_copy_bytes(&g->attr[i])) {
+            uintptr_t first = (uintptr_t)g->attr[i].data;
+            for (unsigned j = 0; j < span_count; j++)
+                if (first >= spans[j].first && first < spans[j].last) {
+                    d->g.attr[i].data = p + spans[j].offset + (first - spans[j].first);
+                    break;
+                }
+        }
         if (cbytes) {
             memcpy(p + off, g->constants[c_lo], c_n * 16u);
             d->c_data = p + off;
