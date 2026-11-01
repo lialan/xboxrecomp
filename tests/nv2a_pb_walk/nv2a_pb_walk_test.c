@@ -46,9 +46,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (method == s_title_moves_get_at)
         s_get_reg = s_title_get;
 }
+/* Segment bulk offers are optional: decline to exercise scalar dispatch. */
+int nv2a_pb_exec_data_run(uint32_t subch, uint32_t method, const uint32_t *p, uint32_t count)
+{ (void)subch; (void)method; (void)p; (void)count; return 0; }
+int nv2a_pb_exec_vsh_run(uint32_t subch, uint32_t method, int inc, const uint32_t *p, uint32_t count)
+{ (void)subch; (void)method; (void)inc; (void)p; (void)count; return 0; }
+uint32_t nv2a_pb_exec_reg_run(uint32_t subch, uint32_t method, const uint32_t *p, uint32_t count)
+{ (void)subch; (void)method; (void)p; (void)count; return 0; }
 void nv2a_pb_exec_report(void) {}
 void xbox_Nv2aAckBusyBits(void) {}
-void nv2a_pb_exec_walk_begin(void) {}       /* the flip hold's vblank sample */
+static unsigned s_walk_begins;
+void nv2a_pb_exec_walk_begin(void) { s_walk_begins++; }
 
 void nv2a_pb_resync(uint32_t get_phys);
 void nv2a_pb_scan(uint32_t put_phys);
@@ -99,6 +107,7 @@ int main(void)
     put(0x400, hdr(1, 0, 0x0308)); put(0x404, 15);
 
     nv2a_pb_scan(0x408);
+    CHECK(s_walk_begins == 1); /* one baseline for the whole DMA walk */
     CHECK(s_n == 5);
     expect(0, 0x0100, 11);
     expect(1, 0x0104, 12);      /* the count walks the method up by 4 */
@@ -183,7 +192,9 @@ int main(void)
         nv2a_pb_scan(0xC08);                               /* nothing moves */
         CHECK(s_n == n0 + 1);
 
+        unsigned before_resume = s_walk_begins;
         nv2a_pb_scan(0xC14);                               /* PUT moves: three more */
+        CHECK(s_walk_begins == before_resume + 1);
         CHECK(s_n == n0 + 4);
         expect(n0 + 1, 0x0504, hdr(1, 0, 0x0600));
         expect(n0 + 2, 0x0508, 43);

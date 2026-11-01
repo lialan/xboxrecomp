@@ -328,8 +328,13 @@ void nv2a_pb_scan(uint32_t put_phys)
         s_get = put, s_pend_left = 0;
         return;
     }
-    if (s_exec_enabled)
+    if (s_exec_enabled) {
+        extern void nv2a_pb_exec_walk_begin(void);
         get_reg = xbox_Nv2aRegPtr(NV2A_USER_DMA_GET);
+        /* DMA walks need the same timestamp/vblank baseline as scanned
+         * segments, including when resuming a partially consumed method. */
+        nv2a_pb_exec_walk_begin();
+    }
 
     pb_consume(mem, put, &words);             /* the method PUT stalled inside */
 
