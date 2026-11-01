@@ -122,7 +122,10 @@ static int s_mode = -1;           /* 0 off, 1 threaded, 2 synchronous */
 static uint8_t *s_ring;
 static volatile uint64_t s_head;  /* producer: bytes published */
 static volatile uint64_t s_tail;  /* consumer: bytes replayed */
-static volatile int s_consumer_sleeping, s_producer_waiting;
+static volatile uint64_t s_consumer_sleeping;
+/* Absolute consumer position requested by a blocked producer; zero means no
+ * waiter. Signaling every intermediate record only wakes it to sleep again. */
+static volatile uint64_t s_producer_until;
 static long s_gl_us;             /* RECOMP_EXEC_GL_DELAY_US */
 
 static struct {
@@ -135,8 +138,8 @@ static CRITICAL_SECTION s_mu;
 static CONDITION_VARIABLE s_work_cv, s_done_cv;
 #define LOCK() EnterCriticalSection(&s_mu)
 #define UNLOCK() LeaveCriticalSection(&s_mu)
-#define WAIT_WORK() SleepConditionVariableCS(&s_work_cv, &s_mu, 2)
-#define WAIT_DONE() SleepConditionVariableCS(&s_done_cv, &s_mu, 2)
+#define WAIT_WORK() SleepConditionVariableCS(&s_work_cv, &s_mu, INFINITE)
+#define WAIT_DONE() SleepConditionVariableCS(&s_done_cv, &s_mu, INFINITE)
 #define SIGNAL_WORK() WakeConditionVariable(&s_work_cv)
 #define SIGNAL_DONE() WakeConditionVariable(&s_done_cv)
 #else
@@ -145,19 +148,12 @@ static pthread_cond_t s_work_cv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t s_done_cv = PTHREAD_COND_INITIALIZER;
 #define LOCK() pthread_mutex_lock(&s_mu)
 #define UNLOCK() pthread_mutex_unlock(&s_mu)
-static void timed_wait(pthread_cond_t *cv)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += 2000000;            /* 2 ms: a missed wake costs no more */
-    if (ts.tv_nsec >= 1000000000) {
-        ts.tv_sec++;
-        ts.tv_nsec -= 1000000000;
-    }
-    pthread_cond_timedwait(cv, &s_mu, &ts);
-}
-#define WAIT_WORK() timed_wait(&s_work_cv)
-#define WAIT_DONE() timed_wait(&s_done_cv)
+/* Both sides publish their waiter predicate before the seq-cst fence and
+ * recheck progress under this mutex. The peer's paired fence either observes
+ * the waiter or makes progress visible to that recheck; no polling timeout is
+ * needed to recover a missed notification. Spurious wakes still recheck. */
+#define WAIT_WORK() pthread_cond_wait(&s_work_cv, &s_mu)
+#define WAIT_DONE() pthread_cond_wait(&s_done_cv, &s_mu)
 #define SIGNAL_WORK() pthread_cond_signal(&s_work_cv)
 #define SIGNAL_DONE() pthread_cond_signal(&s_done_cv)
 #endif
@@ -261,11 +257,11 @@ static void *submit_thread(void *unused)
         uint64_t head = load_acq(&s_head), tail = s_tail;
         if (tail == head) {
             LOCK();
-            s_consumer_sleeping = 1;
+            store_rel(&s_consumer_sleeping, 1);
             FENCE();   /* vs publish() */
             if (load_acq(&s_head) == s_tail)
                 WAIT_WORK();
-            s_consumer_sleeping = 0;
+            store_rel(&s_consumer_sleeping, 0);
             UNLOCK();
             continue;
         }
@@ -277,9 +273,16 @@ static void *submit_thread(void *unused)
             tail += h->size;
             store_rel(&s_tail, tail);
             FENCE();
-            if (s_producer_waiting) {
+            uint64_t until = load_acq(&s_producer_until);
+            if (until && tail >= until) {
                 LOCK();
-                SIGNAL_DONE();
+                /* The producer may already have observed completion or
+                 * moved on to a later boundary while we took the lock. */
+                until = load_acq(&s_producer_until);
+                if (until && tail >= until) {
+                    store_rel(&s_producer_until, 0);
+                    SIGNAL_DONE();
+                }
                 UNLOCK();
             }
         }
@@ -301,11 +304,11 @@ static void wait_tail(uint64_t until)
         if (++spins < 64)
             continue;
         LOCK();
-        s_producer_waiting = 1;
+        store_rel(&s_producer_until, until);
         FENCE();       /* vs the consumer's tail store */
         if (load_acq(&s_tail) < until)
             WAIT_DONE();
-        s_producer_waiting = 0;
+        store_rel(&s_producer_until, 0);
         UNLOCK();
     }
 }
@@ -373,9 +376,9 @@ static void publish(RecHdr *h)
     depth = s_head - load_acq(&s_tail);
     if (depth > s_st.max_depth)
         s_st.max_depth = depth;
-    if (s_consumer_sleeping) {
+    if (load_acq(&s_consumer_sleeping)) {
         LOCK();
-        SIGNAL_WORK();
+        if (load_acq(&s_consumer_sleeping)) SIGNAL_WORK();
         UNLOCK();
     }
     if (s_mode == 2)
