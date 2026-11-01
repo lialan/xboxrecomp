@@ -486,11 +486,27 @@ int nv2a_pb_dma_walk(void)
 static int s_in_call;
 int nv2a_pb_scan_in_call(void) { return s_in_call; }
 
+/* A top-level PUT may split a method's payload. Only a contiguous next
+ * segment can resume it; a ring restart discards the old partial packet. */
+static struct { uint32_t next,left,method,subch; int noninc; } s_segment_pending;
+
 static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                                 uint32_t *jumps, uint32_t *unknown)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
+
+    if(!in_call && s_segment_pending.left) {
+        if(va!=s_segment_pending.next) s_segment_pending.left=0;
+        while(s_segment_pending.left && va<end_va) {
+            note(s_segment_pending.subch,s_segment_pending.method);
+            if(s_exec_enabled) nv2a_pb_exec_method(s_segment_pending.subch,
+                s_segment_pending.method,*(const uint32_t *)(mem+va));
+            va+=4;words++;s_segment_pending.left--;
+            if(!s_segment_pending.noninc) s_segment_pending.method+=4;
+        }
+        s_segment_pending.next=va;
+    }
 
     while (va < end_va && words < 0x100000u) {
         uint32_t w = *(const uint32_t *)(mem + va);
@@ -527,6 +543,19 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             uint32_t subch  = (w >> 13) & 7u;
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
+
+            if(!in_call && count>(end_va-va)/4) {
+                uint32_t available=(end_va-va)/4;
+                static int trace=-1;static unsigned reports;
+                if(trace<0) trace=getenv("RECOMP_PB_SPLIT_LOG")!=NULL;
+                if(trace && reports++<16)
+                    fprintf(stderr,"[PB split] method=%04X subch=%u available=%u remaining=%u next=%08X\n",
+                        method,subch,available,count-available,end_va);
+                s_segment_pending.next=end_va;
+                s_segment_pending.left=count-available;
+                s_segment_pending.method=noninc?method:method+available*4;
+                s_segment_pending.subch=subch;s_segment_pending.noninc=noninc;
+            }
 
             /* index lists and inline vertex data: the run in one call */
             static int data_run = -1;     /* RECOMP_PB_DATARUN=0: word by word */
