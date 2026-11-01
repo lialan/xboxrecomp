@@ -279,6 +279,11 @@ void nv2a_backend_register(const Nv2aBackend *backend);
  * (A flip replayed on the submission thread gets the one recorded with it.) */
 uint32_t nv2a_backend_presented_va(void);
 
+/* Process-lifetime count of executor FLIP_STALL operations. Atomic read for
+ * diagnostic input scripts; independent of backend/display frame rate. This
+ * is not a GPU completion fence: deferred submission may still be pending. */
+uint64_t nv2a_backend_flip_count(void);
+
 /* The submission thread, around a flip it replays: what
  * nv2a_backend_presented_va answers meanwhile (on 0, off again). */
 void nv2a_backend_presented_override(int on, uint32_t va);

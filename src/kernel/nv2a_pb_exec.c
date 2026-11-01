@@ -778,6 +778,11 @@ static void surface_apply_clip(void)
 /* ---- Render back end (nv2a_backend.h) ------------------------------- */
 
 static const Nv2aBackend *s_backend;
+static uint64_t s_script_flips;
+uint64_t nv2a_backend_flip_count(void)
+{
+    return __atomic_load_n(&s_script_flips, __ATOMIC_RELAXED);
+}
 
 /* RECOMP_PROF=1: once a second, where the executor thread's time went --
  * transforming fixed-function and vertex-program batches on the CPU, clipping
@@ -5757,6 +5762,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
         }
         s_gpu.drawn_stale = 1;
+        __atomic_fetch_add(&s_script_flips, 1, __ATOMIC_RELAXED);
 
         if (verbose) {
             static unsigned n;
