@@ -79,6 +79,9 @@ typedef struct {
     uint32_t depth_test_enable, depth_func, depth_write;
     uint32_t color_mask;
     uint32_t cull_enable, cull_face, front_face;
+    uint32_t clear_rect_h, clear_rect_v, clear_rect_set; /* inclusive NV clear bounds; valid axes bits 0/1 */
+    uint32_t zeta_pitch; /* bytes/row from SURFACE_PITCH high half */
+    uint32_t surface_format; /* raw SURFACE_FORMAT: depth format and layout */
     uint32_t zeta_va;                                    /* 0: no depth surface */
     float    depth_min, depth_max;                       /* SET_CLIP_MIN/MAX */
     /* SET_STENCIL_*: compare function as above; ops GL_KEEP 0x1E00, GL_ZERO 0,

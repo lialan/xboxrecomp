@@ -878,6 +878,11 @@ static void current_render_state(Nv2aRenderState *r)
     r->cull_enable       = s_reg[0x0308 / 4];        /* SET_CULL_FACE_ENABLE */
     r->cull_face         = s_reg[0x039C / 4];        /* SET_CULL_FACE */
     r->front_face        = s_reg[0x03A0 / 4];        /* SET_FRONT_FACE */
+    r->clear_rect_h      = s_gpu.clear_rect_h;
+    r->clear_rect_v      = s_gpu.clear_rect_v;
+    r->clear_rect_set    = (uint32_t)s_gpu.clear_rect_set;
+    r->zeta_pitch        = s_reg[NV097_SET_SURFACE_PITCH / 4] >> 16;
+    r->surface_format    = s_gpu.format;
     r->zeta_va           = s_gpu.zeta_offset ? dma_resolve(s_gpu.zeta_offset) : 0;
     r->depth_min         = reg_f(0x0394);            /* SET_CLIP_MIN */
     r->depth_max         = reg_f(0x0398);            /* SET_CLIP_MAX */
