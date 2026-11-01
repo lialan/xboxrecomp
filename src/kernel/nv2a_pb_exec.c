@@ -797,8 +797,11 @@ static struct {
 
 static int prof_on(void)
 {
-    if (s_prof.on < 0)
-        s_prof.on = getenv("RECOMP_PROF") != NULL;
+    if (s_prof.on < 0) {
+        const char *value = getenv("RECOMP_PROF");
+        /* Preserve presence-style opt-in, but honor explicit disable. */
+        s_prof.on = value && strcmp(value, "0") != 0;
+    }
     return s_prof.on;
 }
 
