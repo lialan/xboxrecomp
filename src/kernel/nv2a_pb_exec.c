@@ -791,7 +791,7 @@ uint64_t nv2a_backend_flip_count(void)
  * off the CPU next; guessing had it at texture hashing. */
 static struct {
     int on;
-    uint64_t start, ff, vp, clip, draw, raw, flip, batch, ext;
+    uint64_t start, ff, vp, clip, draw, raw, flip, batch, ext, metadata;
     uint32_t ff_n, vp_n, raw_n, draw_n, ext_n;
 } s_prof = { .on = -1 };
 
@@ -815,11 +815,11 @@ static void prof_flip(void)
         return;
     fprintf(stderr, "[PROF] %.2f s: batches %.0f ms | FF xf %.0f ms (%u) | VP xf %.0f ms (%u)"
             " | clip+expand %.0f ms | draw %.0f ms (%u) | raw %.0f ms (%u) | flip %.0f ms"
-            " | VP extent %.1f ms (%u)\n",
+            " | VP extent %.1f ms (%u) | metadata vertex %.3f ms\n",
             dt / 1e9, s_prof.batch / 1e6, s_prof.ff / 1e6, s_prof.ff_n,
             s_prof.vp / 1e6, s_prof.vp_n, s_prof.clip / 1e6, s_prof.draw / 1e6,
             s_prof.draw_n, s_prof.raw / 1e6, s_prof.raw_n, s_prof.flip / 1e6,
-            s_prof.ext / 1e6, s_prof.ext_n);
+            s_prof.ext / 1e6, s_prof.ext_n, s_prof.metadata / 1e6);
     memset(&s_prof, 0, sizeof s_prof);
     s_prof.on = 1;
     s_prof.start = now;
@@ -4144,7 +4144,10 @@ static int try_draw_raw_vp(void)
         }
     /* The first vertex as the CPU path computes it: the back end's
      * screen-space (2D) decisions look at it. */
-    if (!transform_vertex(s_gpu.idx[0], &v0)) {
+    uint64_t metadata_start = prof_on() ? xbox_HostNowNs() : 0;
+    int metadata_ok = transform_vertex(s_gpu.idx[0], &v0);
+    if (metadata_start) s_prof.metadata += xbox_HostNowNs() - metadata_start;
+    if (!metadata_ok) {
         s_raw.declined[RAW_D_PROGRAM]++;
         return 0;
     }
