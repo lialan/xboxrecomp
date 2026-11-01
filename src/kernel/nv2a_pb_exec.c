@@ -1402,6 +1402,23 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
         uint32_t fmt = swizzled ? linear_twin(tex->color) : tex->color;
         uint32_t mx = 0, my = 0, oy = 0;
         if (swizzled) xbox_swizzle_masks(tex->width, tex->height, &mx, &my);
+        /* These formats already have the decoder's native ARGB word layout.
+         * Select the format once instead of dispatching once per texel. */
+        if (fmt == 0x12 || fmt == 0x1e) {
+            uint32_t alpha = fmt == 0x1e ? 0xff000000u : 0;
+            for (y = 0; y < tex->height; y++) {
+                const uint8_t *row = mem + tex->offset + (swizzled ? 0 : (size_t)y * tex->pitch);
+                uint32_t ox = 0;
+                for (x = 0; x < tex->width; x++) {
+                    uint32_t pixel, at = swizzled ? (ox | oy) : x;
+                    memcpy(&pixel, row + (size_t)at * 4, sizeof pixel);
+                    argb_out[(size_t)y * tex->width + x] = pixel | alpha;
+                    ox = (ox - mx) & mx;
+                }
+                oy = (oy - my) & my;
+            }
+            return 1;
+        }
         /* Bulk uploads visit only in-bounds texels. Hoist immutable format,
          * memory and layout state; walk Morton bits with the same masked
          * increment used by xbox_unswizzle, including rectangular mips. */
