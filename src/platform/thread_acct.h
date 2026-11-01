@@ -6,6 +6,9 @@
 #define XBOX_THREAD_ACCT_H
 
 #include <stdint.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,6 +21,16 @@ extern int g_thread_acct_on;
 
 /* Reads RECOMP_THREAD_LOG once (starting the reporter); returns 1 when on. */
 int xbox_ThreadAcctInit(void);
+/* Atomic publication keeps first-use calls from racing the initialization. */
+static inline int xbox_ThreadAcctEnabled(void) {
+#if defined(_MSC_VER)
+    int enabled=(int)_InterlockedCompareExchange((volatile long *)&g_thread_acct_on,0,0);
+#else
+    int enabled=__atomic_load_n(&g_thread_acct_on,__ATOMIC_ACQUIRE);
+#endif
+    return enabled<0?xbox_ThreadAcctInit():enabled;
+}
+
 /* Names the calling thread in the report (and registers it). */
 void xbox_ThreadAcctName(const char *name);
 /* Called with each name given (on the named thread, log on or off) when
@@ -34,7 +47,7 @@ const char *xbox_ThreadAcctSelfName(void);
 
 /* Around a wait: a load and a branch while the log is off. */
 #define XBOX_ACCT_BEGIN() \
-    uint64_t _acct_t0 = (g_thread_acct_on > 0 || (g_thread_acct_on < 0 && xbox_ThreadAcctInit() > 0)) \
+    uint64_t _acct_t0 = (xbox_ThreadAcctEnabled() > 0) \
                         ? xbox_HostNowNs() : 0
 #define XBOX_ACCT_END(kind) \
     do { if (_acct_t0) xbox_ThreadAcctAdd((kind), xbox_HostNowNs() - _acct_t0); } while (0)

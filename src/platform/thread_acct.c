@@ -187,24 +187,42 @@ static void *acct_reporter(void *arg)
 #endif
 }
 
+static void acct_initialize(void)
+{
+    const char *e=getenv("RECOMP_THREAD_LOG");
+    int enabled=e && *e=='1';
+    if(enabled) {
+#if defined(_WIN32)
+        HANDLE reporter=CreateThread(NULL,0,acct_reporter,NULL,0,NULL);
+        if(reporter) CloseHandle(reporter);else enabled=0;
+#else
+        pthread_t t;
+        if(!pthread_create(&t,NULL,acct_reporter,NULL)) pthread_detach(t);else enabled=0;
+#endif
+        if(enabled) fprintf(stderr,"[THREADS] per-thread CPU and wait time, once a second (RECOMP_THREAD_LOG=1)\n");
+    }
+#if defined(_MSC_VER)
+    _InterlockedExchange((volatile long *)&g_thread_acct_on,enabled);
+#else
+    __atomic_store_n(&g_thread_acct_on,enabled,__ATOMIC_RELEASE);
+#endif
+}
+#if defined(_WIN32)
+static INIT_ONCE acct_once=INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK acct_initialize_once(PINIT_ONCE once,PVOID parameter,PVOID *context) {
+    (void)once;(void)parameter;(void)context;acct_initialize();return TRUE;
+}
+#else
+static pthread_once_t acct_once=PTHREAD_ONCE_INIT;
+#endif
 int xbox_ThreadAcctInit(void)
 {
-    if (g_thread_acct_on < 0) {
-        const char *e = getenv("RECOMP_THREAD_LOG");
-        g_thread_acct_on = e && *e == '1';
-        if (g_thread_acct_on) {
 #if defined(_WIN32)
-            CloseHandle(CreateThread(NULL, 0, acct_reporter, NULL, 0, NULL));
+    InitOnceExecuteOnce(&acct_once,acct_initialize_once,NULL,NULL);
 #else
-            pthread_t t;
-            pthread_create(&t, NULL, acct_reporter, NULL);
-            pthread_detach(t);
+    pthread_once(&acct_once,acct_initialize);
 #endif
-            fprintf(stderr, "[THREADS] per-thread CPU and wait time, once a second"
-                    " (RECOMP_THREAD_LOG=1)\n");
-        }
-    }
-    return g_thread_acct_on;
+    return xbox_ThreadAcctEnabled();
 }
 
 void (*g_xbox_thread_named)(const char *name);

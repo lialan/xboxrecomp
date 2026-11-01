@@ -1418,7 +1418,7 @@ static void nv2a_ack_busy_bits(int flip_held)
     /* RECOMP_THREAD_LOG: a flush request found pending could have waited
      * at most since the walker last looked -- D3D's kick-off spins on it,
      * so this bounds the title's time waiting for the executor there. */
-    if (g_thread_acct_on > 0) {
+    if (xbox_ThreadAcctEnabled() > 0) {
         static uint64_t last;
         uint64_t now = xbox_HostNowNs();
         volatile uint32_t *flush = (volatile uint32_t *)((char *)regs + NV2A_ACK_PFB_FLUSH);
@@ -1483,7 +1483,7 @@ static DWORD WINAPI nv2a_flush_ack_thread(LPVOID param)
         us = 1000;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         if ((*r & 0x00010000u) && !nv2a_pb_exec_flip_is_held()) {
-            if (g_thread_acct_on > 0)
+            if (xbox_ThreadAcctEnabled() > 0)
                 xbox_ThreadAcctKick(us * 1000ull);
             InterlockedAnd((volatile LONG *)r, (LONG)~0x00010000u);
         }
