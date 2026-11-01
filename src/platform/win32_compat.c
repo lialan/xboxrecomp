@@ -31,6 +31,7 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#include <stdatomic.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -45,6 +46,27 @@
 /* ===================================================================== */
 
 static __thread DWORD t_last_error = 0;
+
+static _Atomic(const W32MemoryObserver *) s_memory_observer;
+void w32_set_memory_observer(const W32MemoryObserver *observer)
+{
+    atomic_store_explicit(&s_memory_observer,observer,memory_order_release);
+}
+const W32MemoryObserver *w32_memory_write_begin(void *memory,size_t bytes)
+{
+    const W32MemoryObserver *observer=atomic_load_explicit(&s_memory_observer,memory_order_acquire);
+    if(observer && observer->begin_write) observer->begin_write(observer->context,memory,bytes);
+    return observer;
+}
+void w32_memory_write_end(const W32MemoryObserver *observer,void *memory,size_t bytes)
+{
+    if(observer && observer->end_write) observer->end_write(observer->context,memory,bytes);
+}
+void w32_memory_invalidate(void *memory,size_t bytes)
+{
+    const W32MemoryObserver *observer=atomic_load_explicit(&s_memory_observer,memory_order_acquire);
+    if(observer && observer->invalidate) observer->invalidate(observer->context,memory,bytes);
+}
 
 DWORD GetLastError(void)            { return t_last_error; }
 VOID  SetLastError(DWORD code)      { t_last_error = code; }
@@ -1306,6 +1328,7 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
     /* MEM_COMMIT on a region already reserved by a prior VirtualAlloc:
      * just adjust protection. */
     if ((allocationType & MEM_COMMIT) && !(allocationType & MEM_RESERVE) && address) {
+        w32_memory_invalidate(address,size);
         if (mprotect(address, size, prot) == 0)
             return address;
         /* fall through to a fresh mapping */
@@ -1354,15 +1377,19 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
         size_t len = view_take(address);
         if (size == 0) size = len;
         if (size == 0) return FALSE;
+        w32_memory_invalidate(address,size);
         return munmap(address, size) == 0;
     }
-    if (freeType & MEM_DECOMMIT)
+    if (freeType & MEM_DECOMMIT) {
+        w32_memory_invalidate(address,size);
         return mprotect(address, size, PROT_NONE) == 0;
+    }
     return TRUE;
 }
 
 BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
 {
+    w32_memory_invalidate(address,size);
     if (oldProtect) *oldProtect = PAGE_READWRITE;
     return mprotect(address, size, prot_from_page(newProtect)) == 0;
 }
@@ -1556,7 +1583,11 @@ BOOL ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped)
     (void)overlapped;
     int fd = w32_handle_fd(h);
     if (fd < 0) { if (nread) *nread = 0; SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    const W32MemoryObserver *observer=w32_memory_write_begin(buf,len);
     ssize_t n = read(fd, buf, len);
+    int saved_errno=errno;
+    w32_memory_write_end(observer,buf,len);
+    errno=saved_errno;
     if (n < 0)  { if (nread) *nread = 0; SetLastError(ERROR_GEN_FAILURE);    return FALSE; }
     if (nread)  *nread = (DWORD)n;
     return TRUE;
@@ -1901,6 +1932,7 @@ BOOL UnmapViewOfFile(LPCVOID baseAddr)
 {
     size_t len = view_take(baseAddr);
     if (len == 0) return FALSE;
+    w32_memory_invalidate((void *)baseAddr,len);
     return munmap((void *)baseAddr, len) == 0;
 }
 

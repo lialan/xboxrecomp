@@ -22,6 +22,20 @@
 extern "C" {
 #endif
 
+/* Optional host memory observer. Install/remove only while guest callers are
+ * stopped. Descriptor/context must outlive every matching write lease. This
+ * is host bookkeeping; no Xbox renderer or memory policy is imposed here. */
+typedef struct W32MemoryObserver {
+    void *context;
+    void (*begin_write)(void *,void *,size_t);
+    void (*end_write)(void *,void *,size_t);
+    void (*invalidate)(void *,void *,size_t);
+} W32MemoryObserver;
+void w32_set_memory_observer(const W32MemoryObserver *);
+const W32MemoryObserver *w32_memory_write_begin(void *,size_t);
+void w32_memory_write_end(const W32MemoryObserver *,void *,size_t);
+void w32_memory_invalidate(void *,size_t);
+
 /* ---- Constants --------------------------------------------------------- */
 #define WAIT_OBJECT_0        0x00000000u
 #define WAIT_ABANDONED_0     0x00000080u

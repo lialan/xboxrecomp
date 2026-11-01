@@ -249,6 +249,10 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);
+/* Actual contiguous backing views, at common offset zero. Zero means the
+ * alias relationship could not be established. Does not enumerate low RAM:
+ * the contiguous window uses separate backing in this host layout. */
+size_t xbox_GetContiguousViews(void **bases,size_t *bytes,size_t capacity);
 void xbox_ProtectMirrorsForDebug(void);
 
 /* Trapped hardware registers (APU, AC'97 bus master, USB OHCI). A title's

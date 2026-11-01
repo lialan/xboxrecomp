@@ -109,6 +109,8 @@ static void span_release_for(void *addr, size_t size)
 #endif
 }
 static void *g_tiled_view = NULL;
+static size_t g_tiled_bytes;
+static int g_tiled_alias_verified,g_contig_is_view;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
  * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
@@ -150,6 +152,18 @@ static void *g_flash_memory = NULL;
  * twice. See the tiled aperture below for why that matters.
  */
 static HANDLE g_contig_mapping = NULL;
+
+size_t xbox_GetContiguousViews(void **bases,size_t *bytes,size_t capacity)
+{
+    if(!bases || !bytes || !capacity || !g_contig_memory ||
+       g_contig_memory!=(void *)(uintptr_t)(XBOX_CONTIG_BASE+g_memory_offset)) return 0;
+    if(g_tiled_view && (!g_contig_is_view || !g_tiled_alias_verified)) return 0;
+    size_t count=g_tiled_view?2:1;
+    if(capacity<count) return 0;
+    bases[0]=g_contig_memory;bytes[0]=XBOX_CONTIG_SIZE;
+    if(count==2) {bases[1]=g_tiled_view;bytes[1]=g_tiled_bytes;}
+    return count;
+}
 
 /* Windows: one reservation for the whole guest address space.
  *
@@ -3304,6 +3318,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             ? layout_map_view(g_contig_mapping, XBOX_CONTIG_SIZE,
                               (LPVOID)contig_native)
             : NULL;
+        g_contig_is_view=g_contig_memory!=NULL;
         if (!g_contig_memory)
             g_contig_memory = layout_commit_at((LPVOID)contig_native,
                                                XBOX_CONTIG_SIZE);
@@ -3692,6 +3707,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                               (LPVOID)tiled_native)
             : NULL;
         if (g_tiled_view) {
+            g_tiled_bytes=tiled_size;
             /* Prove the alias rather than assert it. Everything the title
              * renders goes through this window and is read back through the
              * physical address, so if the two are not the same bytes the GPU
@@ -3718,10 +3734,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                             " the contiguous window (wrote A5C30F17, read"
                             " %08X) -- the GPU will sample empty textures\n",
                             *via_contig);
-                else
+                else {
+                    g_tiled_alias_verified=1;
                     fprintf(stderr, "  Tiled aperture alias verified"
                             " (tiled 0x%08X == contiguous 0x%08X)\n",
                             XBOX_TILED_BASE, XBOX_CONTIG_BASE);
+                }
                 *via_contig = saved;
             }
             fprintf(stderr, "  Tiled aperture: %u MB at Xbox VA 0x%08X"
@@ -3811,6 +3829,7 @@ void xbox_MemoryLayoutShutdown(void)
         UnmapViewOfFile(g_tiled_view);
         g_tiled_view = NULL;
     }
+    g_tiled_bytes=0;g_tiled_alias_verified=g_contig_is_view=0;
     if (g_contig_memory) {
 #if defined(_WIN32)
         /* Usually a view of g_contig_mapping, which VirtualFree cannot

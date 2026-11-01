@@ -19,12 +19,12 @@
  *   4. teardown          shutdown must release every view, or a second init
  *                        in one process fails on addresses it already owns
  *
- * Deliberately not asserted: the tiled aperture at 0xF0000000. Whether that
- * specific architectural alias survives relocation to a high host base is a
- * question about what guest code assumes, and guessing at it here would bake
- * in an answer nobody has established.
+ * The contiguous/tiled registry is also checked against actual shared bytes:
+ * host write tracking must enumerate the mapped aliases rather than infer
+ * them from guest constants.
  */
 #include "xbox_memory_layout.h"
+#include "kernel.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -159,6 +159,21 @@ int main(int argc, char **argv)
     size_t size = xbox_GetMappedSize();
     check(base != NULL, "base pointer is non-NULL", NULL);
     check(size > 0, "mapped size is non-zero", NULL);
+    void *views[2];size_t view_bytes[2];
+    size_t count=xbox_GetContiguousViews(views,view_bytes,2);
+    check(count==2,"contiguous view registry includes the verified tiled alias",NULL);
+    check(!xbox_GetContiguousViews(views,view_bytes,1),"view registry rejects insufficient capacity",NULL);
+    if(count==2) {
+        check((uintptr_t)views[0]==(uintptr_t)xbox_GetMemoryOffset()+XBOX_CONTIG_BASE &&
+              (uintptr_t)views[1]==(uintptr_t)xbox_GetMemoryOffset()+XBOX_TILED_BASE,
+              "registry reports actual relocated contiguous/tiled pointers",NULL);
+        check(view_bytes[0]==XBOX_CONTIG_SIZE && view_bytes[1]>0 && view_bytes[1]<=view_bytes[0],
+              "registry bounds both backing views",NULL);
+        volatile unsigned char *via_base=views[0],*via_alias=views[1];
+        unsigned char saved=via_base[0x2010];via_alias[0x2010]=0x7b;
+        check(via_base[0x2010]==0x7b,"enumerated views share the same backing bytes",NULL);
+        via_base[0x2010]=saved;
+    }
 
     /* 2. Host page granularity, not the guest's 4 KB. */
     check(((uintptr_t)base % (uintptr_t)host_page) == 0,
@@ -209,6 +224,7 @@ int main(int argc, char **argv)
 
     /* 4. Teardown has to give the addresses back, or nothing can re-init. */
     xbox_MemoryLayoutShutdown();
+    check(!xbox_GetContiguousViews(views,view_bytes,2),"view registry clears on shutdown",NULL);
     BOOL again = xbox_MemoryLayoutInit(xbe, n);
     check(again, "a second init after shutdown succeeds",
           "shutdown leaked views, so the addresses are still taken");

@@ -25,6 +25,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <errno.h>
 
 static int failures = 0;
 
@@ -41,6 +44,63 @@ static void *free_range(size_t len)
     if (p == MAP_FAILED) return NULL;
     munmap(p, len);
     return p;
+}
+
+struct ObserverProbe {void *memory;size_t page;unsigned begin,end,invalidations;};
+static void observe_begin(void *context,void *memory,size_t bytes)
+{
+    struct ObserverProbe *p=context;
+    if(memory!=p->memory) return;
+    check(bytes==4,"read observer receives the complete destination range");
+    check(!mprotect(memory,p->page,PROT_READ|PROT_WRITE),"begin lease opens destination before kernel read");
+    p->begin++;
+}
+static void observe_end(void *context,void *memory,size_t bytes)
+{
+    (void)bytes;struct ObserverProbe *p=context;
+    if(memory!=p->memory) return;
+    check(!mprotect(memory,p->page,PROT_READ),"end lease may restore read-only protection");
+    p->end++;errno=ERANGE; /* Must not replace the read syscall's errno. */
+}
+static void observe_invalidate(void *context,void *memory,size_t bytes)
+{
+    struct ObserverProbe *p=context;
+    if(memory!=p->memory) return;
+    check(bytes==p->page,"protection observer receives the whole range");
+    check(!mprotect(memory,p->page,PROT_READ|PROT_WRITE),"observer removes its protection before external change");
+    p->invalidations++;
+}
+static void observer_test(void)
+{
+    size_t page=(size_t)sysconf(_SC_PAGESIZE);
+    void *memory=VirtualAlloc(NULL,page,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+    check(memory!=NULL,"observer test allocation");if(!memory) return;
+    char path[]="/tmp/w32-observer-XXXXXX";int fd=mkstemp(path);
+    check(fd>=0,"observer test file");if(fd<0) {VirtualFree(memory,0,MEM_RELEASE);return;}
+    check(write(fd,"data",4)==4 && lseek(fd,0,SEEK_SET)==0,"prepare read payload");
+    int bad=open(path,O_WRONLY);unlink(path);
+    HANDLE file=w32_open_handle(fd,"observer"),write_only=w32_open_handle(bad,"observer-write-only");
+    struct ObserverProbe probe={memory,page,0,0,0};
+    W32MemoryObserver observer={&probe,observe_begin,observe_end,observe_invalidate};
+    check(!mprotect(memory,page,PROT_READ),"arm simulated observer protection");
+    w32_set_memory_observer(&observer);
+    DWORD got=0;
+    check(ReadFile(file,memory,4,&got,NULL) && got==4 && !memcmp(memory,"data",4),
+          "ReadFile fills a protected destination through paired hooks");
+    check(probe.begin==1 && probe.end==1,"successful read releases exactly one lease");
+    check(!ReadFile(write_only,memory,4,&got,NULL) && !got && errno==EBADF,
+          "failed read releases lease and preserves syscall errno");
+    check(probe.begin==2 && probe.end==2,"error path releases exactly one lease");
+    DWORD old;
+    check(VirtualProtect(memory,page,PAGE_READONLY,&old) && probe.invalidations==1,
+          "VirtualProtect notifies before applying new permissions");
+    check(VirtualFree(memory,page,MEM_DECOMMIT) && probe.invalidations==2,
+          "decommit notifies before protection change");
+    check(VirtualAlloc(memory,page,MEM_COMMIT,PAGE_READWRITE)==memory && probe.invalidations==3,
+          "recommit invalidates protection tracking");
+    check(VirtualFree(memory,0,MEM_RELEASE) && probe.invalidations==4,
+          "release invalidates before unmapping");
+    w32_set_memory_observer(NULL);CloseHandle(file);CloseHandle(write_only);
 }
 
 int main(void)
@@ -108,6 +168,7 @@ int main(void)
     if (a) VirtualFree(a, 0, MEM_RELEASE);
 
     CloseHandle(map);
+    observer_test();
 
     printf("\n%d failure(s)\n", failures);
     return failures ? 1 : 0;

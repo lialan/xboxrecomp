@@ -1217,7 +1217,11 @@ NTSTATUS __stdcall xbox_NtReadFile(
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
+    const W32MemoryObserver *observer=w32_memory_write_begin(Buffer,Length);
     ssize_t n = read(fd, Buffer, Length);
+    int saved_errno=errno;
+    w32_memory_write_end(observer,Buffer,Length);
+    errno=saved_errno;
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
