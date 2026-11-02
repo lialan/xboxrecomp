@@ -163,6 +163,46 @@ static uint64_t now_ms(void)
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
+/* An aim marker over the picture, for a gun with no pointer of its own on
+ * the screen (a gamepad's): ux, uy over the 4:3 picture in the middle of
+ * the window's picture, 0..1; negative, none. Set from any thread. */
+static volatile float s_aim_x = -1.0f, s_aim_y = -1.0f;
+
+void fb_present_set_aim(float ux, float uy)
+{
+    s_aim_x = ux;
+    s_aim_y = uy;
+}
+
+static void draw_aim(SDL_Renderer *ren, int lw, int lh)
+{
+    float ux = s_aim_x, uy = s_aim_y;
+    int gw, x, y, r, i;
+    if (ux < 0.0f || uy < 0.0f || lw <= 0 || lh <= 0)
+        return;
+    gw = lw * 3 > lh * 4 ? lh * 4 / 3 : lw;
+    x = (lw - gw) / 2 + (int)(ux * gw);
+    y = (int)(uy * lh);
+    r = lh / 40 > 6 ? lh / 40 : 6;
+    /* a dark outline under a bright red cross, readable on any scene */
+    for (i = 0; i < 2; i++) {
+        int o = i == 0 ? 1 : 0;
+        if (i == 0)
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        else
+            SDL_SetRenderDrawColor(ren, 255, 40, 30, 255);
+        SDL_RenderDrawLine(ren, x - r - o, y - o, x - r / 3 + o, y - o);
+        SDL_RenderDrawLine(ren, x + r / 3 - o, y - o, x + r + o, y - o);
+        SDL_RenderDrawLine(ren, x - o, y - r - o, x - o, y - r / 3 + o);
+        SDL_RenderDrawLine(ren, x - o, y + r / 3 - o, x - o, y + r + o);
+        SDL_RenderDrawLine(ren, x - r - o, y + o, x - r / 3 + o, y + o);
+        SDL_RenderDrawLine(ren, x + r / 3 - o, y + o, x + r + o, y + o);
+        SDL_RenderDrawLine(ren, x + o, y - r - o, x + o, y - r / 3 + o);
+        SDL_RenderDrawLine(ren, x + o, y + r / 3 - o, x + o, y + r + o);
+    }
+    SDL_RenderDrawPoint(ren, x, y);
+}
+
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
     s_fb_va = fb_va;
@@ -615,6 +655,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 d.y = 0;
                 SDL_RenderCopy(ren, tex, NULL, &d);
             }
+            draw_aim(ren, (int)log_w, (int)log_h);
             SDL_RenderPresent(ren);
             __atomic_add_fetch(&s_presents, 1, __ATOMIC_RELAXED);
         }
