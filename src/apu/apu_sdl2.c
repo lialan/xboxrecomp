@@ -95,21 +95,30 @@ int xa2_init(void)
     if (e && *e && *e != '0')
         SDL_setenv("SDL_AUDIODRIVER", "dummy", 0);
 
-#if defined(__ANDROID__)
+#if defined(__linux__)
     /* Android: AAudio rather than SDL's default there, OpenSL ES. On the
      * Quest an OpenSL ES player now and then stopped calling back for good
      * a moment after the title started the APU -- a silent session -- and
      * SDL can neither restart one nor open a second (xa2_recover). AAudio
-     * reports a broken stream and streams can be reopened. Falls back to
-     * SDL's default if AAudio will not start; SDL_AUDIODRIVER, if set,
-     * decides instead. */
+     * reports a broken stream and streams can be reopened.
+     * Desktop Linux: PipeWire rather than SDL's default there, PulseAudio.
+     * On SteamOS (Steam Frame) the PulseAudio backend, talking to
+     * PipeWire's Pulse server, never returned from opening the device: the
+     * title's thread waited in xa2_init for good and the screen stayed
+     * black. Either way SDL's default is the fallback if the preferred
+     * driver will not start; SDL_AUDIODRIVER, if set, decides instead. */
+#if defined(__ANDROID__)
+    static const char preferred[] = "aaudio";
+#else
+    static const char preferred[] = "pipewire";
+#endif
     if (!getenv("SDL_AUDIODRIVER") && !SDL_WasInit(SDL_INIT_AUDIO)) {
-        SDL_setenv("SDL_AUDIODRIVER", "aaudio", 1);
+        SDL_setenv("SDL_AUDIODRIVER", preferred, 1);
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
             g_audio_opened = 1;
         } else {
-            fprintf(stderr, "[SDL2] AAudio would not start (%s): SDL's default instead\n",
-                    SDL_GetError());
+            fprintf(stderr, "[SDL2] %s would not start (%s): SDL's default instead\n",
+                    preferred, SDL_GetError());
             unsetenv("SDL_AUDIODRIVER");
         }
     }
