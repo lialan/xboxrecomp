@@ -2761,12 +2761,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         /* RECOMP_HOLD_WINDOW=1 holds the whole window too, without the rest
          * of RECOMP_EXT_VMA -- the case of a 128 MB title, whose mirrors
          * already reach GUEST_VMEM_TOP so ext_vma_span() is 0. On by default
-         * on Android: there the libraries the loader maps top-down sit just
-         * above a fresh span, and the contiguous window, the device
-         * apertures and the kernel page all failed (ENOMEM) without it. */
+         * on Linux (Android included): mappings go top-down there, the
+         * libraries just above a fresh span, and the contiguous window, the
+         * device apertures and the kernel page all failed (ENOMEM) without
+         * it. On a 48-bit AArch64 desktop (Steam Frame) the base even landed
+         * within 4 GB of the top of user space, so base + 0x80000000 and up
+         * could not be mapped at all. */
         {
             const char *hold = getenv("RECOMP_HOLD_WINDOW");
-#if defined(__ANDROID__)
+#if defined(__linux__)
             int hold_on = !hold || *hold != '0';
 #else
             int hold_on = hold && *hold && *hold != '0';

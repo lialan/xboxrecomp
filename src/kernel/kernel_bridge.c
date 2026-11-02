@@ -25,6 +25,9 @@
  *   different parameter layouts (pointer vs value), so each needs its own bridge.
  */
 
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE     /* glibc declares dladdr and Dl_info only with it */
+#endif
 #include "thread_acct.h"
 #if !defined(_WIN32)
 #include <dlfcn.h>
