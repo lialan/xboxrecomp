@@ -41,6 +41,7 @@
 #include "nv2a_vsh_interp.h"
 #include "nv2a_combiner.h"
 #include "nv2a_backend.h"
+#include "nv2a_check_span.h"
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -553,6 +554,8 @@ static uint32_t attr_elem_bytes(const VertexAttr *a)
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
+static const Nv2aRawGeometry *s_check_geometry; /* only while raw_check runs */
+
 static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -563,6 +566,22 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     out[3] = 1.0f;
     if (!a->size || !a->stride)
         return 0;
+    if (s_check_geometry) {
+        uint32_t slot;
+        for (slot = 0; slot < NV_VERTEX_ATTRS; slot++)
+            if (a == &s_gpu.attr[slot]) {
+                const Nv2aAttrib *snap = &s_check_geometry->attr[slot];
+                if (!snap->data) {
+                    memcpy(out, snap->value, sizeof snap->value);
+                    return 1;
+                }
+                if (index < s_check_geometry->min_index || index > s_check_geometry->max_index)
+                    return 0;
+                p = (const uint8_t *)snap->data
+                  + (size_t)(index - s_check_geometry->min_index) * snap->stride;
+                goto decode;
+            }
+    }
     if (s_gpu.inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
          * the buffered payload rather than a guest address -- and 0 is a legal
@@ -580,6 +599,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         p = mem + at;
     }
 
+decode:
     switch (a->type) {
     case 0:                                  /* D3DCOLOR */
         /* A DWORD 0xAARRGGBB, so little-endian bytes are B,G,R,A -- not the
@@ -3717,22 +3737,122 @@ static int raw_close(float a, float b, float rel, float abs_tol)
 /* RECOMP_GPU_XF_CHECK: transform the batch on the CPU as well and compare,
  * vertex by vertex, with what the back end's shader produced (check_out):
  * a translation bug shows here apart from any rasterisation difference. */
-static void raw_check(const Nv2aRawGeometry *g, const float *gpu)
+/* Both the submitted GPU draw and CPU checker must read the same bytes.
+ * The guest producer can overwrite a vertex buffer while a checked draw
+ * drains the GL thread, even though the executor itself is synchronous. */
+static int raw_check_snapshot(Nv2aRawGeometry *g)
+{
+    static uint8_t *data;
+    static size_t capacity;
+    size_t bytes = 0, at = 0;
+    uint32_t slot;
+    for (slot = 0; slot < NV_VERTEX_ATTRS; slot++)
+        if (g->attr[slot].data)
+            bytes += ((size_t)g->attr[slot].bytes + 15) & ~(size_t)15;
+    if (bytes > capacity) {
+        uint8_t *next = (uint8_t *)realloc(data, bytes);
+        if (!next)
+            return 0;
+        data = next;
+        capacity = bytes;
+    }
+    for (slot = 0; slot < NV_VERTEX_ATTRS; slot++)
+        if (g->attr[slot].data) {
+            memcpy(data + at, g->attr[slot].data, g->attr[slot].bytes);
+            g->attr[slot].data = data + at;
+            at += ((size_t)g->attr[slot].bytes + 15) & ~(size_t)15;
+        }
+    return 1;
+}
+
+/* Bounded cumulative samples per surface/kind. Called only after a valid
+ * GPU capture and a complete CPU transform of the immutable input snapshot.
+ * Counts are indexed vertex references (duplicates included), not unique
+ * mesh vertices, and describe sampled batches rather than the whole scene. */
+static void raw_check_span(const Nv2aRawGeometry *g, const Nv2aSurface *surf)
+{
+    static struct {
+        uint32_t va, kind, width, height, batches;
+        float aa_x, aa_y;
+        Nv2aCheckSpan span;
+    } table[16];
+    static unsigned entries;
+    static unsigned char code[65536];
+    unsigned slot, i;
+    float ax = g->aa_sx > 0 ? g->aa_sx : 1;
+    float ay = g->aa_sy > 0 ? g->aa_sy : 1;
+    float width = surf->width / ax, height = surf->height / ay;
+    Nv2aCheckSpan *span;
+    for (slot = 0; slot < entries; slot++)
+        if (table[slot].va == surf->color_va && table[slot].kind == g->kind
+            && table[slot].width == surf->width && table[slot].height == surf->height
+            && table[slot].aa_x == ax && table[slot].aa_y == ay)
+            break;
+    if (slot == entries) {
+        if (entries == 16) return;
+        entries++;
+        table[slot].va = surf->color_va;
+        table[slot].kind = g->kind;
+        table[slot].width = surf->width;
+        table[slot].height = surf->height;
+        table[slot].aa_x = ax;
+        table[slot].aa_y = ay;
+    }
+    span = &table[slot].span;
+    memset(code, 16, sizeof code);
+    for (i = 0; i < s_gpu.idx_count; i++) {
+        const float *p = s_xf[i].pos;
+        float logical[4] = {p[0] / ax, p[1] / ay, p[2], p[3]};
+        uint32_t index = s_gpu.idx[i] - g->min_index;
+        nv2a_check_span_vertex(span, logical, width, height);
+        if (index < 65536)
+            code[index] = (unsigned char)nv2a_check_outcode(logical, width, height);
+    }
+    for (i = 0; i + 2 < g->index_count; i += g->prim == 5 ? 3 : 1) {
+        unsigned a = g->prim == 7 ? 0 : i;
+        nv2a_check_span_triangle(span, code[g->indices[a]],
+                                 code[g->indices[i + 1]], code[g->indices[i + 2]]);
+    }
+    table[slot].batches++;
+    if (table[slot].batches & (table[slot].batches - 1)) return;
+    fprintf(stderr, "[XFSPAN] target %08X kind %s logical %.0fx%.0f sampled-batches %u"
+            " refs %llu invalid %llu nonforward %llu positive %llu clip-w %.9g..%.9g"
+            " w>2000 %llu xy-outside %llu triangles inside/outside/crossing/invalid %llu/%llu/%llu/%llu\n",
+            surf->color_va, g->kind == NV2A_RAW_PROGRAM ? "VP" : "FFP", width, height,
+            table[slot].batches, (unsigned long long)span->refs,
+            (unsigned long long)span->invalid, (unsigned long long)span->nonforward,
+            (unsigned long long)span->positive, span->wmin, span->wmax,
+            (unsigned long long)span->over2000, (unsigned long long)span->outside,
+            (unsigned long long)span->tri_inside, (unsigned long long)span->tri_outside,
+            (unsigned long long)span->tri_crossing, (unsigned long long)span->tri_invalid);
+}
+
+static void raw_check(const Nv2aRawGeometry *g, const Nv2aSurface *surf, const float *gpu)
 {
     static int logged_batches;
     uint32_t i, k, bad = 0;
     int logged = 0;
 
+    if (g->check_valid && !*g->check_valid) {
+        static uint32_t missing;
+        if (++missing <= 8 || (missing & (missing - 1)) == 0)
+            fprintf(stderr, "[XFCHK] capture not produced; skipped (%u so far)\n", missing);
+        return;
+    }
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
     s_raw.checked++;
+    s_check_geometry = g;
     for (i = 0; i < s_gpu.idx_count; i++)
         if (!transform_vertex(s_gpu.idx[i], &s_xf[i])) {
             /* The CPU drops the whole batch for one vertex at w = 0; the
              * shader clips only the triangles touching it. */
             s_raw.cpu_aborts++;
+            s_check_geometry = NULL;
             return;
         }
+    s_check_geometry = NULL;
+    raw_check_span(g, surf);
     for (i = 0; i < s_gpu.idx_count; i++) {
         const Nv2aVshOutput *c = &s_xf[i];
         const float *o = gpu + (size_t)(s_gpu.idx[i] - g->min_index) * NV2A_RAW_CHECK_FLOATS;
@@ -3894,6 +4014,7 @@ static int try_draw_raw(void)
     Nv2aBatch batch;
     const VertexAttr *tc;
     int check = 0;
+    uint32_t capture_valid = 0;
     uint64_t t0 = prof_on() ? xbox_HostNowNs() : 0;
 
     if (!ridx && !(ridx = (uint16_t *)malloc((NV_MAX_INDICES / 4 * 6 + 8) * sizeof *ridx)))
@@ -3969,6 +4090,7 @@ static int try_draw_raw(void)
                                         * sizeof *check_buf);
         if (check_buf) {
             g.check_out = check_buf;
+            g.check_valid = &capture_valid;
             check = 1;
         }
     }
@@ -3977,13 +4099,17 @@ static int try_draw_raw(void)
     tc = texcoord_attr();
     s_xf_no_tex = !(tc->offset && tc->stride);
     backend_batch_init(&batch, &surf, &rs, &tex, stex, !s_xf_no_tex, backend_use_rc());
+    if (check && !raw_check_snapshot(&g)) {
+        check = 0;
+        g.check_out = NULL;
+    }
     batch.raw = &g;
     if (!s_backend->draw_raw(&surf, &batch)) {
         s_raw.declined[RAW_D_BACKEND]++;
         return 0;
     }
     if (check)
-        raw_check(&g, check_buf);
+        raw_check(&g, &surf, check_buf);
     s_raw.ff_batches++;
     s_raw.ff_tris += tris;
     s_raw.ff_verts += hi - lo + 1;
@@ -4123,6 +4249,7 @@ static int try_draw_raw_vp(void)
     Nv2aVshOutput v0;
     const VertexAttr *tc;
     int check = 0;
+    uint32_t capture_valid = 0;
     uint64_t t0 = prof_on() ? xbox_HostNowNs() : 0;
 
     if (!ridx && !(ridx = (uint16_t *)malloc((NV_MAX_INDICES / 4 * 6 + 8) * sizeof *ridx)))
@@ -4197,6 +4324,7 @@ static int try_draw_raw_vp(void)
                                         * sizeof *check_buf);
         if (check_buf) {
             g.check_out = check_buf;
+            g.check_valid = &capture_valid;
             check = 1;
         }
     }
@@ -4207,13 +4335,17 @@ static int try_draw_raw_vp(void)
     tc = texcoord_attr();
     s_xf_no_tex = g.w0 > 0.0f && g.w0 != 1.0f && !(tc->offset && tc->stride);
     backend_batch_init(&batch, &surf, &rs, &tex, stex, !s_xf_no_tex, backend_use_rc());
+    if (check && !raw_check_snapshot(&g)) {
+        check = 0;
+        g.check_out = NULL;
+    }
     batch.raw = &g;
     if (!s_backend->draw_raw(&surf, &batch)) {
         s_raw.declined[RAW_D_BACKEND]++;
         return 0;
     }
     if (check)
-        raw_check(&g, check_buf);
+        raw_check(&g, &surf, check_buf);
     if (g.w0 == 1.0f)
         s_raw.vp2d_batches++;
     s_raw.vp_batches++;

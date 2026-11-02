@@ -218,6 +218,7 @@ typedef struct Nv2aRawGeometry {
      * shader computed it, 29 floats: screen x y z w, d0 rgba, d1 rgba,
      * fog factor, then T0-T3 (s t r q). */
     float *check_out;
+    uint32_t *check_valid; /* backend sets 1 only after producing check_out */
 } Nv2aRawGeometry;
 
 typedef struct {

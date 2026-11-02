@@ -8930,11 +8930,11 @@ static void bridge_KiUnlockDispatcherDatabase(void)
 }
 
 /* --- KeGetCurrentIrql (ordinal 103, 0 args = 0 bytes)
- * Stack-based with 0 args (not the Kf* fastcall form). IRQL is unmounted, so
- * report PASSIVE_LEVEL. */
+ * Stack-based with 0 args (not the Kf* fastcall form). Use the same
+ * thread-local level as raises, lowers and interrupt delivery. */
 static void bridge_KeGetCurrentIrql(void)
 {
-    g_eax = 0;  /* PASSIVE_LEVEL */
+    g_eax = (uint32_t)xbox_IrqlCurrent();
 }
 
 /* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) --- */

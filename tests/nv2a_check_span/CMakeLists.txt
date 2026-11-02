@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_check_span C)
+add_executable(nv2a_check_span_test test_main.c)
+enable_testing()
+add_test(NAME nv2a_check_span_test COMMAND nv2a_check_span_test)
