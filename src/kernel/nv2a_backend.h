@@ -268,6 +268,10 @@ typedef struct {
      * before a semaphore/report/kickoff completion becomes visible. Deferred
      * submission replays this on the owning submission thread. */
     void (*flush)(void);
+    /* Optional capability: draw_raw never consults raw.extent. The deferred
+     * queue may omit the CPU vertex-program walk used to snapshot it.
+     * Zero preserves legacy metadata for routing/diagnostic backends. */
+    int raw_no_extent;
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
