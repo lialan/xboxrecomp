@@ -3307,9 +3307,23 @@ static void kernel_vblank_raise(void)
  * edge, 0 when vblanks are off. */
 #define VBLANK_RESTART_NS 100000000ull
 
+/* RECOMP_VBLANK_HZ: the schedule's rate (default 60, the console's). A
+ * benchmark of how fast the whole pipeline can go: the title then runs
+ * faster than real time, as many frames a second as its vblank allows. */
+static uint64_t vblank_hz(void)
+{
+    static uint64_t hz;
+    if (!hz) {
+        const char *e = getenv("RECOMP_VBLANK_HZ");
+        long v = e ? atol(e) : 60;
+        hz = v >= 30 && v <= 1000 ? (uint64_t)v : 60u;
+    }
+    return hz;
+}
+
 static uint64_t vblank_due(uint64_t t0_ns, uint64_t n)
 {
-    return t0_ns + n * 1000000000ull / 60u;
+    return t0_ns + n * 1000000000ull / vblank_hz();
 }
 
 /* xbox_VblankAlign's request: a display edge, 0 when none is pending. */
@@ -3341,7 +3355,7 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
         /* RECOMP_VBLANK_SLEW_NS: the most one alignment moves the schedule
          * (default 250 us) */
         static int64_t step = -1;
-        const int64_t P = 1000000000ll / 60;
+        const int64_t P = 1000000000ll / (int64_t)vblank_hz();
         if (step < 0) {
             const char *e = getenv("RECOMP_VBLANK_SLEW_NS");
             step = e ? atol(e) : 250000;
