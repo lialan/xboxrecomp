@@ -818,7 +818,13 @@ static unsigned s_vstat_frames, s_vstat_secs;
 static void vp_stat_init(void)
 {
     const char *e;
-    s_vstat_on = apu_env_on("RECOMP_APU_TRACE");
+    /* RECOMP_APU_TRACE: everything below. RECOMP_APU_VSTAT: only the
+     * once-a-second line per voice (the audio thread's own bookkeeping),
+     * light enough to leave on while playing: the trace also logs every
+     * APU register access from the guest thread and every voice's play
+     * position 25 times a second. */
+    s_vstat_on = apu_env_on("RECOMP_APU_TRACE") ? 2
+               : apu_env_on("RECOMP_APU_VSTAT") ? 1 : 0;
     e = getenv("RECOMP_APU_VOICE_DUMP");
     if (e && *e) {
         const char *path = getenv("RECOMP_APU_VOICE_DUMP_FILE");
@@ -1698,7 +1704,7 @@ static void vp_trace_positions(MCPXAPUState *d)
 {
     if (s_vstat_on < 0)
         vp_stat_init();
-    if (s_vstat_on <= 0 || ++s_pos_frames % 60)
+    if (s_vstat_on < 2 || ++s_pos_frames % 60)
         return;
 
     for (int list = 0; list < 3; list++) {
