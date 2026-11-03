@@ -560,10 +560,20 @@ static DrawRec *record_draw(const Nv2aSurface *s, const Nv2aBatch *b, int raw)
         /* The extent reads the executor's state as it is now: computed here
          * for the batches a back end may ask it of (screen-space programs,
          * and those whose first vertex is behind the eye). */
+        /* Only small batches (sprites, HUD pieces, full-screen quads): the
+         * extent transforms every vertex on the CPU, and a back end that
+         * asks it of a big screen-space mesh (a distortion grid) gets 0 and
+         * decides without it. NV2A_EXTENT_MAX_INDICES overrides (0: all). */
         if (s_real->raw_no_extent) {
             d->g.extent = NULL;
         } else if (g->extent) {
-            if (g->kind == NV2A_RAW_PROGRAM && !(g->w0 > 0.0f && g->w0 != 1.0f))
+            static long max_indices = -1;
+            if (max_indices < 0) {
+                const char *e = getenv("NV2A_EXTENT_MAX_INDICES");
+                max_indices = e ? atol(e) : 96;
+            }
+            if (g->kind == NV2A_RAW_PROGRAM && !(g->w0 > 0.0f && g->w0 != 1.0f)
+                && (max_indices == 0 || g->index_count <= (uint32_t)max_indices))
                 d->ext_ok = g->extent(g, &d->ext);
             d->g.extent = defer_extent;
         }
