@@ -507,8 +507,28 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * inside it is the image. Sending that one to the window delivered the
  * descriptor where the driver never looked, and it reset the port and asked
  * again, forever. */
+/*
+ * But an image can also overlap contiguous memory the driver really uses:
+ * Silent Scope's ss1.xbe spans 0x10000-0x1DCB4F0 (28 MB of .bss), its HCCA
+ * is physical 0x82000 and its SETUP packets sit beside their TDs at 0x82FB0.
+ * Image-first read the title's code there as endpoint lists and SETUP
+ * packets: no port reset, no pad, ever. What tells the two apart is how the
+ * driver got the number: a static's comes from MmGetPhysicalAddress on an
+ * image address, which the runtime records (xbox_PhysImageNameMap); a
+ * contiguous block's from MmGetPhysicalAddress on a window address, which it
+ * does not. So: an image page the title named is the image; otherwise a page
+ * the allocator handed out is the window; otherwise as before.
+ */
 static uint32_t bus_resolve(uint32_t addr)
 {
+    uint32_t page = addr / 4096u;
+
+    if (addr && addr < xbox_ContiguousAllocatedBytes()) {
+        if (xbox_PhysImageNameMap()[page])
+            return addr;
+        if (xbox_ContiguousPageMap()[page])
+            return OHCI_CONTIG_BASE + addr;
+    }
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
     if (addr && addr < xbox_ContiguousAllocatedBytes())

@@ -218,6 +218,9 @@ void xbox_PhysNoteRamName(uint32_t va);
  * no live heap block covers the page any more. Read without a lock; a device
  * model's view. */
 const volatile uint8_t *xbox_PhysRamNameMap(void);
+/* The same for image pages the title named (never cleared): a bus master's
+ * buffer in the title's own statics. Separate from the heap record above. */
+const volatile uint8_t *xbox_PhysImageNameMap(void);
 uint32_t xbox_ContiguousInUseBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,

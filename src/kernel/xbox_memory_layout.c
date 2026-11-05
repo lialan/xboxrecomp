@@ -4531,10 +4531,27 @@ uint32_t xbox_ContiguousInUseBytes(void)
  * most one pass of one voice. */
 static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
 
+/* Image pages MmGetPhysicalAddress has named, kept apart from the heap's
+ * record above (whose users must not see them: a large image can overlap
+ * the window pages DirectSound's voice array lives in). For the OHCI, a
+ * transfer buffer in the title's own .data is an image page the title named
+ * this way (Burnout 3's descriptor reads into 0x0041A904), while one in
+ * contiguous memory never is (Silent Scope's SETUP packets at physical
+ * 0x82FB0, inside its 28 MB image's range). The image is never freed, so
+ * these are never cleared. */
+static volatile uint8_t g_phys_image_named[CONTIG_PAGES];
+
 void xbox_PhysNoteRamName(uint32_t va)
 {
     if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
         g_phys_ram_named[va / CONTIG_PAGE] = 1;
+    else if (va >= g_xbox_image_lo && va < g_xbox_image_hi && va < XBOX_CONTIG_SIZE)
+        g_phys_image_named[va / CONTIG_PAGE] = 1;
+}
+
+const volatile uint8_t *xbox_PhysImageNameMap(void)
+{
+    return g_phys_image_named;
 }
 
 /* Heap block m is free (and merged with any free neighbours): its pages name
