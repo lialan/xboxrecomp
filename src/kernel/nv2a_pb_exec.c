@@ -382,7 +382,9 @@ static float reg_f(uint32_t method)
 
 /* Where BACK_END_WRITE_SEMAPHORE_RELEASE lands; see nv2a_backend.h. */
 static uint32_t s_sem_va;
+static uint32_t (*s_sem_resolve)(void);
 void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
+void nv2a_pb_set_semaphore_resolver(uint32_t (*resolve)(void)) { s_sem_resolve = resolve; }
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -5543,6 +5545,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
      * held 0xFF000000 at times, which put the write outside guest memory). */
+    if (subch == 0 && method == 0x1D70 && !s_sem_va && s_sem_resolve) {
+        s_sem_va = s_sem_resolve();
+        if (s_sem_va)
+            fprintf(stderr, "[PB] semaphore target 0x%08X (resolved at the first release)\n",
+                    s_sem_va);
+    }
     if (subch == 0 && method == 0x1D70 && s_sem_va) {
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         /* Deferring, the release is queued behind the draws before it and

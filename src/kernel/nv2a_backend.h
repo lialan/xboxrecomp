@@ -308,4 +308,13 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
  * the semaphore context DMA object through RAMIN. */
 void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 
+/* Asked at a release while no target is set: the semaphore's guest VA, or 0
+ * if the title has none yet (that release is then dropped, as before). A
+ * project that knows where D3D keeps it (device+0x30) registers this at
+ * boot, so releases land from the first one on -- before any fence wait
+ * the project hooks has run. XDK 5558 D3D's ring-space wait reads the
+ * semaphore before its first BlockOnTime: with the early releases dropped
+ * it waited on a stale value forever (Silent Scope's boot). */
+void nv2a_pb_set_semaphore_resolver(uint32_t (*resolve)(void));
+
 #endif /* NV2A_BACKEND_H */
