@@ -552,7 +552,16 @@ static void wr32(uint32_t va, uint32_t v)
 }
 static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 {
+    uint32_t phys = va;
     va = bus_resolve(va);
+    if (s_trace) {
+        static uint32_t last;
+        if (phys != last) {     /* a buffer's resolution, once per address */
+            last = phys;
+            fprintf(stderr, "  [OHCI] buffer %08X -> %s %08X\n", phys,
+                    va == phys ? "as is" : "window", va);
+        }
+    }
     return guest_ok(va, bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
 }
