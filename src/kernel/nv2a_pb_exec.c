@@ -5266,6 +5266,14 @@ int nv2a_pb_exec_flip_pacing(void)
     return mode;
 }
 
+/* The last swap's presentation interval in vblanks (D3D's 1, 2, 3; 0 for
+ * IMMEDIATE), recorded only under flip pacing; 0 before any swap. A host
+ * showing more frames than the title makes (an interpolator) reads it. */
+uint32_t nv2a_pb_exec_swap_interval(void)
+{
+    return s_flip_hold.swap_interval;
+}
+
 /* The guest vblank count, and whether it is a running clock: vblanks are on
  * and the count moved within XBOX_FLIP_CLOCK_STALE_NS. Without it a hold
  * would only ever end on its timeout. */
