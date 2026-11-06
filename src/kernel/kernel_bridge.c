@@ -244,8 +244,31 @@ static void kernel_data_init(void)
      */
     {
         const char *cmdline = getenv("RECOMP_CMDLINE");
+        /* RECOMP_LAUNCH_PAGE=<file>: the whole page another image's
+         * XLaunchNewImage filled (the host's launch handler wrote it), as the
+         * console hands it over on the reboot into this one. */
+        const char *launch = getenv("RECOMP_LAUNCH_PAGE");
+        FILE *lf = launch && *launch ? fopen(launch, "rb") : NULL;
 
-        if (cmdline && *cmdline) {
+        if (lf) {
+            uint32_t page = xbox_HeapAlloc(0x1000, 4096);
+            uint8_t buf[0x1000];
+            size_t got = fread(buf, 1, sizeof buf, lf);
+            size_t i;
+
+            fclose(lf);
+            remove(launch);          /* written for this handover only */
+            if (page && got == sizeof buf) {
+                for (i = 0; i < sizeof buf; i++)
+                    BRIDGE_MEM8(page + (uint32_t)i) = buf[i];
+                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = page;
+                fprintf(stderr, "  Launch data: type %u from title 0x%08X at 0x%08X (%s)\n",
+                        BRIDGE_MEM32(page), BRIDGE_MEM32(page + 4), page, launch);
+            } else {
+                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = 0;
+                fprintf(stderr, "  Launch data: %s unreadable (%zu bytes), none\n", launch, got);
+            }
+        } else if (cmdline && *cmdline) {
             uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
             if (page) {
                 size_t n = strlen(cmdline);
@@ -1773,6 +1796,13 @@ static void bridge_ExQueryNonVolatileSetting(void)
  *
  * It never returns on hardware. Returning here would let the game run on past
  * a decision to quit, which reads as a hang rather than an exit. */
+static XboxLaunchHandler s_launch_handler;
+
+void xbox_SetLaunchHandler(XboxLaunchHandler handler)
+{
+    s_launch_handler = handler;
+}
+
 static void bridge_HalReturnToFirmware(void)
 {
     uint32_t routine = STACK_ARG(0);
@@ -1785,7 +1815,7 @@ static void bridge_HalReturnToFirmware(void)
         uint32_t page = BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
 
         if (page) {
-            char path[64];
+            char path[520];          /* LAUNCH_DATA_HEADER.szLaunchPath */
             uint32_t i;
 
             for (i = 0; i < sizeof(path) - 1; i++) {
@@ -1804,8 +1834,17 @@ static void bridge_HalReturnToFirmware(void)
             for (i = 0; i < 8; i++)
                 fprintf(stderr, " %08X", BRIDGE_MEM32(page + 1024 + i * 4));
             fprintf(stderr, "\n");
+            /* The host starts that image if it can (no return) */
+            if (routine == 2 && s_launch_handler) {
+                fflush(stderr);
+                s_launch_handler(path, (const uint8_t *)g_xbox_mem_offset + page);
+            }
         } else {
             fprintf(stderr, "  [KERNEL] no launch data page set\n");
+            if (routine == 2 && s_launch_handler) {
+                fflush(stderr);
+                s_launch_handler("", NULL);
+            }
         }
     }
 

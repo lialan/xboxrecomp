@@ -873,6 +873,15 @@ BOOLEAN  __stdcall xbox_KeSynchronizeExecution(PXBOX_KINTERRUPT Interrupt, PVOID
 
 VOID    __stdcall xbox_HalReadWritePCISpace(ULONG BusNumber, ULONG SlotNumber, ULONG RegisterNumber, PVOID Buffer, ULONG Length, BOOLEAN WritePCISpace);
 VOID    __stdcall xbox_HalReturnToFirmware(ULONG Routine);
+/* A title launching another image (XLaunchNewImage: HalReturnToFirmware(2)
+ * with the launch data page filled in) is handed to the host's handler
+ * first: the image's path as the title wrote it ("\Device\CdRom0;ss2.xbe";
+ * empty for the dashboard) and the whole 4096-byte page (NULL with none).
+ * A handler that starts the image does not return; one that returns leaves
+ * the exit to go on as before. RECOMP_LAUNCH_PAGE=<file> gives the next
+ * process that page at boot, as the console's loader would. */
+typedef void (*XboxLaunchHandler)(const char *path, const uint8_t *page);
+void    xbox_SetLaunchHandler(XboxLaunchHandler handler);
 ULONG   __stdcall xbox_HalReadSMCTrayState(PULONG TrayState, PULONG TrayStateChangeCount);
 VOID    __stdcall xbox_HalClearSoftwareInterrupt(KIRQL RequestIrql);
 VOID    __stdcall xbox_HalRequestSoftwareInterrupt(KIRQL RequestIrql);
