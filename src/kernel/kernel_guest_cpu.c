@@ -45,6 +45,18 @@
  *
  * RECOMP_GUEST_QUANTUM (ms, default 4) is the quantum; RECOMP_GUEST_CPU_TRACE
  * (ms) prints each turn held at least that long and where it ended.
+ *
+ * Scoped (RECOMP_GUEST_LOCK=scoped, or xbox_GuestCpuScopeEnable() from a
+ * game's runtime): only a guest thread between xbox_GuestCpuScopeEnter and
+ * xbox_GuestCpuScopeLeave takes part -- a middleware lock that leaned on the
+ * console's priorities rather than a mutex. CRI's ADX manager "locks" by
+ * raising the caller's priority: nothing else of CRI runs while the holder
+ * runs, and everything may while it sleeps or waits, which a host mutex
+ * cannot copy (HOTD3's game thread sleeps holding it until a worker that
+ * needs it drains a queue). Here the holder keeps the CPU until it blocks in
+ * a kernel call or leaves the scope: no quantum, no preemption -- the
+ * priority boost -- and threads outside every scope run free, so the rest of
+ * the title keeps its host cores.
  */
 #include "kernel.h"
 #include "platform/host_time.h"
@@ -75,6 +87,9 @@ static CRITICAL_SECTION s_lock;
 static CONDITION_VARIABLE s_cv;
 static INIT_ONCE s_once = INIT_ONCE_STATIC_INIT;
 static int s_on;
+static int s_scoped;                        /* only threads inside a scope take part */
+static int s_scoped_api;                    /* xbox_GuestCpuScopeEnable was called */
+static XBOX_THREAD_LOCAL int t_scope;       /* this thread's scope depth */
 static uint64_t s_trace_ns;                 /* RECOMP_GUEST_CPU_TRACE; 0 = off */
 static uint64_t s_quantum_ns;               /* RECOMP_GUEST_QUANTUM */
 
@@ -112,6 +127,10 @@ static void guest_cpu_config(void)
     long qms = q && *q ? strtol(q, NULL, 0) : 4;
 
     s_on = e && *e == '1';
+    /* Scoped unless the whole-title lock is on (every guest thread already
+     * takes part then); the environment's 0 turns both off. */
+    s_scoped = !s_on && !(e && *e == '0')
+               && ((e && strcmp(e, "scoped") == 0) || s_scoped_api);
     s_trace_ns = t ? (uint64_t)(*t ? strtoul(t, NULL, 0) : 1) * 1000000ull : 0;
     s_quantum_ns = (uint64_t)(qms >= 0 ? qms : 4) * 1000000ull;   /* 0: hand over at every call */
     if (s_on) {
@@ -119,7 +138,18 @@ static void guest_cpu_config(void)
                         " guest code at a time, %lu ms quantum\n",
                 (unsigned long)(s_quantum_ns / 1000000ull));
         fflush(stderr);
+    } else if (s_scoped) {
+        fprintf(stderr, "  [KERNEL] guest CPU lock scoped: one guest thread at a"
+                        " time inside a scope, held until it blocks\n");
+        fflush(stderr);
     }
+}
+
+/* Taking part: every guest thread with the lock on; with it scoped, a guest
+ * thread inside a scope. Host threads running a guest callback never. */
+static int takes_part(void)
+{
+    return t_guest && (s_on || (s_scoped && t_scope > 0));
 }
 
 /* The config is read here, under the INIT_ONCE, so no thread sees s_on set
@@ -227,7 +257,7 @@ static void guest_cpu_acquire(int barge)
         my = s_next_ticket++;
         s_waiting++;
         t0 = xbox_HostNowNs();
-        if (barge && !s_free)
+        if (barge && !s_free && s_on)
             preempt_set(1);
         while (!(s_free && my == s_head)) {
             SleepConditionVariableCS(&s_cv, &s_lock, GUEST_CPU_POLL_MS);
@@ -236,7 +266,7 @@ static void guest_cpu_acquire(int barge)
              * a queued one past the quantum (the console's timer tick).
              * The holder clears the flag when it cannot (at DISPATCH),
              * and the waiter raises it again at its next poll. */
-            if (!preempt_get() && !(s_free && my == s_head)
+            if (s_on && !preempt_get() && !(s_free && my == s_head)
                 && (barge || xbox_HostNowNs() - t0 >= s_quantum_ns))
                 preempt_set(1);
         }
@@ -329,7 +359,8 @@ static int ordinal_may_block(uint32_t ordinal)
 void xbox_GuestCpuJoin(void)
 {
     t_guest = 1;
-    if (xbox_GuestCpuOn() && !t_held)
+    xbox_GuestCpuOn();
+    if (takes_part() && !t_held)
         guest_cpu_acquire(0);
 }
 
@@ -364,7 +395,7 @@ int xbox_GuestCpuRelease(int kind, uint32_t where)
          * gate. The call soft-releases and barges back, as the back edge
          * refuses to hand over there. */
         else if (where == 238 /* NtYieldExecution */
-            || (s_waiting && !xbox_IrqlThisThreadBlocksDpcs()
+            || (s_on && s_waiting && !xbox_IrqlThisThreadBlocksDpcs()
                 && (preempt_get()
                     || xbox_HostNowNs() - t_turn_ns >= s_quantum_ns)))
             guest_cpu_handoff(kind, where);
@@ -378,7 +409,8 @@ int xbox_GuestCpuRelease(int kind, uint32_t where)
 
 void xbox_GuestCpuAcquire(void)
 {
-    if (!t_held && xbox_GuestCpuOn())
+    xbox_GuestCpuOn();
+    if (!t_held && takes_part())
         guest_cpu_acquire(1);
 }
 
@@ -388,7 +420,8 @@ void xbox_GuestCpuAcquire(void)
  * while, so the waiters learn now instead of at their next poll. */
 void xbox_GuestCpuBlocked(void)
 {
-    if (t_held || !t_guest || !s_waiting || !xbox_GuestCpuOn())
+    xbox_GuestCpuOn();
+    if (t_held || !t_guest || !s_waiting || !(s_on || s_scoped))
         return;
     EnterCriticalSection(&s_lock);
     if (s_free && s_waiting)
@@ -421,10 +454,42 @@ void xbox_GuestCpuPreempt(uint32_t va)
  * call. 1 when this took it, for the leave. */
 int xbox_GuestCpuEnterCallback(void)
 {
-    if (!t_guest || t_held || !xbox_GuestCpuOn())
+    xbox_GuestCpuOn();
+    if (t_held || !takes_part())
         return 0;
     guest_cpu_acquire(1);
     return 1;
+}
+
+/* ── Scoped (see the top) ─────────────────────────────────────────── */
+
+void xbox_GuestCpuScopeEnable(void)
+{
+    InitOnceExecuteOnce(&s_once, guest_cpu_init, NULL, NULL);
+    EnterCriticalSection(&s_lock);
+    if (!s_scoped_api) {
+        s_scoped_api = 1;
+        guest_cpu_config();
+    }
+    LeaveCriticalSection(&s_lock);
+}
+
+/* Nested: the CPU is taken at the outermost enter and handed to the oldest
+ * waiter at the outermost leave. A guest thread only: a host thread's
+ * callback (a DPC) ran at any instant on the console, scope or none. */
+void xbox_GuestCpuScopeEnter(void)
+{
+    xbox_GuestCpuOn();
+    if (t_scope++ == 0 && s_scoped && t_guest && !t_held)
+        guest_cpu_acquire(1);
+}
+
+void xbox_GuestCpuScopeLeave(void)
+{
+    if (t_scope <= 0)
+        return;
+    if (--t_scope == 0 && s_scoped && t_held)
+        guest_cpu_handoff(XBOX_GUEST_CPU_KERNEL, 0);
 }
 
 void xbox_GuestCpuLeaveCallback(int took)
@@ -442,7 +507,7 @@ int xbox_GuestCpuWaiting(void)
 {
     int n;
 
-    if (!xbox_GuestCpuOn())
+    if (!xbox_GuestCpuOn() && !s_scoped)
         return 0;
     EnterCriticalSection(&s_lock);
     n = (int)s_waiting;
@@ -471,7 +536,7 @@ void xbox_GuestCpuReport(void)
     XboxGuestCpuStats s;
     char w[32];
 
-    if (!xbox_GuestCpuOn())
+    if (!xbox_GuestCpuOn() && !s_scoped)
         return;
     xbox_GuestCpuStatsGet(&s, 1);
     if (!s.turns && !s.releases)

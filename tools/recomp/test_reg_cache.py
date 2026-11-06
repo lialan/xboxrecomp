@@ -42,6 +42,25 @@ def test_fpu_stack_macros_are_not_calls():
     assert "fp_pop();" in out and "RECOMP_RC_STORE(); fp_pop" not in out
 
 
+SETJMP_FUNC = '''void sub_00006000(void)
+{
+loc_00006000: ;
+    esi = MEM32(esp + 4);
+    { int _sjv = setjmp(*recomp_setjmp_slot(MEM32(esp), esp)); if (_sjv) { ebp = g_seh_ebp; eax = (uint32_t)_sjv; } else { PUSH32(esp, 0x00006010u); sub_00007000(); } } /* setjmp 0x00007000 */
+    MEM32(esi) = eax; return;
+}
+'''
+
+
+def test_registers_reloaded_where_a_longjmp_lands():
+    # recomp_guest_longjmp restores ebx/esi/edi/esp into g_regs; the locals
+    # that cache them are indeterminate after the native longjmp, so the
+    # landing branch reloads them all, then takes eax from the jump.
+    out = reg_cache_function(SETJMP_FUNC)
+    assert "if (_sjv) { RECOMP_RC_LOAD(); ebp = g_seh_ebp; eax = (uint32_t)_sjv; }" in out
+    assert "{ RECOMP_RC_STORE(); sub_00007000(); RECOMP_RC_LOAD(); }" in out
+
+
 def test_function_naming_no_register_is_unchanged():
     code = "void sub_00004000(void)\n{\n    MEM32(0x100) = 1;\n    sub_00005000(); return;\n}\n"
     assert reg_cache_function(code) == code

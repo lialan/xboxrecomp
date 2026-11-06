@@ -289,11 +289,16 @@ extern RECOMP_TLS struct RecompRegs g_regs;
  * place a native setjmp is valid -- makes the guest jump a native jump, so the
  * frames actually unwind.
  *
- * recomp_setjmp_slot() returns the native buffer for a guest jmp_buf address,
- * allocating one on first use. recomp_guest_longjmp() restores the guest
- * registers the CRT's longjmp would and jumps; it returns 0, without jumping,
- * for a buffer that has no native counterpart, leaving the caller to fall back
- * to the guest's own longjmp.
+ * recomp_setjmp_slot() returns the native buffer for a guest jmp_buf address
+ * armed from the frame whose guest esp (at the call, before the return
+ * address is pushed) is given -- one per buffer AND frame, because a title can
+ * re-arm one global buffer from a nested frame and copy the outer contents
+ * back on the way out (HOTD3's task scheduler, sub_0011B000). Slots of frames
+ * deeper than the caller are dropped: those frames have returned.
+ * recomp_guest_longjmp() restores the guest registers the CRT's longjmp would
+ * and jumps to the slot whose frame matches the esp the guest buffer holds
+ * now; it returns 0, without jumping, when there is none, leaving the caller
+ * to fall back to the guest's own longjmp.
  */
 /* Atomic read-modify-write, for the lock-prefixed instructions.
  *
@@ -318,7 +323,7 @@ extern RECOMP_TLS struct RecompRegs g_regs;
 #endif
 
 #include <setjmp.h>
-jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
+jmp_buf *recomp_setjmp_slot(uint32_t buf_va, uint32_t esp);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
 
 /* EFLAGS.DF, and the signed step the string instructions take because of it.

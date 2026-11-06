@@ -46,6 +46,13 @@ def reg_cache_function(code):
         lambda m: "{ RECOMP_RC_STORE(); %s(); RECOMP_RC_LOAD(); }" % m.group(1), body)
     body = re.sub(r'(recomp_debug_service\([^;]*\);)',
                   r'{ RECOMP_RC_STORE(); \1 RECOMP_RC_LOAD(); }', body)
+    # Where a guest longjmp lands (the lifter's native setjmp): the runtime
+    # put the jmp_buf's ebx/esi/edi/esp into g_regs, and the locals caching
+    # them are indeterminate after the native longjmp -- reload them all
+    # before eax takes the jump's value. Without it HOTD3's task loop
+    # (sub_0011B000) resumed on stale locals and stored through garbage.
+    body = body.replace("if (_sjv) { ebp = g_seh_ebp;",
+                        "if (_sjv) { RECOMP_RC_LOAD(); ebp = g_seh_ebp;")
     enter = ["    uint32_t rc_%s = g_regs.r_%s;" % (r, r) for r in used]
     enter += ["#define RC_%s" % r.upper() for r in used]
     enter.append('#include "recomp_rc_on.h"')

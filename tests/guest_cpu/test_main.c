@@ -421,6 +421,70 @@ static void callback(void)
     check(s_host_took == 0, "callback: a host thread's routine takes nothing");
 }
 
+/* ── Scoped (RECOMP_GUEST_LOCK=scoped; CRI's lock) ─────────────────── */
+
+static volatile LONG s_sc_free_ran, s_sc_in, s_sc_out;
+
+static DWORD WINAPI scope_free_thread(LPVOID p)
+{
+    (void)p;
+    xbox_GuestCpuJoin();                       /* outside every scope */
+    InterlockedExchange(&s_sc_free_ran, 1);
+    xbox_GuestCpuPart();
+    return 0;
+}
+
+static DWORD WINAPI scope_thread(LPVOID p)
+{
+    (void)p;
+    xbox_GuestCpuJoin();
+    xbox_GuestCpuScopeEnter();                 /* waits while the other holds it */
+    InterlockedExchange(&s_sc_in, 1);
+    Sleep(20);
+    InterlockedExchange(&s_sc_out, 1);
+    xbox_GuestCpuScopeLeave();
+    xbox_GuestCpuPart();
+    return 0;
+}
+
+static void scoped(void)
+{
+    HANDLE f, t;
+    int held, short_held;
+
+    set_lock("scoped");
+    s_sc_free_ran = s_sc_in = s_sc_out = 0;
+    xbox_GuestCpuJoin();
+    check(!xbox_GuestCpuHeld(), "scoped: a join outside every scope takes nothing");
+    xbox_GuestCpuScopeEnter();
+    xbox_GuestCpuScopeEnter();                                   /* nested */
+    check(xbox_GuestCpuHeld(), "scoped: entering a scope takes the CPU");
+    f = CreateThread(NULL, 0, scope_free_thread, NULL, 0, NULL);
+    check(wait_for(&s_sc_free_ran, 1, 5000),
+          "scoped: a guest thread outside every scope runs while it is held");
+    join(f);
+    t = CreateThread(NULL, 0, scope_thread, NULL, 0, NULL);
+    check(wait_waiting(1, 5000), "scoped: a thread entering a scope waits for it");
+    Sleep(10);
+    short_held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 3);  /* returns at once */
+    xbox_GuestCpuAcquire();
+    check(short_held && xbox_GuestCpuHeld() && !s_sc_in,
+          "scoped: a short kernel call switches nobody, past any quantum");
+    held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 99);       /* KeDelayExecutionThread */
+    check(held && wait_for(&s_sc_in, 1, 5000),
+          "scoped: the holder's blocking call lets the waiter in");
+    xbox_GuestCpuAcquire();
+    check(s_sc_out && xbox_GuestCpuHeld(),
+          "scoped: the holder gets it back once the other left its scope");
+    xbox_GuestCpuScopeLeave();
+    check(xbox_GuestCpuHeld(), "scoped: the inner leave keeps it");
+    xbox_GuestCpuScopeLeave();
+    check(!xbox_GuestCpuHeld(), "scoped: the outer leave lets it go");
+    xbox_GuestCpuPart();
+    join(t);
+    set_lock(NULL);
+}
+
 /* ── A loop back edge past the quantum (RECOMP_BACK_EDGE) ─────────── */
 
 static volatile LONG s_be_ran;
@@ -663,6 +727,7 @@ int main(void)
     wake();
     dispatch_call();
     callback();
+    scoped();
 
     /* The dispatch case reset the counters last, so only it and the
      * callback case are in here. */

@@ -2233,12 +2233,7 @@ class Lifter:
     def _lift_imul(self, insn, ops):
         nops = len(ops)
         if nops == 1:
-            # One operand: edx:eax = eax * ops[0]
-            src = _fmt_operand_read(ops[0])
-            return [
-                f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
-            ]
+            return self._lift_muldiv(insn, ops, "imul")
         elif nops == 2:
             # Two operand: dst = dst * src
             dst = _fmt_operand_read(ops[0])
@@ -2252,25 +2247,57 @@ class Lifter:
         return ["/* imul: unexpected form */"]
 
     def _lift_muldiv(self, insn, ops, m):
+        """One-operand MUL, IMUL, DIV, IDIV at the operand's width.
+
+        8-bit: AX = AL * src, or AX / src into AL (quotient) and AH
+        (remainder); 16-bit: DX:AX; 32-bit: EDX:EAX. The operand is read
+        into _s first, so a source that is also a result register (div eax)
+        is the value before the write.
+        """
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
         src = _fmt_operand_read(ops[0])
+        w = _operand_width(ops[0]) or 4
+        if w == 1:
+            body = {
+                "imul": "SET_LO16(eax, (uint16_t)((int16_t)(int8_t)LO8(eax) * (int16_t)(int8_t)_s));",
+                "mul": "SET_LO16(eax, (uint16_t)((uint16_t)LO8(eax) * _s));",
+                "div": "uint16_t _n = LO16(eax); SET_LO16(eax, (uint16_t)((_n % _s) << 8 | (uint8_t)(_n / _s)));",
+                "idiv": "int16_t _n = (int16_t)LO16(eax); SET_LO16(eax, (uint16_t)((uint16_t)(uint8_t)(int8_t)(_n % (int8_t)_s) << 8"
+                        " | (uint8_t)(int8_t)(_n / (int8_t)_s)));",
+            }.get(m)
+            return [f"{{ uint8_t _s = (uint8_t)({src}); {body} }}  /* {m} r/m8 */"] if body else [f"/* {m}: unhandled */"]
+        if w == 2:
+            body = {
+                "imul": "int32_t _r = (int32_t)(int16_t)LO16(eax) * (int32_t)(int16_t)_s;"
+                        " SET_LO16(eax, (uint32_t)_r); SET_LO16(edx, (uint32_t)_r >> 16);",
+                "mul": "uint32_t _r = (uint32_t)LO16(eax) * _s; SET_LO16(eax, _r); SET_LO16(edx, _r >> 16);",
+                "div": "uint32_t _n = (uint32_t)LO16(edx) << 16 | LO16(eax); SET_LO16(eax, _n / _s); SET_LO16(edx, _n % _s);",
+                "idiv": "int32_t _n = (int32_t)((uint32_t)LO16(edx) << 16 | LO16(eax));"
+                        " SET_LO16(eax, (uint32_t)(_n / (int16_t)_s)); SET_LO16(edx, (uint32_t)(_n % (int16_t)_s));",
+            }.get(m)
+            return [f"{{ uint16_t _s = (uint16_t)({src}); {body} }}  /* {m} r/m16 */"] if body else [f"/* {m}: unhandled */"]
+        if m == "imul":
+            return [
+                f"{{ uint32_t _s = (uint32_t)({src}); int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t)_s;",
+                f"  eax = (uint32_t)_r; edx = (uint32_t)((uint64_t)_r >> 32); }}"
+            ]
         if m == "mul":
             return [
-                f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",
+                f"{{ uint32_t _s = (uint32_t)({src}); uint64_t _r = (uint64_t)eax * (uint64_t)_s;",
                 f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
             ]
         elif m == "div":
             return [
-                f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
-                f"  eax = (uint32_t)(_dividend / (uint32_t){src});",
-                f"  edx = (uint32_t)(_dividend % (uint32_t){src}); }}"
+                f"{{ uint32_t _s = (uint32_t)({src}); uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
+                f"  eax = (uint32_t)(_dividend / _s);",
+                f"  edx = (uint32_t)(_dividend % _s); }}"
             ]
         elif m == "idiv":
             return [
-                f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax;",
-                f"  eax = (uint32_t)((int32_t)(_dividend / (int32_t){src}));",
-                f"  edx = (uint32_t)((int32_t)(_dividend % (int32_t){src})); }}"
+                f"{{ uint32_t _s = (uint32_t)({src}); int64_t _dividend = (int64_t)(((uint64_t)edx << 32) | eax);",
+                f"  eax = (uint32_t)((int32_t)(_dividend / (int32_t)_s));",
+                f"  edx = (uint32_t)((int32_t)(_dividend % (int32_t)_s)); }}"
             ]
         return [f"/* {m}: unhandled */"]
 
@@ -2543,7 +2570,7 @@ class Lifter:
             # and the old behaviour is still better than ignoring the jump.
             if insn.call_target == self.SETJMP_FN:
                 lines.append(
-                    "{ int _sjv = setjmp(*recomp_setjmp_slot(MEM32(esp)));"
+                    "{ int _sjv = setjmp(*recomp_setjmp_slot(MEM32(esp), esp));"
                     " if (_sjv) { ebp = g_seh_ebp; eax = (uint32_t)_sjv; }"
                     f" else {{ PUSH32(esp, 0x{ret_va:08X}u); {name}(); }} }}"
                     f" /* setjmp 0x{insn.call_target:08X} */")

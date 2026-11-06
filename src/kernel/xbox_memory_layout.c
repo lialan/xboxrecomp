@@ -1895,39 +1895,56 @@ int g_force_return = 0;
  * guest-only longjmp is not enough; in short, the recompiled frames are C
  * frames and something has to unwind them.
  *
- * Keyed by guest buffer address, per thread. Buffers nest, so jumping to an
- * outer one discards every inner entry -- those frames are gone.
+ * Keyed by guest buffer address AND the guest esp of the frame that armed it,
+ * per thread. One buffer can be armed from nested frames: HOTD3's task
+ * scheduler (sub_0011B000) is re-entrant on one global jmp_buf -- it saves the
+ * buffer, re-arms it, and copies the outer contents back when it returns.
+ * Keyed by address alone, the inner setjmp took over the outer's native slot,
+ * and the outer scheduler's next longjmp landed in the inner frame after it
+ * had returned: a crash on a garbage address, or worse. So a longjmp goes to
+ * the slot whose frame matches the esp the guest buffer holds at that moment.
+ * Slots of frames deeper than a new setjmp's are dropped (those frames have
+ * returned), and jumping to an outer one discards every inner entry.
  */
 #define RECOMP_JMPBUF_SLOTS 32
 
 typedef struct {
     uint32_t buf_va;
+    uint32_t esp;          /* guest esp at the setjmp call, before its return address */
     jmp_buf  native;
 } recomp_jmp_slot;
 
 static RECOMP_TLS recomp_jmp_slot s_jmp[RECOMP_JMPBUF_SLOTS];
 static RECOMP_TLS int             s_jmp_used;
 
-jmp_buf *recomp_setjmp_slot(uint32_t buf_va)
+jmp_buf *recomp_setjmp_slot(uint32_t buf_va, uint32_t esp)
 {
     int i;
 
+    /* The stack grows down: a slot armed below this esp belongs to a frame
+     * that has returned, since this one is running. */
+    while (s_jmp_used > 0 && s_jmp[s_jmp_used - 1].esp < esp)
+        s_jmp_used--;
     for (i = 0; i < s_jmp_used; i++)
-        if (s_jmp[i].buf_va == buf_va)
-            return &s_jmp[i].native;      /* the same buffer, re-armed */
+        if (s_jmp[i].buf_va == buf_va && s_jmp[i].esp == esp)
+            return &s_jmp[i].native;      /* the same buffer and frame, re-armed */
     if (s_jmp_used >= RECOMP_JMPBUF_SLOTS)
         s_jmp_used = RECOMP_JMPBUF_SLOTS - 1;   /* keep the deepest */
     s_jmp[s_jmp_used].buf_va = buf_va;
+    s_jmp[s_jmp_used].esp = esp;
     return &s_jmp[s_jmp_used++].native;
 }
 
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value)
 {
     const uint8_t *mem = (const uint8_t *)g_memory_offset;
+    /* The frame the buffer names now: its setjmp-time esp (pointing at the
+     * return address) plus that return address is the call site's esp. */
+    const uint32_t frame_esp = *(const uint32_t *)(mem + buf_va + 0x10) + 4;
     int i;
 
     for (i = s_jmp_used - 1; i >= 0; i--) {
-        if (s_jmp[i].buf_va != buf_va)
+        if (s_jmp[i].buf_va != buf_va || s_jmp[i].esp != frame_esp)
             continue;
 
         /* The callee-saved registers and the stack, exactly as the CRT's
@@ -4045,7 +4062,11 @@ static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 #define XBOX_THREAD_STACK_SIZE  (512 * 1024)
-#define XBOX_MAX_THREAD_STACKS  8
+/* Live worker threads at once. Stacks come from the heap as threads are made,
+ * so the cap costs nothing until used. 8 was too few for HOTD3: its tenth
+ * thread (a file worker that waits for requests) fell back to running inline
+ * and never returned, freezing the boot after a second. */
+#define XBOX_MAX_THREAD_STACKS  32
 
 static int g_thread_stacks_used = 0;
 
