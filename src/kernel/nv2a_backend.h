@@ -92,6 +92,12 @@ typedef struct {
      * that ignores these draws that pass over the whole surface. */
     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
+    /* The last semaphore release the decode passed before this draw or
+     * clear (BACK_END_WRITE_SEMAPHORE_RELEASE's value: a D3D fence's time;
+     * 0 before any): where in the title's stream it is, kept with it --
+     * a deferred back end runs it later, the semaphore is written later
+     * still. A host marking stretches of its stream with fences reads it. */
+    uint32_t release;
 } Nv2aRenderState;
 
 /* What the register combiners read per vertex, beyond Nv2aVertex: for a back

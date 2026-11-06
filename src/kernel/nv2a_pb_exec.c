@@ -891,8 +891,10 @@ static void current_surface(Nv2aSurface *out)
 /* Render state in the NV2A's own values, gathered from what the executor
  * tracks and from the register mirror for what it does not (culling, the
  * depth range). */
+static volatile uint32_t s_release_decoded;   /* nv2a_pb_exec_release_decoded, below */
 static void current_render_state(Nv2aRenderState *r)
 {
+    r->release           = s_release_decoded;
     r->blend_enable      = s_gpu.blend_enable;
     r->blend_src         = s_gpu.blend_sfactor;
     r->blend_dst         = s_gpu.blend_dfactor;
@@ -5274,6 +5276,18 @@ uint32_t nv2a_pb_exec_swap_interval(void)
     return s_flip_hold.swap_interval;
 }
 
+/* The last semaphore release (BACK_END_WRITE_SEMAPHORE_RELEASE's value, a
+ * D3D fence's time) the decode has passed, in push-buffer order: a backend
+ * drawing can tell where in the title's stream it is. The semaphore itself
+ * is written later, once the draws before it are submitted (deferred
+ * writes), so it trails the decode; a deferred back end's draws run after
+ * the decode has gone on, so each carries its own (Nv2aRenderState.release).
+ * 0 before any. */
+uint32_t nv2a_pb_exec_release_decoded(void)
+{
+    return __atomic_load_n(&s_release_decoded, __ATOMIC_RELAXED);
+}
+
 /* The guest vblank count, and whether it is a running clock: vblanks are on
  * and the count moved within XBOX_FLIP_CLOCK_STALE_NS. Without it a hold
  * would only ever end on its timeout. */
@@ -5561,6 +5575,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     if (subch == 0 && method == 0x1D70 && s_sem_va) {
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+        __atomic_store_n(&s_release_decoded, param, __ATOMIC_RELAXED);
         /* Deferring, the release is queued behind the draws before it and
          * the submission thread writes it once it has submitted them: the
          * title sees the progress a GPU would report, and the decode goes
