@@ -565,6 +565,7 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h);
 #define THOBJ_SIZE        0x200u
 #define THOBJ_SIGNAL      0x004u
 #define THOBJ_EXIT_STATUS 0x120u
+#define THOBJ_BASE_PRIO   0x1F0u   /* ours: the KeSetBasePriorityThread value */
 #define THOBJ_PER_PAGE    (0x1000u / THOBJ_SIZE)
 
 /* Grown as threads are made, so there is no cap but memory (it was 256). */
@@ -5745,16 +5746,46 @@ static void bridge_KeDisconnectInterrupt(void)
 /* KeQueryBasePriorityThread (ordinal 124, 1 arg). The implementation has
  * existed in kernel_thread.c all along; only the bridge wrapper was
  * missing, so the thunk fell through to the fallback and returned 0. */
+/* The argument is a thread object (ObReferenceObjectByHandle hands out
+ * thobj VAs), not a host handle, so the host cannot take the priority.
+ * It is kept in the object instead -- the console's base priority, which
+ * the title's own scheduling depends on (HOTD3's CRI lock lets threads
+ * above its spinner's priority through; see xbox_GuestThreadBasePriority). */
 static void bridge_KeQueryBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+    uint32_t t = STACK_ARG(0);
+    g_eax = t ? BRIDGE_MEM32(t + THOBJ_BASE_PRIO) : 0;
 }
 
 static void bridge_KeSetBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
+    uint32_t t = STACK_ARG(0);
+    g_eax = 0;
+    if (t) {
+        g_eax = BRIDGE_MEM32(t + THOBJ_BASE_PRIO);
+        BRIDGE_MEM32(t + THOBJ_BASE_PRIO) = STACK_ARG(1);
+    }
+}
+
+/* The calling guest thread's base priority, as KeSetBasePriorityThread last
+ * set it (0, normal, until then; 16 time-critical, 2 highest, -2 lowest). */
+LONG xbox_GuestThreadBasePriority(void)
+{
+    uint32_t t = thobj_current();
+    return t ? (LONG)BRIDGE_MEM32(t + THOBJ_BASE_PRIO) : 0;
+}
+
+/* Set it, as KeSetBasePriorityThread on the calling thread would (a runtime
+ * replacement of title code that changed it); returns the old value. */
+LONG xbox_GuestThreadSetBasePriority(LONG prio)
+{
+    uint32_t t = thobj_current();
+    LONG old = 0;
+    if (t) {
+        old = (LONG)BRIDGE_MEM32(t + THOBJ_BASE_PRIO);
+        BRIDGE_MEM32(t + THOBJ_BASE_PRIO) = (uint32_t)prio;
+    }
+    return old;
 }
 
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */

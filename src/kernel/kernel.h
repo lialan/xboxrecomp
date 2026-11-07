@@ -815,12 +815,12 @@ void     xbox_GuestCpuBlocked(void);   /* a bridge blocks inside a non-blocking 
 void     xbox_GuestCpuPreempt(uint32_t va); /* RECOMP_BACK_EDGE with the flag set */
 int      xbox_GuestCpuEnterCallback(void);      /* 1 when it took the CPU */
 void     xbox_GuestCpuLeaveCallback(int took);
-/* Scoped guest CPU (kernel_guest_cpu.c): only guest threads inside a scope
- * take part, each holding the CPU until it blocks or leaves -- for a
- * middleware lock built on the console's priorities (CRI's). */
-void     xbox_GuestCpuScopeEnable(void);
-void     xbox_GuestCpuScopeEnter(void);
-void     xbox_GuestCpuScopeLeave(void);
+/* The calling guest thread's base priority as the title set it with
+ * KeSetBasePriorityThread (kept in its thread object; 0 until set, 16
+ * time-critical), and a setter for runtime code that replaces title code
+ * which changed it. The setter returns the old value. */
+LONG     xbox_GuestThreadBasePriority(void);
+LONG     xbox_GuestThreadSetBasePriority(LONG prio);
 unsigned long xbox_GuestCpuOwner(void);         /* the holder's tid, 0 when free */
 int      xbox_GuestCpuWaiting(void);            /* threads queued for it */
 /* Read by RECOMP_BACK_EDGE: a waiter has waited its quantum; the holder
