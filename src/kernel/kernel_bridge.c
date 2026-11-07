@@ -565,12 +565,13 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h);
 #define THOBJ_SIZE        0x200u
 #define THOBJ_SIGNAL      0x004u
 #define THOBJ_EXIT_STATUS 0x120u
-#define THOBJ_MAX         256
 #define THOBJ_PER_PAGE    (0x1000u / THOBJ_SIZE)
 
-static uint32_t s_thobj_va[THOBJ_MAX];     /* 0 = slot never carved */
-static LONG     s_thobj_refs[THOBJ_MAX];   /* 0 = free */
+/* Grown as threads are made, so there is no cap but memory (it was 256). */
+static uint32_t *s_thobj_va;               /* 0 = slot never carved */
+static LONG     *s_thobj_refs;             /* 0 = free */
 static uint32_t s_thobj_count;             /* slots carved so far */
+static uint32_t s_thobj_cap;               /* slots the two arrays hold */
 static uint32_t s_token_thobj[16384];      /* token index -> object VA */
 static volatile LONG s_thobj_lock;
 static RECOMP_TLS uint32_t g_thread_obj_va;
@@ -608,12 +609,26 @@ static uint32_t thobj_alloc(void)
     for (i = 0; i < s_thobj_count; i++)
         if (s_thobj_refs[i] == 0)
             break;
-    if (i == s_thobj_count && s_thobj_count < THOBJ_MAX) {
+    if (i == s_thobj_count && s_thobj_count + THOBJ_PER_PAGE > s_thobj_cap) {
+        uint32_t cap = s_thobj_cap ? s_thobj_cap * 2 : 64;
+        uint32_t *nva = realloc(s_thobj_va, cap * sizeof *nva);
+        LONG *nrefs = nva ? realloc(s_thobj_refs, cap * sizeof *nrefs) : NULL;
+
+        if (nva)
+            s_thobj_va = nva;
+        if (nrefs) {
+            s_thobj_refs = nrefs;
+            memset(nva + s_thobj_cap, 0, (cap - s_thobj_cap) * sizeof *nva);
+            memset(nrefs + s_thobj_cap, 0, (cap - s_thobj_cap) * sizeof *nrefs);
+            s_thobj_cap = cap;
+        }
+    }
+    if (i == s_thobj_count && s_thobj_count + THOBJ_PER_PAGE <= s_thobj_cap) {
         uint32_t page = xbox_ContiguousAlloc(0x1000, 0x1000);
         uint32_t k;
 
         if (page) {
-            for (k = 0; k < THOBJ_PER_PAGE && s_thobj_count < THOBJ_MAX; k++)
+            for (k = 0; k < THOBJ_PER_PAGE; k++)
                 s_thobj_va[s_thobj_count++] = page + k * THOBJ_SIZE;
         }
     }
@@ -624,8 +639,8 @@ static uint32_t thobj_alloc(void)
     thobj_unlock();
 
     if (!va) {
-        fprintf(stderr, "  [KERNEL] no guest thread object (pool of %d full)\n",
-                THOBJ_MAX);
+        fprintf(stderr, "  [KERNEL] no guest thread object (out of memory at %u)\n",
+                s_thobj_count);
         fflush(stderr);
         return 0;
     }
@@ -978,11 +993,14 @@ static void bridge_PsCreateSystemThreadEx(void)
                 stack_top = xbox_AllocThreadStack();
 
                 if (!stack_top) {
-                    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: out of "
-                            "thread stacks, running worker 0x%08X inline\n",
-                            start_routine);
+                    /* Guest memory is gone: fail as the console does. Running
+                     * the worker inline instead deadlocks any worker that
+                     * waits for requests. */
+                    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: no guest "
+                            "memory for worker 0x%08X's stack\n", start_routine);
                     fflush(stderr);
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    g_eax = 0xC0000017u;   /* STATUS_NO_MEMORY */
+                    return;
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
                                               stack_top, xbox_handle_ptr,
@@ -9432,8 +9450,12 @@ static void bridge_PsCreateSystemThread(void)
                     return;
                 }
                 stack_top = xbox_AllocThreadStack();
-                if (!stack_top) {
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                if (!stack_top) {          /* as PsCreateSystemThreadEx */
+                    fprintf(stderr, "  [KERNEL] PsCreateSystemThread: no guest "
+                            "memory for worker 0x%08X's stack\n", start_routine);
+                    fflush(stderr);
+                    g_eax = 0xC0000017u;   /* STATUS_NO_MEMORY */
+                    return;
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
                                               stack_top, xbox_handle_ptr, 0);

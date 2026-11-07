@@ -40,6 +40,7 @@
 typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(unsigned int va) { (void)va; return 0; }
 recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 static int failures = 0;
 
@@ -220,6 +221,31 @@ int main(int argc, char **argv)
         }
     } else {
         check(0, "mapped region covers the 0x70000 probe", "region too small");
+    }
+
+    /* 3b. Threads: as many as guest memory holds, no fixed count. A cap of
+     *     8 froze HOTD3's boot at its tenth thread. Allocate until the heap
+     *     gives out; the stop must be memory, not a counter. */
+    {
+        enum { MAX = 1024 };
+        static uint32_t tops[MAX];
+        int got = 0, distinct = 1;
+        while (got < MAX && (tops[got] = xbox_AllocThreadStack()) != 0) {
+            for (int j = 0; j < got; j++)
+                if (tops[j] == tops[got]) distinct = 0;
+            got++;
+        }
+        char detail[64];
+        snprintf(detail, sizeof detail, "%d allocated", got);
+        check(got >= 64, "thread stacks well past the old cap of 32", detail);
+        check(distinct, "every thread stack is its own", NULL);
+        check(got == MAX || !xbox_HeapAlloc(512 * 1024, 4096),
+              "only running out of guest memory stops them", detail);
+        for (int i = 0; i < got; i++)
+            xbox_FreeThreadStack(tops[i]);
+        uint32_t again_top = xbox_AllocThreadStack();
+        check(again_top != 0, "a stack after freeing them all", NULL);
+        xbox_FreeThreadStack(again_top);
     }
 
     /* 4. Teardown has to give the addresses back, or nothing can re-init. */

@@ -4062,13 +4062,12 @@ static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 #define XBOX_THREAD_STACK_SIZE  (512 * 1024)
-/* Live worker threads at once. Stacks come from the heap as threads are made,
- * so the cap costs nothing until used. 8 was too few for HOTD3: its tenth
- * thread (a file worker that waits for requests) fell back to running inline
- * and never returned, freezing the boot after a second. */
-#define XBOX_MAX_THREAD_STACKS  32
-
-static int g_thread_stacks_used = 0;
+/* Live worker stacks, for the record only. There is no cap: stacks come from
+ * the heap as threads are made, so a title gets as many threads as guest
+ * memory holds, as on the console. A fixed cap of 8 froze HOTD3's boot (its
+ * tenth thread, a file worker that waits for requests, ran inline instead and
+ * never returned). */
+static volatile LONG g_thread_stacks_used = 0;
 
 /* A TIB and TLS block for a newly spawned guest thread.
  *
@@ -4122,10 +4121,6 @@ uint32_t xbox_AllocThreadStack(void)
 {
     uint32_t base;
 
-    if (g_thread_stacks_used >= XBOX_MAX_THREAD_STACKS) {
-        return 0;
-    }
-
     /* From the heap, not from XBOX_STACK_BASE.
      *
      * The stack region begins at 0x00780000, which is fine only while the
@@ -4143,7 +4138,7 @@ uint32_t xbox_AllocThreadStack(void)
     base = xbox_HeapAlloc(XBOX_THREAD_STACK_SIZE, 4096);
     if (!base)
         return 0;
-    g_thread_stacks_used++;
+    InterlockedIncrement(&g_thread_stacks_used);
 
     /* Top of the slice, 16-byte aligned, growing down. */
     return base + XBOX_THREAD_STACK_SIZE - 16;
@@ -4154,7 +4149,7 @@ uint32_t xbox_AllocThreadStack(void)
  * The counter used to only ever go up, so a title that creates and destroys
  * threads ran the pool dry no matter how few were alive at once. The Xbox
  * Dashboard spawns one worker per ambient WAV and terminates it before loading
- * the next; after XBOX_MAX_THREAD_STACKS files the pool was empty and
+ * the next; after the old cap's worth of files the pool was empty and
  * PsCreateSystemThreadEx fell back to running the worker inline. That fallback
  * is a deadlock here rather than a slowdown: the worker ran to completion
  * before the caller reached its wait, so the main thread then waited forever on
@@ -4168,8 +4163,7 @@ void xbox_FreeThreadStack(uint32_t stack_top)
     if (!stack_top)
         return;
     xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
-    if (g_thread_stacks_used > 0)
-        g_thread_stacks_used--;
+    InterlockedDecrement(&g_thread_stacks_used);
 }
 
 /* Page allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
