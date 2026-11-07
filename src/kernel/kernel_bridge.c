@@ -11014,6 +11014,7 @@ static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 #define STALL_THREADS 64
 typedef struct {
     uint32_t used, in_call, ordinal, caller, esp, args[4];
+    int kslot;                       /* the call's RECOMP_KCALL_LOG record, -1 none */
     uint64_t t_enter, calls;
     unsigned long host_tid;
 } StallRec;
@@ -11022,9 +11023,10 @@ static int s_stall_on = -1;
 /* RECOMP_KCALL_LOG=<s>: every <s> seconds, per guest thread, the kernel
  * calls it made in that period by ordinal and caller, the busiest first --
  * what each thread is doing, to set a stalled run beside a healthy one at
- * the same moment. Rides on the stall records. */
+ * the same moment, with the time spent in them (a wait's length). Rides on
+ * the stall records. */
 #define KCALL_SLOTS 24
-typedef struct { uint32_t ordinal, caller, n; } KcallRec;
+typedef struct { uint32_t ordinal, caller, n; uint64_t ns; } KcallRec;
 static KcallRec s_kcall[STALL_THREADS][KCALL_SLOTS];
 static int s_kcall_secs;
 static DWORD WINAPI kcall_reporter(LPVOID arg)
@@ -11048,7 +11050,8 @@ static DWORD WINAPI kcall_reporter(LPVOID arg)
                     }
             fprintf(stderr, "[KCALL] %us t%-2d", period * s_kcall_secs, i);
             for (j = 0; j < KCALL_SLOTS && snap[j].n; j++)
-                fprintf(stderr, " %u@%08X x%u", snap[j].ordinal, snap[j].caller, snap[j].n);
+                fprintf(stderr, " %u@%08X x%u %.1fms", snap[j].ordinal, snap[j].caller, snap[j].n,
+                        snap[j].ns / 1e6);
             fprintf(stderr, "%s\n", snap[0].n ? "" : " (none)");
         }
         fflush(stderr);
@@ -11180,6 +11183,7 @@ static void stall_enter(uint32_t ordinal, uint32_t esp_args)
     r->t_enter = xbox_HostNowNs();
     r->calls++;
     r->in_call = 1;
+    r->kslot = -1;
     if (s_kcall_secs) {
         KcallRec *t = s_kcall[s_stall_slot];
         for (k = 0; k < KCALL_SLOTS; k++) {
@@ -11188,6 +11192,7 @@ static void stall_enter(uint32_t ordinal, uint32_t esp_args)
             t[k].ordinal = ordinal;           /* racy with the reporter: a count off */
             t[k].caller = r->caller;
             t[k].n++;
+            r->kslot = k;
             break;
         }
     }
@@ -11195,8 +11200,12 @@ static void stall_enter(uint32_t ordinal, uint32_t esp_args)
 
 static void stall_leave(void)
 {
-    if (s_stall_on > 0 && s_stall_slot >= 0)
-        s_stall[s_stall_slot].in_call = 0;
+    if (s_stall_on > 0 && s_stall_slot >= 0) {
+        StallRec *r = &s_stall[s_stall_slot];
+        r->in_call = 0;
+        if (s_kcall_secs && r->kslot >= 0)   /* racy with the reporter, as the count */
+            s_kcall[s_stall_slot][r->kslot].ns += xbox_HostNowNs() - r->t_enter;
+    }
 }
 
 static void kernel_thunk_dispatch_body(void);
