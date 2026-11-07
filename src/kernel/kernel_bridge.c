@@ -37,6 +37,7 @@
 #include "kernel_missing.h"
 #include "xbox_memory_layout.h"
 #include "platform/host_time.h"
+#include "platform/host_stacks.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
@@ -11111,6 +11112,7 @@ static void stall_dump(void)
     }
     if (g_stall_dump_hook)
         g_stall_dump_hook();
+    xbox_host_stacks_dump();   /* where each thread is in host code (Linux, Android) */
     fflush(stderr);
 }
 
