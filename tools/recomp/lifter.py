@@ -449,7 +449,7 @@ _EFLAGS_PRESERVE = frozenset({
     "pushfd", "pushal", "pushad", "popal", "popad",
     # cpuid writes eax..edx and no flags.
     "cpuid",
-    "sgdt", "ljmp", "sfence",
+    "sgdt", "ljmp", "sfence", "wbinvd", "invd",
     "stmxcsr", "ldmxcsr",
     # SSE scalar float
     "movss", "movsd",
@@ -1758,10 +1758,11 @@ class Lifter:
         # following adc/sbb reads kept whatever the last arithmetic left in it.
         # Only worth emitting when something downstream consumes CF -- that is
         # also the only time the enclosing function declares _cf.
-        # Cache hints and store fences: nothing to model on a single-threaded
+        # Cache hints, store fences and cache flushes (wbinvd/invd, which
+        # HOTD3's D3D runs before a kick): nothing to model on a single-threaded
         # interpreter over coherent host memory. Named so they stop showing up
         # in the unimplemented report as if they were missing work.
-        if m.startswith("prefetch") or m in ("sfence", "lfence", "mfence"):
+        if m.startswith("prefetch") or m in ("sfence", "lfence", "mfence", "wbinvd", "invd"):
             return [f"(void)0; /* {m}: cache/ordering hint, nothing to model */"]
 
         if m in ("stc", "clc", "cmc"):

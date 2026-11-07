@@ -75,6 +75,15 @@ class UnimplementedMarkerTest(unittest.TestCase):
         self.assertNotIn("TODO", out)
         self.assertEqual(lifter.unimplemented, {})
 
+    def test_cache_flush_has_no_marker(self):
+        # wbinvd/invd flush the CPU's caches (HOTD3's D3D before a push
+        # buffer kick): nothing to model over coherent host memory.
+        for m in ("wbinvd", "invd"):
+            lifter, out = _lift(m)
+            self.assertNotIn("RECOMP_UNIMPL", out)
+            self.assertNotIn("TODO", out)
+            self.assertEqual(lifter.unimplemented, {})
+
     def test_translated_instruction_has_no_marker(self):
         # Negative control: an ordinary translated instruction carries neither
         # the marker nor the comment, and records nothing.
