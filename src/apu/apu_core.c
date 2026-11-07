@@ -115,6 +115,15 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * the voice-array case below still holds for the image. */
     if (xbox_PhysRamNameMap()[a >> 12])
         return g_apu_ram_ptr + a;
+    /* Likewise an image page the title named: on the console the image's
+     * physical pages are its own, never contiguous memory too. HOTD3's
+     * DirectSound points four looping voices at a static buffer in its own
+     * section (0x150FB0, zeros); read from the window page of the same
+     * number, they played whatever the window held there -- full-scale noise
+     * over everything. The voice-array case below is unaffected: a window
+     * page is named from its window address, not an image one. */
+    if (xbox_PhysImageNameMap()[a >> 12] && a >= g_xbox_image_lo && a < g_xbox_image_hi)
+        return g_apu_ram_ptr + a;
     /* A page the contiguous allocator handed out is the window, even where
      * it overlaps the image's physical range: an image whose BSS runs past
      * 48 MB can have DirectSound's voice array at a window address inside
@@ -146,6 +155,8 @@ const char *mcpx_apu_phys_class(uint64_t addr)
         return a < apu_mapped_ram() ? "ram" : "wrap";
     if (xbox_PhysRamNameMap()[a >> 12])
         return "named";
+    if (xbox_PhysImageNameMap()[a >> 12] && a >= g_xbox_image_lo && a < g_xbox_image_hi)
+        return "img";
     if (xbox_ContiguousPageMap()[a >> 12])
         return "win";
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
